@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: 'Aguka AI - Rwanda WhatsApp Agent Platform',
-  description: 'Enterprise bilingual (Kinyarwanda & English) WhatsApp AI Agent Platform for Rwanda and international expansion. Featuring job discovery, career assistant, coding sandbox, image studio, and employment marketplace.',
+  description: 'Bilingual (Kinyarwanda & English) WhatsApp AI agent platform for Rwanda: job discovery, career and CV support, coding help as text, passport photo guidance, study tutoring, and an employment marketplace.',
   openGraph: {
     title: 'Aguka AI - Rwanda WhatsApp Agent Platform',
     description: 'Bilingual AI WhatsApp assistant powering jobs, careers, coding, and education for Rwanda.',

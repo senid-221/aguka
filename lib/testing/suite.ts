@@ -4,7 +4,8 @@ import { sanitizeUserInput, redactSecrets } from '@/lib/ai/prompt-security';
 import { repo } from '@/lib/db/repository';
 import { parseAndValidateConfig } from '@/lib/config';
 import { logger } from '@/lib/logging/logger';
-import { getAIProvider, MockAIProvider, GeminiAIProvider } from '@/lib/ai/provider-adapter';
+import { getAIProvider, GeminiAIProvider } from '@/lib/ai/provider-adapter';
+import { GEMINI_MODEL } from '@/lib/gemini';
 import { queueService } from '@/lib/queue/redis-queue';
 import crypto from 'node:crypto';
 
@@ -30,7 +31,7 @@ export async function runPlatformTestSuiteAsync(): Promise<{
   // Test 1: Webhook Subscription Challenge (GET)
   const t1Start = Date.now();
   const validChallenge = 'hub_challenge_aguka_test_123';
-  const expectedToken = 'aguka_rwanda_webhook_secret_token_2026';
+  const expectedToken = 'unit-test-verify-token';
   const chalRes = verifyWebhookChallenge('subscribe', expectedToken, validChallenge, expectedToken);
   results.push({
     id: 'test-webhook-challenge',
@@ -150,23 +151,42 @@ export async function runPlatformTestSuiteAsync(): Promise<{
     durationMs: Date.now() - t8Start,
   });
 
-  // Test 9: Job Match Explainability Verification
+  // Test 9: Marketplace matching is driven by stored data, never by a seed
   const t9Start = Date.now();
-  const matches = repo.getJobMatches();
-  const firstMatch = matches[0];
-  const explainable = Boolean(
-    firstMatch &&
-    firstMatch.explainability &&
-    typeof firstMatch.explainability.skillsMatchPercentage === 'number' &&
-    firstMatch.explainability.rationale
+  const testWorker = repo.createWorkerProfile({
+    userId: `test-user-${Date.now()}`,
+    fullName: 'Suite Test Worker',
+    phoneNumber: `test-wa-${Date.now()}`,
+    title: 'Software Developer',
+    bio: 'Created by the automated test suite.',
+    skills: ['TypeScript', 'Next.js'],
+    experienceYrs: 3,
+    district: 'Kigali',
+    isAvailable: true,
+  });
+  const storedMatches = repo.getJobMatches();
+  const orphanMatch = storedMatches.find(
+    (m) => !repo.getWorkerProfiles().some((w) => w.id === m.workerId)
   );
+  const unexplained = storedMatches.find(
+    (m) =>
+      typeof m.explainability.skillsMatchPercentage !== 'number' ||
+      !m.explainability.rationale ||
+      !Array.isArray(m.explainability.matchedSkills)
+  );
+  // With no vacancy ever posted, a new worker must not generate a match
+  const matchForTestWorker = storedMatches.filter((m) => m.workerId === testWorker.id).length;
+  const matchingHonest =
+    repo.getVacancies().length === 0
+      ? matchForTestWorker === 0
+      : matchForTestWorker > 0;
   results.push({
     id: 'test-marketplace-explainability',
     category: 'Employment Marketplace',
-    name: 'Job Matching Score Explainability & Non-Discrimination',
-    passed: explainable,
-    expected: 'True with skillsMatchPercentage and rationale',
-    actual: String(explainable),
+    name: 'Job Matching Driven by Stored Data with Full Explainability',
+    passed: !orphanMatch && !unexplained && matchingHonest,
+    expected: 'No seeded matches; every stored match names a real worker and carries explainability',
+    actual: `vacancies=${repo.getVacancies().length}, matches=${storedMatches.length}, testWorkerMatches=${matchForTestWorker}, orphan=${Boolean(orphanMatch)}, unexplained=${Boolean(unexplained)}`,
     durationMs: Date.now() - t9Start,
   });
 
@@ -211,30 +231,38 @@ export async function runPlatformTestSuiteAsync(): Promise<{
     durationMs: Date.now() - t11Start,
   });
 
-  // Test 12: AI Provider Adapter Contract & Health Check
+  // Test 12: AI Provider Adapter Contract — real provider only, honest failure without a key
   const t12Start = Date.now();
-  const mockProvider = new MockAIProvider();
-  const mockHealth = await mockProvider.healthCheck();
-  const mockReply = await mockProvider.generateResponse('Nshaka akazi mu Rwanda');
+  const configuredProvider = getAIProvider();
   const geminiProvider = new GeminiAIProvider();
-  const geminiAdheres =
+  const keyPresent = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
+
+  const contractAdhered =
     typeof geminiProvider.generateResponse === 'function' &&
     typeof geminiProvider.healthCheck === 'function' &&
-    geminiProvider.model === 'gemini-3.8-flash';
+    geminiProvider.model === GEMINI_MODEL;
 
-  const providerPassed =
-    mockHealth.ok &&
-    typeof mockReply.text === 'string' &&
-    mockReply.text.length > 5 &&
-    geminiAdheres;
+  let unavailableBehaviorOk = true;
+  let unavailableDetail = 'key configured, skipped';
+  if (!keyPresent) {
+    const health = await geminiProvider.healthCheck();
+    let generationThrew = false;
+    try {
+      await geminiProvider.generateResponse('Nshaka akazi mu Rwanda');
+    } catch {
+      generationThrew = true;
+    }
+    unavailableBehaviorOk = configuredProvider === null && health.ok === false && generationThrew;
+    unavailableDetail = `provider=${configuredProvider === null ? 'null' : 'set'}, healthOk=${health.ok}, threw=${generationThrew}`;
+  }
 
   results.push({
     id: 'test-ai-provider-adapter',
     category: 'AI Orchestrator',
-    name: 'AI Provider Adapter Contract (Gemini & Mock Fallback)',
-    passed: providerPassed,
-    expected: 'ok=true with valid text response & Gemini contract adhered',
-    actual: `ok=${mockHealth.ok}, geminiAdheres=${geminiAdheres}, length=${mockReply.text.length}`,
+    name: 'AI Provider Adapter Contract (Gemini only, no mock fallback)',
+    passed: contractAdhered && unavailableBehaviorOk,
+    expected: 'Gemini contract adhered; with no key getAIProvider() is null, healthCheck fails and generation throws',
+    actual: `contract=${contractAdhered}, model=${geminiProvider.model}, ${unavailableDetail}`,
     durationMs: Date.now() - t12Start,
   });
 

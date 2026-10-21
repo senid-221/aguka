@@ -8,14 +8,17 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   try {
-    const { operation, originalUrl, userName = 'Jean Claude Mugisha' } = await request.json();
+    const { userId, userName, operation, originalUrl } = await request.json();
+
+    if (!userId || !originalUrl) {
+      return NextResponse.json({ error: 'userId and originalUrl are required' }, { status: 400 });
+    }
 
     const created = repo.createMediaTask({
-      userId: 'usr-rw-01',
-      userName,
+      userId,
+      userName: userName || repo.getUserById(userId)?.fullName || userId,
       operation: operation || 'PASSPORT_CROP',
-      originalUrl: originalUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=400&q=80',
-      processedUrl: originalUrl,
+      originalUrl,
       retentionDays: 30,
     });
 

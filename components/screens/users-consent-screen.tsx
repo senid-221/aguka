@@ -115,7 +115,8 @@ export function UsersConsentScreen() {
             <span>Users, Privacy & Rwanda DPPA Consent</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Enforcing Law N° 058/2021 relating to the protection of personal data and privacy. Explicit opt-ins, data portability, and erasure controls.
+            Consent, export and erasure controls for Rwanda Law N° 058/2021. These act on records held in
+            this process; a persistent store must apply the same rules once a database is connected.
           </p>
         </div>
 
@@ -137,6 +138,12 @@ export function UsersConsentScreen() {
           </div>
 
           <div className="divide-y divide-zinc-800/60 overflow-y-auto max-h-[500px]">
+            {users.length === 0 && (
+              <p className="text-xs text-zinc-500 p-6 text-center">
+                No users registered yet. A user record is created the first time a phone number messages
+                the agent.
+              </p>
+            )}
             {users.map((u) => {
               const isSelected = selectedUser?.id === u.id;
               return (

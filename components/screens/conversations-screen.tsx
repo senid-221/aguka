@@ -80,6 +80,13 @@ export function ConversationsScreen() {
           </div>
 
           <div className="flex-1 overflow-y-auto divide-y divide-zinc-800/60">
+            {filtered.length === 0 && (
+              <p className="text-xs text-zinc-500 p-6 text-center">
+                {conversations.length === 0
+                  ? 'No conversations stored yet. They appear after a real WhatsApp message or a simulator run.'
+                  : 'No conversation matches this search.'}
+              </p>
+            )}
             {filtered.map((c) => {
               const isSelected = c.id === selectedId;
               const lastMsg = c.messages[c.messages.length - 1];

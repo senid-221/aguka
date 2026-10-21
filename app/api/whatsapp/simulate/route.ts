@@ -5,7 +5,11 @@ import { WhatsAppOutgoingMessage } from '@/lib/whatsapp/gateway';
 
 export async function POST(request: NextRequest) {
   try {
-    const { phoneNumber = '+250788912345', name = 'Jean Claude Mugisha', messageText } = await request.json();
+    const { phoneNumber, name, messageText } = await request.json();
+
+    if (!phoneNumber) {
+      return NextResponse.json({ error: 'phoneNumber is required' }, { status: 400 });
+    }
 
     if (!messageText || !messageText.trim()) {
       return NextResponse.json({ error: 'Message text is required' }, { status: 400 });
@@ -15,12 +19,13 @@ export async function POST(request: NextRequest) {
     const user = repo.getOrCreateUserByPhone(cleanPhone, name);
     const conversation = repo.getOrCreateConversation(user.id);
 
-    const waMsgId = `wamid.sim.${Date.now()}`;
-    repo.markMessageProcessed(waMsgId);
+    // Local id only: this path never receives a Meta wamid because nothing is dispatched.
+    const localMessageId = `sim-local-${Date.now()}`;
+    repo.markMessageProcessed(localMessageId);
 
     // Save incoming user message
     const userMsg = repo.addMessage(conversation.id, {
-      waMessageId: waMsgId,
+      waMessageId: localMessageId,
       role: 'USER',
       type: 'TEXT',
       content: messageText,
@@ -81,6 +86,11 @@ export async function POST(request: NextRequest) {
       assistantMessage: assistantMsg,
       agentResult,
       outgoingPayload,
+      delivery: {
+        dispatched: false,
+        reason:
+          'This simulator builds and shows the payload only. The real delivery path is POST /api/whatsapp/webhook with Meta Cloud API credentials.',
+      },
     });
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);

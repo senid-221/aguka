@@ -43,7 +43,7 @@ export function Sidebar({ currentScreen, onSelectScreen, isOpenMobile, onCloseMo
     { id: 'overview', label: 'Overview', icon: <LayoutDashboard className="w-4 h-4" /> },
     {
       id: 'simulator',
-      label: 'Live WhatsApp Simulator',
+      label: 'WhatsApp Simulator',
       icon: <Smartphone className="w-4 h-4 text-emerald-400" />,
       badge: 'Interactive',
       badgeColor: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
@@ -85,7 +85,7 @@ export function Sidebar({ currentScreen, onSelectScreen, isOpenMobile, onCloseMo
                 <span>Aguka AI</span>
                 <RwandaFlagIcon className="w-4 h-2.5 rounded-xs" />
               </div>
-              <p className="text-[10px] text-zinc-400 font-medium">Enterprise WhatsApp Agent</p>
+              <p className="text-[10px] text-zinc-400 font-medium">Bilingual WhatsApp Agent</p>
             </div>
           </div>
         </div>

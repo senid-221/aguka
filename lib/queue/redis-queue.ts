@@ -126,12 +126,13 @@ class ResilientJobQueue implements IQueueService {
   }
 
   async healthCheck(): Promise<{ ok: boolean; pendingJobs: number; activeWorkers: number; mode: string }> {
-    const hasRedis = Boolean(process.env.REDIS_URL && !process.env.REDIS_URL.includes('replace_with'));
+    // No Redis client is connected in this build; REDIS_URL is reserved for the
+    // BullMQ worker that will replace this implementation.
     return {
       ok: true,
       pendingJobs: this.getPendingCount(),
-      activeWorkers: 4,
-      mode: hasRedis ? 'Redis BullMQ' : 'In-Memory Resilient Queue',
+      activeWorkers: 0,
+      mode: 'In-Memory Resilient Queue',
     };
   }
 }

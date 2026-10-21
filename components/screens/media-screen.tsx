@@ -4,84 +4,156 @@ import React, { useState, useEffect } from 'react';
 import {
   Image as ImageIcon,
   CheckCircle2,
-  Trash2,
   Clock,
-  ShieldCheck,
+  AlertCircle,
   RefreshCw,
-  Sparkles,
-  ExternalLink,
   Upload,
 } from 'lucide-react';
 import { MediaTask } from '@/lib/types';
 
+const OPERATIONS: Array<{ value: MediaTask['operation']; label: string }> = [
+  { value: 'PASSPORT_CROP', label: 'Passport crop 35x45mm' },
+  { value: 'REMOVE_BG', label: 'Remove background' },
+  { value: 'ENHANCE_CV_PHOTO', label: 'Enhance CV photo' },
+  { value: 'RESIZE', label: 'Resize' },
+];
+
+function statusStyle(status: MediaTask['status']): string {
+  if (status === 'COMPLETED') return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
+  if (status === 'FAILED') return 'bg-red-500/10 text-red-400 border-red-500/20';
+  return 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+}
+
 export function MediaScreen() {
   const [tasks, setTasks] = useState<MediaTask[]>([]);
   const [selectedTask, setSelectedTask] = useState<MediaTask | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [userId, setUserId] = useState('');
+  const [imageUrl, setImageUrl] = useState('');
+  const [operation, setOperation] = useState<MediaTask['operation']>('PASSPORT_CROP');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [formError, setFormError] = useState('');
 
-  useEffect(() => {
-    let isMounted = true;
+  const loadTasks = () => {
     fetch('/api/media')
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
-        if (!isMounted || !data) return;
-        setTasks(data.tasks || []);
-        if (data.tasks?.length > 0) {
-          setSelectedTask((prev) => prev || data.tasks[0]);
-        }
+        if (!data) return;
+        const list: MediaTask[] = data.tasks || [];
+        setTasks(list);
+        setSelectedTask((prev) => prev || list[0] || null);
       })
       .catch((err) => console.error('Error fetching media tasks:', err));
+  };
 
-    return () => {
-      isMounted = false;
-    };
+  useEffect(() => {
+    loadTasks();
   }, []);
 
-  const handleSimulateNewTask = async () => {
-    setIsProcessing(true);
+  const handleCreateTask = async () => {
+    if (!userId.trim() || !imageUrl.trim()) {
+      setFormError('Both a user ID and an image URL are required.');
+      return;
+    }
+    setFormError('');
+    setIsSubmitting(true);
     try {
       const res = await fetch('/api/media', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          operation: 'PASSPORT_CROP',
-          originalUrl: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=400&q=80',
-          userName: 'David Kanimba',
+          userId: userId.trim(),
+          originalUrl: imageUrl.trim(),
+          operation,
         }),
       });
-      if (res.ok) {
-        const data = await res.json();
+      const data = await res.json();
+      if (res.ok && data.task) {
         setTasks((prev) => [data.task, ...prev]);
         setSelectedTask(data.task);
+      } else {
+        setFormError(data.error || 'Could not record the request.');
       }
     } catch (err) {
-      console.error('Failed to create task:', err);
+      setFormError(err instanceof Error ? err.message : 'Request failed.');
     } finally {
-      setIsProcessing(false);
+      setIsSubmitting(false);
     }
   };
 
   return (
     <div className="p-4 sm:p-6 space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-white flex items-center gap-2">
             <ImageIcon className="w-5 h-5 text-emerald-400" />
-            <span>Passport & Photo Studio Hub</span>
+            <span>Photo Studio Queue</span>
           </h1>
-          <p className="text-xs text-zinc-400 mt-1">
-            Automated 35x45mm Rwanda biometric passport compliance, CV portrait background removal, and 30-day retention policies.
+          <p className="text-xs text-zinc-400 mt-1 max-w-2xl">
+            This screen records photo requests. No image editor is wired to this build yet, so crops,
+            background removal and biometric checks do not run — every request stays PENDING until an
+            editing service is connected.
           </p>
         </div>
 
         <button
-          onClick={handleSimulateNewTask}
-          disabled={isProcessing}
-          className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-all cursor-pointer disabled:opacity-50 w-max"
+          onClick={loadTasks}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 border border-zinc-700 transition-colors w-max"
         >
-          <Upload className="w-3.5 h-3.5" />
-          <span>{isProcessing ? 'Processing...' : 'Simulate Photo Upload'}</span>
+          <RefreshCw className="w-3.5 h-3.5" />
+          <span>Reload</span>
         </button>
+      </div>
+
+      {/* Record a request */}
+      <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-3">
+        <p className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
+          <Upload className="w-3.5 h-3.5 text-emerald-400" />
+          <span>Record a photo request</span>
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-2.5">
+          <input
+            value={userId}
+            onChange={(e) => setUserId(e.target.value)}
+            placeholder="User ID (e.g. usr-...)"
+            className="bg-zinc-950 text-zinc-100 placeholder-zinc-500 text-xs rounded-lg px-3 py-2 border border-zinc-800 outline-hidden focus:border-emerald-500/50"
+          />
+          <input
+            value={imageUrl}
+            onChange={(e) => setImageUrl(e.target.value)}
+            placeholder="Image URL from WhatsApp media"
+            className="bg-zinc-950 text-zinc-100 placeholder-zinc-500 text-xs rounded-lg px-3 py-2 border border-zinc-800 outline-hidden focus:border-emerald-500/50 sm:col-span-2"
+          />
+          <select
+            value={operation}
+            onChange={(e) => setOperation(e.target.value as MediaTask['operation'])}
+            className="bg-zinc-950 text-zinc-100 text-xs rounded-lg px-3 py-2 border border-zinc-800 outline-hidden"
+          >
+            {OPERATIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          {formError ? (
+            <p className="text-[11px] text-red-400 flex items-center gap-1.5">
+              <AlertCircle className="w-3.5 h-3.5" />
+              <span>{formError}</span>
+            </p>
+          ) : (
+            <p className="text-[11px] text-zinc-500">
+              Creates a queue record only — nothing is downloaded, edited or stored beyond the URL.
+            </p>
+          )}
+          <button
+            onClick={handleCreateTask}
+            disabled={isSubmitting}
+            className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-all cursor-pointer disabled:opacity-50 w-max"
+          >
+            <span>{isSubmitting ? 'Saving…' : 'Add to queue'}</span>
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -89,12 +161,17 @@ export function MediaScreen() {
         <div className="lg:col-span-5 bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden flex flex-col">
           <div className="p-3.5 border-b border-zinc-800 bg-zinc-950/60 flex items-center justify-between">
             <span className="text-xs font-semibold text-zinc-300">
-              Processed Media Tasks ({tasks.length})
+              Requested Media Tasks ({tasks.length})
             </span>
-            <span className="text-[10px] text-zinc-500 font-mono">Retention: 30 days</span>
+            <span className="text-[10px] text-zinc-500 font-mono">Retention policy: {tasks[0]?.retentionDays ?? 30} days</span>
           </div>
 
           <div className="divide-y divide-zinc-800/60 overflow-y-auto max-h-[500px]">
+            {tasks.length === 0 && (
+              <p className="text-xs text-zinc-500 p-5 text-center">
+                No photo requests recorded yet.
+              </p>
+            )}
             {tasks.map((t) => {
               const isSelected = selectedTask?.id === t.id;
               return (
@@ -107,7 +184,7 @@ export function MediaScreen() {
                 >
                   <div className="flex items-center gap-3">
                     <img
-                      src={t.processedUrl || t.originalUrl}
+                      src={t.originalUrl}
                       alt={t.userName}
                       className="w-10 h-10 rounded-lg object-cover border border-zinc-700"
                     />
@@ -120,7 +197,7 @@ export function MediaScreen() {
                   </div>
 
                   <div className="text-right">
-                    <span className="text-[10px] px-2 py-0.5 rounded font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                    <span className={`text-[10px] px-2 py-0.5 rounded font-semibold border ${statusStyle(t.status)}`}>
                       {t.status}
                     </span>
                     <p className="text-[9px] text-zinc-500 mt-1">
@@ -133,87 +210,71 @@ export function MediaScreen() {
           </div>
         </div>
 
-        {/* Right Column: Preview & Biometric Specs Inspector */}
+        {/* Right Column: Request Detail */}
         <div className="lg:col-span-7 bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
           {selectedTask ? (
             <>
               <div className="flex items-center justify-between pb-3 border-b border-zinc-800">
                 <div>
                   <h3 className="text-sm font-bold text-white">
-                    {selectedTask.userName} — {selectedTask.operation}
+                    {selectedTask.userName} — {selectedTask.operation.replace('_', ' ')}
                   </h3>
                   <p className="text-xs text-zinc-400 mt-0.5">
-                    Verified compliant with Rwanda Directorate General of Immigration & Emigration.
+                    Requested by {selectedTask.userId} • task {selectedTask.id}
                   </p>
                 </div>
-                <div className="flex items-center gap-1.5 text-xs text-emerald-400 font-semibold px-2.5 py-1 rounded bg-emerald-500/10 border border-emerald-500/20">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>35x45mm Biometric Passed</span>
-                </div>
+                <span className={`flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded border ${statusStyle(selectedTask.status)}`}>
+                  {selectedTask.status === 'COMPLETED' ? <CheckCircle2 className="w-3.5 h-3.5" /> : <Clock className="w-3.5 h-3.5" />}
+                  <span>{selectedTask.status}</span>
+                </span>
               </div>
 
-              {/* Image Preview Canvas */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800 text-center space-y-2">
-                  <span className="text-[10px] text-zinc-400 font-medium uppercase tracking-wider block">
-                    Original User Upload
-                  </span>
-                  <div className="w-40 h-48 mx-auto rounded-lg overflow-hidden border border-zinc-700 bg-zinc-900">
-                    <img
-                      src={selectedTask.originalUrl}
-                      alt="Original"
-                      className="w-full h-full object-cover"
-                    />
-                  </div>
-                  <p className="text-[10px] text-zinc-500">Unfiltered mobile capture</p>
+              <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800 text-center space-y-2">
+                <span className="text-[10px] text-zinc-400 font-medium uppercase tracking-wider block">
+                  Uploaded source image
+                </span>
+                <div className="w-40 h-48 mx-auto rounded-lg overflow-hidden border border-zinc-700 bg-zinc-900">
+                  <img
+                    src={selectedTask.originalUrl}
+                    alt="Original"
+                    className="w-full h-full object-cover"
+                  />
                 </div>
+                <p className="text-[10px] text-zinc-500 break-all px-2">{selectedTask.originalUrl}</p>
+              </div>
 
+              {selectedTask.processedUrl ? (
                 <div className="p-3 rounded-lg bg-zinc-950 border border-emerald-500/30 text-center space-y-2">
                   <span className="text-[10px] text-emerald-400 font-medium uppercase tracking-wider block">
-                    Processed 35x45mm Output
+                    Edited output
                   </span>
                   <div className="w-40 h-48 mx-auto rounded-lg overflow-hidden border-2 border-emerald-500 bg-white shadow-md">
                     <img
-                      src={selectedTask.processedUrl || selectedTask.originalUrl}
+                      src={selectedTask.processedUrl}
                       alt="Processed"
                       className="w-full h-full object-cover"
                     />
                   </div>
-                  <p className="text-[10px] text-emerald-400 font-semibold">
-                    White Background • Centered Crop
-                  </p>
                 </div>
-              </div>
+              ) : (
+                <div className="p-4 rounded-lg bg-zinc-950 border border-amber-500/20 text-xs text-amber-400 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>
+                    No edited output exists for this task. Passport compliance checks (35x45mm crop,
+                    plain background, face coverage) are not performed by this service — connect an
+                    image editing backend and mark the task COMPLETED when it returns a file.
+                  </span>
+                </div>
+              )}
 
-              {/* Compliance Checklist */}
-              <div className="p-4 rounded-lg bg-zinc-950 border border-zinc-800 space-y-2 text-xs">
-                <h4 className="font-semibold text-zinc-200 flex items-center gap-1.5">
-                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                  <span>Rwanda Passport & DPPA Compliance Check</span>
-                </h4>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-zinc-400 text-[11px] pt-1">
-                  <p className="flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Aspect Ratio: 35mm x 45mm</span>
-                  </p>
-                  <p className="flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Background: Clean Studio White</span>
-                  </p>
-                  <p className="flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Facial Area: 70-80% frame coverage</span>
-                  </p>
-                  <p className="flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Auto-delete: {selectedTask.retentionDays} days retention</span>
-                  </p>
-                </div>
-              </div>
+              <p className="text-[11px] text-zinc-500">
+                Retention: records reference the source URL for {selectedTask.retentionDays} days. Deletion
+                must be enforced by the media store that hosts the file.
+              </p>
             </>
           ) : (
             <div className="text-center py-16 text-zinc-500 text-xs">
-              Select a media task to inspect preview
+              No request selected. Photo tasks appear here after a WhatsApp user sends an image.
             </div>
           )}
         </div>

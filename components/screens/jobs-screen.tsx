@@ -27,6 +27,7 @@ export function JobsScreen() {
   const [isRemoteOnly, setIsRemoteOnly] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [crawlingSource, setCrawlingSource] = useState<string | null>(null);
+  const [sourceNotice, setSourceNotice] = useState('');
 
   const loadJobs = () => {
     setIsLoading(true);
@@ -69,17 +70,29 @@ export function JobsScreen() {
 
   const handleCrawl = async (sourceCode: string) => {
     setCrawlingSource(sourceCode);
+    setSourceNotice('');
     try {
       const res = await fetch('/api/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'CRAWL_SOURCE', sourceCode }),
       });
-      if (res.ok) {
-        loadJobs();
+      const data = await res.json();
+      const status = data?.result?.status;
+      if (status === 'NOT_CONFIGURED') {
+        setSourceNotice(
+          `${sourceCode}: no crawler is connected to this board yet, so nothing was fetched.`
+        );
+      } else if (status === 'UNKNOWN_SOURCE') {
+        setSourceNotice(`${sourceCode} is not registered on this server.`);
+      } else if (!res.ok) {
+        setSourceNotice(data?.error || 'The crawl request failed.');
+      } else {
+        setSourceNotice(`${sourceCode}: ${data?.result?.crawledCount ?? 0} listing(s) imported.`);
       }
+      loadJobs();
     } catch (err) {
-      console.error('Crawl failed:', err);
+      setSourceNotice(err instanceof Error ? err.message : 'Crawl request failed.');
     } finally {
       setCrawlingSource(null);
     }
@@ -110,7 +123,8 @@ export function JobsScreen() {
             <span>Jobs Discovery & Verification Hub</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Authoritative, robots-compliant job ingestion from MIFOTRA, Job in Rwanda, and verified remote portals. Zero hallucination policy.
+            Listings are only what has been imported or manually added — the platform never generates a
+            vacancy. Live crawlers for MIFOTRA, Job in Rwanda and remote boards are not connected yet.
           </p>
         </div>
 
@@ -146,25 +160,45 @@ export function JobsScreen() {
                   <ExternalLink className="w-2.5 h-2.5" />
                 </a>
               </div>
-              <span className="text-[10px] px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-semibold">
-                {src.healthStatus}
+              <span
+                className={`text-[10px] px-2 py-0.5 rounded-md font-semibold border ${
+                  src.healthStatus === 'HEALTHY'
+                    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                    : src.healthStatus === 'DOWN'
+                    ? 'bg-red-500/10 text-red-400 border-red-500/20'
+                    : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                }`}
+              >
+                {src.healthStatus === 'UNKNOWN' ? 'Not crawled yet' : src.healthStatus}
               </span>
             </div>
 
             <div className="flex items-center justify-between pt-2 border-t border-zinc-800 text-[11px]">
-              <span className="text-zinc-400">{src.activeListingsCount} verified listings</span>
+              <span className="text-zinc-400">
+                {src.activeListingsCount} stored listing(s)
+                {src.lastCrawledAt
+                  ? ` • synced ${new Date(src.lastCrawledAt).toLocaleString()}`
+                  : ' • never synced'}
+              </span>
               <button
                 onClick={() => handleCrawl(src.code)}
                 disabled={crawlingSource === src.code}
                 className="flex items-center gap-1 px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-emerald-400 font-semibold text-[10px] border border-zinc-700 transition-colors disabled:opacity-50"
               >
                 <RefreshCw className={`w-2.5 h-2.5 ${crawlingSource === src.code ? 'animate-spin' : ''}`} />
-                <span>{crawlingSource === src.code ? 'Crawling...' : 'Sync Feed'}</span>
+                <span>{crawlingSource === src.code ? 'Trying…' : 'Attempt sync'}</span>
               </button>
             </div>
           </div>
         ))}
       </div>
+
+      {sourceNotice && (
+        <p className="text-[11px] text-amber-400 flex items-center gap-1.5 -mt-3">
+          <AlertCircle className="w-3.5 h-3.5" />
+          <span>{sourceNotice}</span>
+        </p>
+      )}
 
       {/* Filters Bar */}
       <div className="p-3.5 rounded-xl bg-zinc-900 border border-zinc-800 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
@@ -219,6 +253,14 @@ export function JobsScreen() {
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800/60">
+              {jobs.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="py-12 text-center text-xs text-zinc-500">
+                    No job records stored yet. Import listings from the admin job form once a live
+                    crawler is connected, or wait for verified feeds to populate the store.
+                  </td>
+                </tr>
+              )}
               {jobs.map((job) => (
                 <tr key={job.id} className="hover:bg-zinc-800/30 transition-colors">
                   <td className="py-3.5 px-4">

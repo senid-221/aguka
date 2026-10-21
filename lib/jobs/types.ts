@@ -21,12 +21,12 @@ export interface ConnectorHealthReport {
   sourceCode: string;
   name: string;
   baseUrl: string;
-  status: 'HEALTHY' | 'DEGRADED' | 'DOWN';
+  status: 'HEALTHY' | 'DEGRADED' | 'DOWN' | 'UNKNOWN';
   lastSyncAt?: string;
   latencyMs: number;
   activeListingsCount: number;
   robotsPermitted: boolean;
-  termsCompliant: boolean;
+  termsCompliant?: boolean;
   lastErrorMessage?: string;
 }
 

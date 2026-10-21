@@ -17,6 +17,12 @@ export function StudyScreen() {
   const [sessions, setSessions] = useState<StudySession[]>([]);
   const [selectedSession, setSelectedSession] = useState<StudySession | null>(null);
   const [selectedAnswers, setSelectedAnswers] = useState<Record<string, number>>({});
+  const [userId, setUserId] = useState('');
+  const [subject, setSubject] = useState('');
+  const [topic, setTopic] = useState('');
+  const [language, setLanguage] = useState<'KINYARWANDA' | 'ENGLISH'>('KINYARWANDA');
+  const [isRequesting, setIsRequesting] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     let isMounted = true;
@@ -40,6 +46,40 @@ export function StudyScreen() {
     setSelectedAnswers((prev) => ({ ...prev, [quizId]: answerIdx }));
   };
 
+  const handleRequestLesson = async () => {
+    if (!userId.trim() || !topic.trim()) {
+      setError('A user ID and a topic are required.');
+      return;
+    }
+    setError('');
+    setIsRequesting(true);
+    try {
+      const res = await fetch('/api/study', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'CREATE_SESSION',
+          userId: userId.trim(),
+          subject: subject.trim() || 'General',
+          topic: topic.trim(),
+          language,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.session) {
+        setSessions((prev) => [data.session, ...prev]);
+        setSelectedSession(data.session);
+        setTopic('');
+      } else {
+        setError(data.error || 'The tutor could not prepare a lesson.');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Network failure.');
+    } finally {
+      setIsRequesting(false);
+    }
+  };
+
   return (
     <div className="p-4 sm:p-6 space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -49,9 +89,59 @@ export function StudyScreen() {
             <span>AI Tutoring & Bilingual Concept Engine</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Explaining STEM, computer science, and career concepts in clear Kinyarwanda & English with interactive quizzes and retention flashcards.
+            Lessons and concept checks are written by Gemini at request time. Nothing is pre-written:
+            with no API key the tutor returns a configuration error instead of a canned lesson.
           </p>
         </div>
+      </div>
+
+      <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-3">
+        <p className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
+          <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+          <span>Ask the tutor for a lesson</span>
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
+          <input
+            value={userId}
+            onChange={(e) => setUserId(e.target.value)}
+            placeholder="User ID"
+            className="bg-zinc-950 text-zinc-100 placeholder-zinc-500 text-xs rounded-lg px-3 py-2 border border-zinc-800 outline-hidden focus:border-emerald-500/50"
+          />
+          <input
+            value={subject}
+            onChange={(e) => setSubject(e.target.value)}
+            placeholder="Subject (e.g. Mathematics)"
+            className="bg-zinc-950 text-zinc-100 placeholder-zinc-500 text-xs rounded-lg px-3 py-2 border border-zinc-800 outline-hidden focus:border-emerald-500/50"
+          />
+          <input
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
+            placeholder="Topic (e.g. Binary Search)"
+            className="bg-zinc-950 text-zinc-100 placeholder-zinc-500 text-xs rounded-lg px-3 py-2 border border-zinc-800 outline-hidden focus:border-emerald-500/50"
+          />
+          <select
+            value={language}
+            onChange={(e) => setLanguage(e.target.value as 'KINYARWANDA' | 'ENGLISH')}
+            className="bg-zinc-950 text-zinc-100 text-xs rounded-lg px-3 py-2 border border-zinc-800 outline-hidden"
+          >
+            <option value="KINYARWANDA">Kinyarwanda</option>
+            <option value="ENGLISH">English</option>
+          </select>
+          <button
+            onClick={handleRequestLesson}
+            disabled={isRequesting}
+            className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors cursor-pointer disabled:opacity-50"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>{isRequesting ? 'Writing lesson…' : 'Generate lesson'}</span>
+          </button>
+        </div>
+        {error && (
+          <p className="text-[11px] text-red-400 flex items-center gap-1.5">
+            <HelpCircle className="w-3.5 h-3.5" />
+            <span>{error}</span>
+          </p>
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -64,6 +154,11 @@ export function StudyScreen() {
           </div>
 
           <div className="divide-y divide-zinc-800/60 overflow-y-auto">
+            {sessions.length === 0 && (
+              <p className="text-xs text-zinc-500 p-5 text-center">
+                No lessons generated yet.
+              </p>
+            )}
             {sessions.map((s) => {
               const isSelected = selectedSession?.id === s.id;
               return (
@@ -186,7 +281,7 @@ export function StudyScreen() {
             </>
           ) : (
             <div className="text-center py-16 text-zinc-500 text-xs">
-              Select a module to view notes and quizzes
+              No lesson selected. Generate one above, or open a session saved by a WhatsApp student.
             </div>
           )}
         </div>

@@ -1,20 +1,25 @@
-import { GoogleGenAI } from '@google/genai';
 import { getGeminiClient, GEMINI_MODEL } from '@/lib/gemini';
 import { redactSecrets } from '@/lib/ai/prompt-security';
 import { logger } from '@/lib/logging/logger';
 
 export interface AIProviderResponse {
   text: string;
+  tokensInput: number;
+  tokensOutput: number;
   tokensUsed: number;
   latencyMs: number;
   model: string;
-  provider: 'gemini' | 'mock';
+  provider: 'gemini';
 }
 
 export interface IAIProvider {
   readonly name: string;
   readonly model: string;
-  generateResponse(prompt: string, systemInstruction?: string): Promise<AIProviderResponse>;
+  generateResponse(
+    prompt: string,
+    systemInstruction?: string,
+    options?: { json?: boolean }
+  ): Promise<AIProviderResponse>;
   healthCheck(): Promise<{ ok: boolean; provider: string; model: string; latencyMs: number }>;
 }
 
@@ -25,7 +30,11 @@ export class GeminiAIProvider implements IAIProvider {
   readonly name = 'Google Gemini';
   readonly model = GEMINI_MODEL;
 
-  async generateResponse(prompt: string, systemInstruction?: string): Promise<AIProviderResponse> {
+  async generateResponse(
+    prompt: string,
+    systemInstruction?: string,
+    options?: { json?: boolean }
+  ): Promise<AIProviderResponse> {
     const startTime = Date.now();
     const client = getGeminiClient();
 
@@ -36,23 +45,31 @@ export class GeminiAIProvider implements IAIProvider {
     const response = await client.models.generateContent({
       model: this.model,
       contents: prompt,
-      config: systemInstruction
-        ? { systemInstruction }
-        : undefined,
+      config: {
+        ...(systemInstruction ? { systemInstruction } : {}),
+        ...(options?.json ? { responseMimeType: 'application/json' } : {}),
+      },
     });
 
     const rawText = response.text || '';
     const cleanText = redactSecrets(rawText);
     const latencyMs = Date.now() - startTime;
+    const usage = (response as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number } })
+      .usageMetadata;
+    const tokensInput = usage?.promptTokenCount ?? 0;
+    const tokensOutput = usage?.candidatesTokenCount ?? 0;
+    const tokensUsed = usage?.totalTokenCount ?? tokensInput + tokensOutput;
 
     logger.info('AI_GENERATION_SUCCESS', 'Gemini response generated successfully', {
       latencyMs,
-      metadata: { model: this.model, promptLength: prompt.length },
+      metadata: { model: this.model, promptLength: prompt.length, tokensUsed },
     });
 
     return {
       text: cleanText,
-      tokensUsed: 260,
+      tokensInput,
+      tokensOutput,
+      tokensUsed,
       latencyMs,
       model: this.model,
       provider: 'gemini',
@@ -73,57 +90,18 @@ export class GeminiAIProvider implements IAIProvider {
   }
 }
 
-/**
- * Resilient Mock AI Provider for offline, testing, and zero-cost local execution
- */
-export class MockAIProvider implements IAIProvider {
-  readonly name = 'Aguka Mock AI Provider';
-  readonly model = 'mock-bilingual-3.8';
-
-  async generateResponse(prompt: string): Promise<AIProviderResponse> {
-    const startTime = Date.now();
-    const p = prompt.toLowerCase();
-
-    let reply = 'Aguka AI bilingual assistant ready to assist.';
-    if (p.includes('akazi') || p.includes('mifotra') || p.includes('job')) {
-      reply = 'Nakuboneye imyanya y’akazi yizewe mu Rwanda muri MINICT / RISA, Bank of Kigali, na Remote Tech. Wifuza ko ngufasha gutegura CV?';
-    } else if (p.includes('cv') || p.includes('ibaruwa') || p.includes('cover letter')) {
-      reply = 'Niteguye kugufasha gukora CV igezweho mu Kinyarwanda cyangwa mu Cyongereza hakurikijwe amabwiriza yo mu Rwanda.';
-    } else if (p.includes('sobanura') || p.includes('tutor') || p.includes('binary search')) {
-      reply = 'Binary Search ni uburyo bwo gushaka ikintu mu rutonde rutondekanye (sorted array) bufata igihe cya O(log n).';
-    } else if (p.includes('scaffold') || p.includes('code') || p.includes('typescript')) {
-      reply = 'Generated TypeScript microservice scaffold with HMAC webhook verification and Dockerfile configuration.';
-    }
-
-    return {
-      text: reply,
-      tokensUsed: 140,
-      latencyMs: Date.now() - startTime,
-      model: this.model,
-      provider: 'mock',
-    };
-  }
-
-  async healthCheck(): Promise<{ ok: boolean; provider: string; model: string; latencyMs: number }> {
-    return {
-      ok: true,
-      provider: this.name,
-      model: this.model,
-      latencyMs: 1,
-    };
-  }
-}
-
 let activeProvider: IAIProvider | null = null;
 
-export function getAIProvider(): IAIProvider {
+/**
+ * Returns the configured provider, or null when no AI credentials are present.
+ * Callers must surface an honest "not configured" reply instead of inventing one.
+ */
+export function getAIProvider(): IAIProvider | null {
   if (activeProvider) return activeProvider;
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (apiKey && apiKey !== 'MY_GEMINI_API_KEY') {
     activeProvider = new GeminiAIProvider();
-  } else {
-    activeProvider = new MockAIProvider();
   }
 
   return activeProvider;

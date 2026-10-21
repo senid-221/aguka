@@ -13,12 +13,12 @@ simulator, consent management, and an automated test suite.
 
 | Module | What it does |
 | --- | --- |
-| **Jobs Discovery** | Verified listings from MIFOTRA e-recruitment, Job in Rwanda and remote tech sources, normalised into one shape. No generated listings. |
-| **Career Assistant** | Bilingual CV building, cover letters and interview coaching; applications require explicit user consent. |
-| **Coding Agent** | Scaffolded microservices, debugging and architecture maps produced in an isolated prompt context, without shell access. |
-| **Passport & Photo Studio** | Biometric 35×45 mm passport checks and CV portrait work, with a 30-day media retention sweep. |
-| **Study Tutor** | STEM and language explanations in Kinyarwanda or English, plus quizzes. |
-| **Employment Marketplace** | Rwandan worker profiles, vacancies and explainable match scores. |
+| **Jobs Discovery** | Registered boards (MIFOTRA e-recruitment, Job in Rwanda, a remote feed) and one normalised listing shape. No live crawler is wired yet, so the pool starts empty and grows only through `POST /api/jobs` with a real `sourceUrl`. Nothing is invented. |
+| **Career Assistant** | Bilingual CV, cover letter and interview coaching text through the AI model; applications require explicit user consent. |
+| **Coding Agent** | Scaffolds, debugging and architecture explanations returned as text by Gemini through `POST /api/coding`. There is no execution sandbox. |
+| **Passport & Photo Studio** | Written guidance on the 35×45 mm Rwandan passport standard and CV portraits. Image editing does not run here; a 30-day retention sweep marks expired media records. |
+| **Study Tutor** | STEM and language explanations in Kinyarwanda or English, plus generated quizzes through `POST /api/study`. |
+| **Employment Marketplace** | Worker profiles, vacancies and match scores computed from stored skills, location and experience. |
 | **Users & Consent** | DPPA consent records and per-user data controls. |
 
 ## Architecture
@@ -28,7 +28,7 @@ WhatsApp user → Meta Cloud API webhook → Next.js route handler
     → signature check + event deduplication
     → bilingual router (language detection → agent selection)
     → Gemini provider adapter
-    → reply via Meta Cloud API (or simulated store)
+    → reply via Meta Cloud API, or a NOT_CONFIGURED result when credentials are absent
 ```
 
 - **Ingress & validation** — `app/api/whatsapp/webhook/route.ts` verifies the Meta `X-Hub-Signature-256`
@@ -40,19 +40,21 @@ WhatsApp user → Meta Cloud API webhook → Next.js route handler
 - **Queue** — `lib/queue/redis-queue.ts` keeps jobs, retries and scheduled tasks in process memory.
   When `REDIS_URL` is set it reports a `Redis BullMQ` mode label, but no Redis client connects; a
   real deployment should replace this with an actual BullMQ worker.
-- **Data** — `lib/db/repository.ts` is backed by `lib/db/mock-data.ts`, including webhook event
-  deduplication via `isMessageAlreadyProcessed`. The normalised PostgreSQL models live in
-  `prisma/schema.prisma` with initial migration SQL in `prisma/migrations/`.
+- **Data** — `lib/db/repository.ts` is an in-memory store that starts empty: no users, conversations,
+  jobs, profiles or agent runs exist until real traffic or an explicit API call creates them, and
+  everything clears on restart. Webhook deduplication uses `isMessageAlreadyProcessed`. The
+  normalised PostgreSQL models live in `prisma/schema.prisma` with initial migration SQL in
+  `prisma/migrations/`.
 - **Limits** — `lib/security/rate-limiter.ts` implements a per-user sliding window and a daily AI
   token budget, but the webhook does not call it yet: enforce it by invoking `usageLimiter.check()`
   before `executeAgent` and `usageLimiter.recordTokens()` after, as described in
   [`docs/CHANGELOG_EXTENSIONS.md`](docs/CHANGELOG_EXTENSIONS.md). `lib/security/admin-auth.ts`
   issues HS256 tokens protecting `POST /api/admin/maintenance`.
 
-> The repository has no runtime dependency on Postgres, Redis or S3 clients. It boots and completes
-> end-to-end conversations with only a Gemini key — or with none, using the mock provider fallback.
-> To persist to PostgreSQL, add `prisma` and `@prisma/client`, point `DATABASE_URL` at your
-> database and apply `prisma/migrations/`.
+> The repository has no runtime dependency on Postgres, Redis or S3 clients. With a Gemini key and
+> Meta credentials it answers and delivers for real; without them every screen shows an honest empty
+> or not-configured state rather than sample data. To persist to PostgreSQL, add `prisma` and
+> `@prisma/client`, point `DATABASE_URL` at your database and apply `prisma/migrations/`.
 
 ## Requirements
 
@@ -66,8 +68,9 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Open http://localhost:3000 for the admin console. With no credentials configured, the gateway
-reports simulated mode and the AI layer uses the mock fallback, so every screen is explorable.
+Open http://localhost:3000 for the admin console. With no credentials configured it starts empty and
+every screen says so: agents reply with an "AI provider not configured" notice, the gateway reports
+`NOT_CONFIGURED` instead of delivering, and admin login is disabled until `ADMIN_JWT_SECRET` is set.
 
 ## Configuration
 
@@ -76,11 +79,12 @@ All variables are documented in [`.env.example`](.env.example) and validated at 
 
 | Variable | Purpose |
 | --- | --- |
-| `GEMINI_API_KEY` | Google Gemini key for live AI responses. |
+| `GEMINI_API_KEY` | Google Gemini key for live AI responses. Without it no reply text is generated. |
+| `GEMINI_MODEL` | Model id sent to Gemini; defaults to `gemini-2.5-flash`. |
 | `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET` | Meta Cloud API credentials; required for live send and webhook signature verification. |
-| `WHATSAPP_VERIFY_TOKEN` | Must match the token entered in Meta's webhook configuration. |
+| `WHATSAPP_VERIFY_TOKEN` | Must match the token entered in Meta's webhook configuration. No default ships with the code, so the handshake fails until you set it. |
 | `DATABASE_URL`, `REDIS_URL` | Opt-in PostgreSQL and Redis backends. |
-| `ADMIN_JWT_SECRET`, `ADMIN_DEFAULT_EMAIL`, `ADMIN_DEFAULT_PASSWORD` | Admin login used by `POST /api/admin/login`. |
+| `ADMIN_JWT_SECRET`, `ADMIN_DEFAULT_EMAIL`, `ADMIN_DEFAULT_PASSWORD` | Admin login used by `POST /api/admin/login`. All three are required; there is no fallback secret or demo account. |
 | `MAX_MESSAGES_PER_MINUTE_PER_USER`, `MAX_DAILY_AI_TOKENS_PER_USER` | Rate and budget limits read by `UsageLimiter`; enforcement still needs wiring. |
 
 Replace the placeholder secrets in `.env.example` before using them anywhere real, and never commit
@@ -94,8 +98,9 @@ Replace the placeholder secrets in `.env.example` before using them anywhere rea
    `WHATSAPP_VERIFY_TOKEN`.
 4. Subscribe the webhook to the `messages` field.
 
-For testing without Meta credentials, use the **Live WhatsApp Simulator** screen, which posts real
-webhook payloads to the same endpoints.
+For testing without Meta credentials, use the **WhatsApp Simulator** screen. It builds a real webhook
+payload and runs it through the same pipeline locally — it never dispatches anything to Meta or to a
+phone number, and the screen labels the result as a local payload preview.
 
 ## API routes
 
@@ -104,7 +109,7 @@ webhook payloads to the same endpoints.
 | `/api/whatsapp/webhook` | GET, POST | Meta subscription handshake and signed inbound messages. |
 | `/api/whatsapp/simulate` | POST | Inject a test message through the full pipeline. |
 | `/api/jobs`, `/api/marketplace`, `/api/study`, `/api/coding`, `/api/media`, `/api/users` | GET, POST | Console data feeds and module actions. |
-| `/api/agents`, `/api/conversations` | GET | Agent registry and conversation history. |
+| `/api/agents`, `/api/conversations` | GET | Recorded agent runs and conversation history. |
 | `/api/admin/login` | POST | Issue an admin bearer token. |
 | `/api/admin/maintenance` | POST | Retention sweep and queue drain; requires a bearer token. |
 | `/api/health`, `/api/ready`, `/api/tests` | GET | Liveness, readiness and the automated suite. |
@@ -118,8 +123,9 @@ npx tsx scripts/run-extension-tests.ts
 
 Coverage includes the webhook challenge, invalid-token rejection, HMAC signature verification,
 event deduplication idempotency, Kinyarwanda/English detection, agent intent routing, prompt
-injection resistance, secret redaction, and job match explainability. The same suite runs from the
-**Run Test Suite** button in the console topbar.
+injection resistance, secret redaction, marketplace matching driven only by stored records, the AI
+provider contract, and the queue lifecycle. The same suite runs from the **Run Test Suite** button in
+the console topbar.
 
 ## Database
 

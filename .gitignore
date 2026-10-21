@@ -3,6 +3,8 @@ node_modules/
 coverage/
 .DS_Store
 *.log
+*.tsbuildinfo
+package-lock.json
 .env*
 !.env.example
 

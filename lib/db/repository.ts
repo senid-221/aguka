@@ -20,72 +20,66 @@ import {
   Consent,
   UserPreference,
 } from '@/lib/types';
-import {
-  INITIAL_JOB_SOURCES,
-  INITIAL_JOB_LISTINGS,
-  INITIAL_USERS,
-  INITIAL_WORKER_PROFILES,
-  INITIAL_EMPLOYER_PROFILES,
-  INITIAL_VACANCIES,
-  INITIAL_JOB_MATCHES,
-  INITIAL_CONVERSATIONS,
-  INITIAL_MEDIA_TASKS,
-  INITIAL_CODING_TASKS,
-  INITIAL_STUDY_SESSIONS,
-  INITIAL_AGENT_RUNS,
-  INITIAL_TOOL_CALL_TRACES,
-  INITIAL_QUEUED_JOBS,
-  INITIAL_WEBHOOK_EVENTS,
-} from './mock-data';
+import { GEMINI_MODEL } from '@/lib/gemini';
+
+// Boards the platform is configured to read. Health and listing counts stay
+// unknown until a real crawl populates them.
+const KNOWN_JOB_SOURCES: JobSource[] = [
+  {
+    id: 'src-mifotra',
+    name: 'MIFOTRA E-Recruitment Portal',
+    code: 'MIFOTRA',
+    baseUrl: 'https://recruitment.mifotra.gov.rw',
+    isPermitted: true,
+    healthStatus: 'UNKNOWN',
+    lastCrawledAt: null,
+    activeListingsCount: 0,
+  },
+  {
+    id: 'src-jobinrwanda',
+    name: 'Job in Rwanda Official Feed',
+    code: 'JOB_IN_RWANDA',
+    baseUrl: 'https://www.jobinrwanda.com',
+    isPermitted: true,
+    healthStatus: 'UNKNOWN',
+    lastCrawledAt: null,
+    activeListingsCount: 0,
+  },
+  {
+    id: 'src-remote-africa',
+    name: 'Global Remote Tech for Africa',
+    code: 'REMOTE_TECH',
+    baseUrl: 'https://weworkremotely.com',
+    isPermitted: true,
+    healthStatus: 'UNKNOWN',
+    lastCrawledAt: null,
+    activeListingsCount: 0,
+  },
+];
 
 // Singleton in-memory state store that persists across server requests
 class AppRepository {
-  private users: User[] = [...INITIAL_USERS];
-  private jobSources: JobSource[] = [...INITIAL_JOB_SOURCES];
-  private jobListings: JobListing[] = [...INITIAL_JOB_LISTINGS];
-  private workerProfiles: WorkerProfile[] = [...INITIAL_WORKER_PROFILES];
-  private employerProfiles: EmployerProfile[] = [...INITIAL_EMPLOYER_PROFILES];
-  private vacancies: Vacancy[] = [...INITIAL_VACANCIES];
-  private jobMatches: JobMatch[] = [...INITIAL_JOB_MATCHES];
-  private conversations: Conversation[] = [...INITIAL_CONVERSATIONS];
-  private mediaTasks: MediaTask[] = [...INITIAL_MEDIA_TASKS];
-  private codingTasks: CodingTask[] = [...INITIAL_CODING_TASKS];
-  private studySessions: StudySession[] = [...INITIAL_STUDY_SESSIONS];
-  private agentRuns: AgentRun[] = [...INITIAL_AGENT_RUNS];
-  private toolCallTraces: ToolCallTrace[] = [...INITIAL_TOOL_CALL_TRACES];
-  private queuedJobs: QueuedJob[] = [...INITIAL_QUEUED_JOBS];
-  private webhookEvents: WebhookEventRecord[] = [...INITIAL_WEBHOOK_EVENTS];
-  private processedMessageIds: Set<string> = new Set([
-    'wamid.HBgLMjUwNzg4OTEyMzQ1FQIAEhgg...',
-    'wamid.HBgLMjUwNzgwMTEyMjMzFQIAEhgg...',
-  ]);
+  private users: User[] = [];
+  private jobSources: JobSource[] = [...KNOWN_JOB_SOURCES];
+  private jobListings: JobListing[] = [];
+  private workerProfiles: WorkerProfile[] = [];
+  private employerProfiles: EmployerProfile[] = [];
+  private vacancies: Vacancy[] = [];
+  private jobMatches: JobMatch[] = [];
+  private conversations: Conversation[] = [];
+  private mediaTasks: MediaTask[] = [];
+  private codingTasks: CodingTask[] = [];
+  private studySessions: StudySession[] = [];
+  private agentRuns: AgentRun[] = [];
+  private toolCallTraces: ToolCallTrace[] = [];
+  private queuedJobs: QueuedJob[] = [];
+  private webhookEvents: WebhookEventRecord[] = [];
+  private processedMessageIds: Set<string> = new Set();
 
   // Consents & Preferences
-  private userConsents: Map<string, Consent[]> = new Map([
-    [
-      'usr-rw-01',
-      [
-        { id: 'c-1', userId: 'usr-rw-01', type: 'TERMS_OF_SERVICE', granted: true, grantedAt: '2026-10-01T10:00:00Z' },
-        { id: 'c-2', userId: 'usr-rw-01', type: 'PRIVACY_POLICY', granted: true, grantedAt: '2026-10-01T10:00:00Z' },
-        { id: 'c-3', userId: 'usr-rw-01', type: 'JOB_ALERTS', granted: true, grantedAt: '2026-10-01T10:00:00Z' },
-      ],
-    ],
-  ]);
+  private userConsents: Map<string, Consent[]> = new Map();
 
-  private userPreferences: Map<string, UserPreference> = new Map([
-    [
-      'usr-rw-01',
-      {
-        id: 'pref-1',
-        userId: 'usr-rw-01',
-        quietHoursStart: '21:00',
-        quietHoursEnd: '07:00',
-        notifyViaSms: false,
-        notifyViaWa: true,
-        autoCvSharing: false,
-      },
-    ],
-  ]);
+  private userPreferences: Map<string, UserPreference> = new Map();
 
   // --- Users ---
   getUsers(): User[] {
@@ -203,12 +197,11 @@ class AppRepository {
   }
 
   triggerSourceCrawl(sourceCode: string): { status: string; crawledCount: number } {
+    // No live crawler is wired to these boards yet, so a crawl yields nothing and
+    // must not rewrite source health.
     const source = this.jobSources.find((s) => s.code === sourceCode);
-    if (source) {
-      source.lastCrawledAt = new Date().toISOString();
-      source.healthStatus = 'HEALTHY';
-    }
-    return { status: 'SUCCESS', crawledCount: 4 };
+    if (!source) return { status: 'UNKNOWN_SOURCE', crawledCount: 0 };
+    return { status: 'NOT_CONFIGURED', crawledCount: 0 };
   }
 
   // --- Employment Marketplace ---
@@ -232,7 +225,7 @@ class AppRepository {
     const newProfile: WorkerProfile = {
       ...profile,
       id: `wp-${Date.now()}`,
-      rating: 5.0,
+      rating: 0,
       completedJobsCount: 0,
     };
     this.workerProfiles.unshift(newProfile);
@@ -400,14 +393,12 @@ class AppRepository {
     return this.mediaTasks;
   }
 
-  createMediaTask(task: Omit<MediaTask, 'id' | 'createdAt' | 'status'>): MediaTask {
+  createMediaTask(task: Omit<MediaTask, 'id' | 'createdAt' | 'status' | 'processedUrl'>): MediaTask {
     const newTask: MediaTask = {
       ...task,
       id: `med-${Date.now()}`,
-      status: 'COMPLETED',
+      status: 'PENDING',
       createdAt: new Date().toISOString(),
-      completedAt: new Date().toISOString(),
-      processedUrl: task.originalUrl,
     };
     this.mediaTasks.unshift(newTask);
     return newTask;
@@ -418,11 +409,10 @@ class AppRepository {
     return this.codingTasks;
   }
 
-  createCodingTask(task: Omit<CodingTask, 'id' | 'createdAt' | 'status'>): CodingTask {
+  createCodingTask(task: Omit<CodingTask, 'id' | 'createdAt'>): CodingTask {
     const newTask: CodingTask = {
       ...task,
       id: `code-${Date.now()}`,
-      status: 'COMPLETED',
       createdAt: new Date().toISOString(),
     };
     this.codingTasks.unshift(newTask);
@@ -434,10 +424,10 @@ class AppRepository {
     return this.studySessions;
   }
 
-  createStudySession(session: Omit<StudySession, 'id' | 'createdAt'>): StudySession {
+  createStudySession(session: Omit<StudySession, 'id' | 'createdAt'> & { id?: string }): StudySession {
     const newSession: StudySession = {
       ...session,
-      id: `study-${Date.now()}`,
+      id: session.id || `study-${Date.now()}`,
       createdAt: new Date().toISOString(),
     };
     this.studySessions.unshift(newSession);
@@ -488,29 +478,42 @@ class AppRepository {
       process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
     );
 
+    const isSignatureEnforced = Boolean(
+      process.env.WHATSAPP_APP_SECRET &&
+      process.env.WHATSAPP_APP_SECRET !== 'replace_with_meta_app_secret_for_sha256_signature_verification'
+    );
+
     return {
-      status: 'OPTIMAL',
-      uptimeSeconds: Math.floor(process.uptime ? process.uptime() : 1420),
+      status: isWaConfigured && isGeminiConfigured && isSignatureEnforced ? 'OPTIMAL' : 'DEGRADED',
+      uptimeSeconds: Math.floor(process.uptime()),
       database: {
-        status: 'CONNECTED',
-        provider: 'Integrated Store',
-        latencyMs: 4,
+        status: 'IN_MEMORY',
+        provider: 'In-Memory Store',
+        latencyMs: null,
       },
       redisQueue: {
-        status: 'ACTIVE',
+        status: 'IN_MEMORY',
         queuedJobs: this.queuedJobs.filter((j) => j.status === 'QUEUED').length,
-        activeWorkers: 4,
+        activeWorkers: 0,
       },
       whatsappApi: {
         configured: isWaConfigured,
-        mode: isWaConfigured ? 'PRODUCTION' : 'SIMULATED_MOCK',
-        webhookVerified: true,
-        phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID || '+250 788 AGUKA AI (Simulated)',
+        mode: isWaConfigured ? 'PRODUCTION' : 'NOT_CONFIGURED',
+        webhookVerified: isSignatureEnforced,
+        phoneNumberId: isWaConfigured ? process.env.WHATSAPP_PHONE_NUMBER_ID : undefined,
       },
       geminiAi: {
         configured: isGeminiConfigured,
-        model: 'gemini-3.8-flash',
+        model: GEMINI_MODEL,
         bilingualKinyarwandaSupport: true,
+      },
+      stats: {
+        totalUsers: this.users.length,
+        conversations: this.conversations.length,
+        messages: this.conversations.reduce((n, c) => n + c.messages.length, 0),
+        verifiedJobListings: this.jobListings.filter((j) => j.verificationStatus === 'VERIFIED').length,
+        agentRuns: this.agentRuns.length,
+        toolCalls: this.toolCallTraces.length,
       },
     };
   }

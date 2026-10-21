@@ -83,8 +83,9 @@ export function verifyWebhookChallenge(
   mode: string | null,
   token: string | null,
   challenge: string | null,
-  expectedVerifyToken: string = process.env.WHATSAPP_VERIFY_TOKEN || 'aguka_rwanda_webhook_secret_token_2026'
+  expectedVerifyToken: string = process.env.WHATSAPP_VERIFY_TOKEN || ''
 ): { isValid: boolean; challenge?: string } {
+  if (!expectedVerifyToken) return { isValid: false };
   if (mode === 'subscribe' && token === expectedVerifyToken && challenge) {
     return { isValid: true, challenge };
   }
@@ -99,7 +100,8 @@ export function verifyMetaSignature(
   signatureHeader: string | null,
   appSecret: string = process.env.WHATSAPP_APP_SECRET || ''
 ): boolean {
-  // If no app secret is configured, allow in development/simulated mode
+  // Without WHATSAPP_APP_SECRET any unsigned POST is accepted, so this build is
+  // for local testing only — set the secret before exposing the webhook publicly.
   if (!appSecret || appSecret === 'replace_with_meta_app_secret_for_sha256_signature_verification') {
     return true;
   }
@@ -181,12 +183,12 @@ export function parseWhatsAppWebhookPayload(body: Record<string, unknown>): What
 }
 
 /**
- * Dispatches an outgoing message to the user via Meta Cloud API or stores simulated response
+ * Dispatches an outgoing message to the user via Meta Cloud API
  */
 export async function sendWhatsAppMessage(payload: WhatsAppOutgoingMessage): Promise<{
   success: boolean;
   messageId: string;
-  mode: 'LIVE_META_API' | 'SIMULATOR';
+  mode: 'LIVE_META_API' | 'NOT_CONFIGURED';
   error?: string;
 }> {
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
@@ -223,7 +225,7 @@ export async function sendWhatsAppMessage(payload: WhatsAppOutgoingMessage): Pro
 
       return {
         success: true,
-        messageId: data.messages?.[0]?.id || `wamid.out.${Date.now()}`,
+        messageId: data.messages?.[0]?.id || '',
         mode: 'LIVE_META_API',
       };
     } catch (err: unknown) {
@@ -237,10 +239,11 @@ export async function sendWhatsAppMessage(payload: WhatsAppOutgoingMessage): Pro
     }
   }
 
-  // Simulated / Mock Mode (guarantees seamless testing without needing a paid Meta account)
   return {
-    success: true,
-    messageId: `wamid.sim.${Date.now()}`,
-    mode: 'SIMULATOR',
+    success: false,
+    messageId: '',
+    mode: 'NOT_CONFIGURED',
+    error:
+      'WhatsApp credentials (WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN) are not configured. Nothing was dispatched.',
   };
 }

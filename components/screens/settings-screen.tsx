@@ -8,52 +8,57 @@ import {
   Copy,
   Check,
   Server,
-  Lock,
-  Terminal,
-  ExternalLink,
-  ShieldCheck,
   Key,
 } from 'lucide-react';
-import { WhatsAppLogo, PostgresLogo, RedisLogo } from '@/components/icons/logos';
-import { SystemHealth } from '@/lib/types';
+import { WhatsAppLogo } from '@/components/icons/logos';
+
+interface ReadinessPayload {
+  status: 'READY' | 'DEGRADED';
+  envPresence: Record<string, boolean>;
+  checks: {
+    configuration: { status: string; warnings: string[] };
+    database: { status: string; provider: string; latencyMs: number | null };
+    queue: { status: string; mode: string; pendingJobs: number };
+    aiProvider: { status: string; provider: string; model: string };
+    whatsappWebhook: { status: string; mode: string; verified: boolean };
+  };
+}
+
+const ENV_LABELS: Array<{ name: string; note: string }> = [
+  { name: 'GEMINI_API_KEY', note: 'Required for any agent reply' },
+  { name: 'WHATSAPP_PHONE_NUMBER_ID', note: 'Meta number that sends replies' },
+  { name: 'WHATSAPP_ACCESS_TOKEN', note: 'Cloud API bearer token' },
+  { name: 'WHATSAPP_VERIFY_TOKEN', note: 'Must match Meta webhook setup' },
+  { name: 'WHATSAPP_APP_SECRET', note: 'Enforces HMAC-SHA256 signature checks' },
+  { name: 'DATABASE_URL', note: 'PostgreSQL target for Prisma schema' },
+  { name: 'REDIS_URL', note: 'External queue and dedup store' },
+  { name: 'ADMIN_JWT_SECRET', note: 'Signs admin dashboard sessions' },
+  { name: 'ADMIN_DEFAULT_EMAIL', note: 'Admin login identity' },
+  { name: 'ADMIN_DEFAULT_PASSWORD', note: 'Admin login secret' },
+];
 
 export function SettingsScreen() {
-  const [health, setHealth] = useState<SystemHealth | null>(null);
+  const [readiness, setReadiness] = useState<ReadinessPayload | null>(null);
   const [copiedUrl, setCopiedUrl] = useState(false);
-  const [copiedToken, setCopiedToken] = useState(false);
 
   useEffect(() => {
-    fetch('/api/health')
+    fetch('/api/ready')
       .then((res) => res.json())
-      .then((data) => setHealth(data))
+      .then((data) => setReadiness(data))
       .catch((err) => console.error(err));
   }, []);
 
   const webhookUrl = typeof window !== 'undefined'
     ? `${window.location.origin}/api/whatsapp/webhook`
-    : 'https://ais-dev-...run.app/api/whatsapp/webhook';
-  const verifyToken = 'aguka_rwanda_webhook_secret_token_2026';
+    : '';
 
-  const handleCopy = (text: string, isUrl: boolean) => {
-    navigator.clipboard.writeText(text);
-    if (isUrl) {
-      setCopiedUrl(true);
-      setTimeout(() => setCopiedUrl(false), 2000);
-    } else {
-      setCopiedToken(true);
-      setTimeout(() => setCopiedToken(false), 2000);
-    }
+  const handleCopy = () => {
+    navigator.clipboard.writeText(webhookUrl);
+    setCopiedUrl(true);
+    setTimeout(() => setCopiedUrl(false), 2000);
   };
 
-  const envVars = [
-    { name: 'GEMINI_API_KEY', status: 'Injected via AI Studio Secrets', safeVal: 'AIza••••••••••••••••' },
-    { name: 'WHATSAPP_PHONE_NUMBER_ID', status: 'Configured / Simulator ready', safeVal: '10987•••••••' },
-    { name: 'WHATSAPP_ACCESS_TOKEN', status: 'Meta System User Token', safeVal: 'EAA••••••••••••••' },
-    { name: 'WHATSAPP_VERIFY_TOKEN', status: 'Production Webhook Token', safeVal: 'aguka_rwanda_webhook_••••' },
-    { name: 'WHATSAPP_APP_SECRET', status: 'HMAC-SHA256 Signature Verification', safeVal: 'sha256••••••••••' },
-    { name: 'DATABASE_URL', status: 'PostgreSQL connection', safeVal: 'postgresql://postgres:••••@localhost:5432' },
-    { name: 'REDIS_URL', status: 'BullMQ Queue connection', safeVal: 'redis://:••••@localhost:6379' },
-  ];
+  const waReady = readiness?.checks.whatsappWebhook;
 
   return (
     <div className="p-4 sm:p-6 space-y-6">
@@ -64,7 +69,8 @@ export function SettingsScreen() {
             <span>Platform Settings & Meta Cloud API Connectivity</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Production Webhook URLs, Meta Cloud API credentials status, durable queue workers, and environment readiness.
+            Webhook URL, live environment-variable presence and readiness checks. Values are never
+            shown here — only whether each variable is set on the server.
           </p>
         </div>
       </div>
@@ -78,31 +84,38 @@ export function SettingsScreen() {
             </div>
             <div>
               <h2 className="text-sm font-bold text-white">Meta WhatsApp Cloud API Configuration</h2>
-              <p className="text-xs text-zinc-400">Enter these exact credentials in Meta for Developers Dashboard</p>
+              <p className="text-xs text-zinc-400">Paste this callback URL in the Meta for Developers dashboard</p>
             </div>
           </div>
-          <span className="text-[10px] px-2.5 py-1 rounded-md bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-semibold flex items-center gap-1">
-            <CheckCircle2 className="w-3.5 h-3.5" />
-            <span>Webhook Ready</span>
+          <span
+            className={`text-[10px] px-2.5 py-1 rounded-md font-semibold flex items-center gap-1 border ${
+              waReady?.status === 'PASS'
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {waReady?.status === 'PASS' ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
+            <span>{waReady?.status === 'PASS' ? 'Credentials detected' : 'WhatsApp not configured'}</span>
           </span>
         </div>
 
         <div className="space-y-3 pt-2">
-          {/* Callback URL */}
           <div className="space-y-1">
             <label className="text-xs font-semibold text-zinc-300">
-              Meta Webhook Callback URL (GET & POST)
+              Meta Webhook Callback URL (GET &amp; POST)
             </label>
             <div className="flex items-center gap-2">
               <input
                 type="text"
                 readOnly
                 value={webhookUrl}
+                placeholder="Loading this deployment&apos;s URL…"
                 className="flex-1 bg-zinc-950 font-mono text-xs text-emerald-400 px-3.5 py-2 rounded-lg border border-zinc-800 outline-hidden"
               />
               <button
-                onClick={() => handleCopy(webhookUrl, true)}
-                className="px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-semibold text-zinc-200 border border-zinc-700 transition-colors flex items-center gap-1.5"
+                onClick={handleCopy}
+                disabled={!webhookUrl}
+                className="px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-semibold text-zinc-200 border border-zinc-700 transition-colors flex items-center gap-1.5 disabled:opacity-50"
               >
                 {copiedUrl ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
                 <span>{copiedUrl ? 'Copied' : 'Copy URL'}</span>
@@ -110,69 +123,113 @@ export function SettingsScreen() {
             </div>
           </div>
 
-          {/* Verify Token */}
-          <div className="space-y-1">
-            <label className="text-xs font-semibold text-zinc-300">
-              Verify Token (`hub.verify_token`)
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                readOnly
-                value={verifyToken}
-                className="flex-1 bg-zinc-950 font-mono text-xs text-zinc-200 px-3.5 py-2 rounded-lg border border-zinc-800 outline-hidden"
-              />
-              <button
-                onClick={() => handleCopy(verifyToken, false)}
-                className="px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-semibold text-zinc-200 border border-zinc-700 transition-colors flex items-center gap-1.5"
-              >
-                {copiedToken ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedToken ? 'Copied' : 'Copy Token'}</span>
-              </button>
-            </div>
+          <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800 text-xs text-zinc-400 space-y-1">
+            <p className="font-semibold text-zinc-300">Verify token and app secret</p>
+            <p>
+              Set <span className="font-mono text-emerald-400">WHATSAPP_VERIFY_TOKEN</span> in the server
+              environment and type the same value into Meta. The dashboard cannot read it — secrets are
+              server-only by design.
+            </p>
+            <p>
+              {!readiness?.envPresence?.WHATSAPP_APP_SECRET
+                ? 'WHATSAPP_APP_SECRET is not set, so incoming webhook signatures are not verified. Anyone who knows this URL can post events.'
+                : 'WHATSAPP_APP_SECRET is set, so x-hub-signature-256 is enforced on every webhook POST.'}
+            </p>
           </div>
         </div>
       </div>
 
-      {/* Security & Secrets Audit */}
+      {/* Environment Presence Audit */}
       <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Key className="w-4 h-4 text-emerald-400" />
-            <h2 className="text-sm font-bold text-white">Environment Configuration & Secrets Hygiene</h2>
+            <h2 className="text-sm font-bold text-white">Environment Variables On This Server</h2>
           </div>
-          <span className="text-xs text-zinc-400">Strictly no plain-text credentials displayed</span>
+          <span className="text-xs text-zinc-400">Presence only — no values are transmitted to the browser</span>
         </div>
 
         <div className="divide-y divide-zinc-800/80 bg-zinc-950 rounded-xl border border-zinc-800 overflow-hidden text-xs">
-          {envVars.map((ev) => (
-            <div key={ev.name} className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <div>
-                <span className="font-mono font-bold text-zinc-200">{ev.name}</span>
-                <p className="text-[11px] text-zinc-400 mt-0.5">{ev.status}</p>
+          {ENV_LABELS.map((ev) => {
+            const isSet = Boolean(readiness?.envPresence?.[ev.name]);
+            return (
+              <div key={ev.name} className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <span className="font-mono font-bold text-zinc-200">{ev.name}</span>
+                  <p className="text-[11px] text-zinc-400 mt-0.5">{ev.note}</p>
+                </div>
+                <span
+                  className={`font-mono px-2 py-1 rounded border text-[11px] ${
+                    isSet
+                      ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
+                      : 'text-zinc-400 bg-zinc-900 border-zinc-800'
+                  }`}
+                >
+                  {readiness ? (isSet ? 'SET' : 'NOT SET') : 'CHECKING…'}
+                </span>
               </div>
-              <span className="font-mono text-zinc-500 bg-zinc-900 px-2 py-1 rounded border border-zinc-800 text-[11px]">
-                {ev.safeVal}
-              </span>
-            </div>
-          ))}
+            );
+          })}
+        </div>
+
+        {readiness && readiness.checks.configuration.warnings.length > 0 && (
+          <div className="space-y-1.5">
+            {readiness.checks.configuration.warnings.map((w, i) => (
+              <p key={i} className="text-[11px] text-amber-400 flex items-start gap-1.5">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span>{w}</span>
+              </p>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Current Runtime Backends */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+          <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">Storage</p>
+          <p className="text-xs font-bold text-white mt-1">{readiness?.checks.database.provider ?? 'Loading…'}</p>
+          <p className="text-[11px] text-zinc-400 mt-0.5">
+            {readiness?.checks.database.latencyMs == null
+              ? 'No database connection measured'
+              : `${readiness.checks.database.latencyMs}ms round trip`}
+          </p>
+        </div>
+        <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+          <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">Queue</p>
+          <p className="text-xs font-bold text-white mt-1">{readiness?.checks.queue.mode ?? 'Loading…'}</p>
+          <p className="text-[11px] text-zinc-400 mt-0.5">
+            {readiness ? `${readiness.checks.queue.pendingJobs} pending job(s)` : 'Reading queue state'}
+          </p>
+        </div>
+        <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+          <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">AI Provider</p>
+          <p className="text-xs font-bold text-white mt-1">{readiness?.checks.aiProvider.model ?? 'Loading…'}</p>
+          <p className="text-[11px] text-zinc-400 mt-0.5">
+            {readiness?.checks.aiProvider.status === 'PASS' ? 'Responding' : 'Not configured or unreachable'}
+          </p>
         </div>
       </div>
 
-      {/* Docker & Deployment Guide */}
+      {/* Deployment Guide */}
       <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-3">
         <h2 className="text-sm font-bold text-white flex items-center gap-2">
           <Server className="w-4 h-4 text-purple-400" />
           <span>Production Deployment Quick Guide (Render, AWS, or Docker)</span>
         </h2>
         <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 font-mono text-xs text-zinc-300 space-y-2">
-          <p className="text-zinc-500"># 1. Run PostgreSQL database migrations:</p>
+          <p className="text-zinc-500"># 1. Point DATABASE_URL at PostgreSQL, then apply the schema:</p>
           <p className="text-emerald-400">npx prisma migrate deploy</p>
-          <p className="text-zinc-500 mt-2"># 2. Build production Next.js standalone application:</p>
+          <p className="text-zinc-500 mt-2"># 2. Build the production Next.js application:</p>
           <p className="text-emerald-400">npm run build</p>
-          <p className="text-zinc-500 mt-2"># 3. Start high-performance server:</p>
+          <p className="text-zinc-500 mt-2"># 3. Start the server:</p>
           <p className="text-emerald-400">npm run start</p>
         </div>
+        <p className="text-[11px] text-zinc-500">
+          Note: the application code reads and writes through the in-memory repository. The Prisma
+          schema and migration exist but are not connected yet, so step 1 prepares a database the app
+          does not use until a Prisma client is wired into lib/db.
+        </p>
       </div>
     </div>
   );

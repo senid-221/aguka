@@ -13,6 +13,7 @@ function sign(data: string, secret: string): string {
 }
 
 export function issueAdminToken(email: string, ttlSeconds = 8 * 3600, secret = appConfig.security.jwtSecret): string {
+  if (!secret) throw new Error('ADMIN_JWT_SECRET is not configured; cannot issue admin sessions.');
   const header = b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
   const payload = b64(JSON.stringify({ sub: email, role: 'ADMIN', exp: Math.floor(Date.now() / 1000) + ttlSeconds }));
   return `${header}.${payload}.${sign(`${header}.${payload}`, secret)}`;
@@ -22,7 +23,7 @@ export function verifyAdminToken(
   token: string | null | undefined,
   secret = appConfig.security.jwtSecret
 ): { valid: boolean; email?: string } {
-  if (!token) return { valid: false };
+  if (!secret || !token) return { valid: false };
   const parts = token.split('.');
   if (parts.length !== 3) return { valid: false };
   const expected = Buffer.from(sign(`${parts[0]}.${parts[1]}`, secret));

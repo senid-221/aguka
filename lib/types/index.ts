@@ -88,11 +88,11 @@ export interface Conversation {
 export interface JobSource {
   id: string;
   name: string;
-  code: string; // "MIFOTRA", "JOB_IN_RWANDA", "REMOTE_OK"
+  code: string; // "MIFOTRA", "JOB_IN_RWANDA", "REMOTE_TECH"
   baseUrl: string;
   isPermitted: boolean;
-  healthStatus: 'HEALTHY' | 'WARNING' | 'DOWN';
-  lastCrawledAt: string;
+  healthStatus: 'HEALTHY' | 'WARNING' | 'DOWN' | 'UNKNOWN';
+  lastCrawledAt: string | null; // null until a crawl actually runs
   activeListingsCount: number;
 }
 
@@ -281,24 +281,32 @@ export interface SystemHealth {
   status: 'OPTIMAL' | 'DEGRADED' | 'CRITICAL';
   uptimeSeconds: number;
   database: {
-    status: 'CONNECTED';
-    provider: 'PostgreSQL' | 'Integrated Store';
-    latencyMs: number;
+    status: 'CONNECTED' | 'IN_MEMORY';
+    provider: 'PostgreSQL' | 'In-Memory Store';
+    latencyMs: number | null;
   };
   redisQueue: {
-    status: 'ACTIVE';
+    status: 'ACTIVE' | 'IN_MEMORY';
     queuedJobs: number;
     activeWorkers: number;
   };
   whatsappApi: {
     configured: boolean;
-    mode: 'PRODUCTION' | 'SIMULATED_MOCK';
-    webhookVerified: boolean;
+    mode: 'PRODUCTION' | 'NOT_CONFIGURED';
+    webhookVerified: boolean; // true only when WHATSAPP_APP_SECRET enforces HMAC checks
     phoneNumberId?: string;
   };
   geminiAi: {
     configured: boolean;
     model: string;
     bilingualKinyarwandaSupport: boolean;
+  };
+  stats: {
+    totalUsers: number;
+    conversations: number;
+    messages: number;
+    verifiedJobListings: number;
+    agentRuns: number;
+    toolCalls: number;
   };
 }

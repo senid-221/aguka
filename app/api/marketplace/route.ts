@@ -21,11 +21,19 @@ export async function POST(request: NextRequest) {
     const { action } = body;
 
     if (action === 'CREATE_WORKER') {
+      const { userId, fullName, phoneNumber, title } = body;
+      if (!userId || !fullName || !phoneNumber || !title) {
+        return NextResponse.json(
+          { error: 'userId, fullName, phoneNumber and title are required' },
+          { status: 400 }
+        );
+      }
+
       const created = repo.createWorkerProfile({
-        userId: body.userId || `usr-${Date.now()}`,
-        fullName: body.fullName,
-        phoneNumber: body.phoneNumber,
-        title: body.title,
+        userId,
+        fullName,
+        phoneNumber,
+        title,
         bio: body.bio,
         skills: body.skills || [],
         experienceYrs: Number(body.experienceYrs || 0),

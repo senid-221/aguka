@@ -12,11 +12,11 @@ export function getGeminiClient(): GoogleGenAI | null {
     apiKey,
     httpOptions: {
       headers: {
-        "User-Agent": "aistudio-build",
+        "User-Agent": "aguka-ai",
       },
     },
   });
   return genAIInstance;
 }
 
-export const GEMINI_MODEL = "gemini-3.8-flash";
+export const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";

@@ -34,10 +34,21 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'CREATE_JOB') {
+      const source = repo.getSources().find((s) => s.id === body.sourceId);
+      if (!source) {
+        return NextResponse.json({ error: 'A valid sourceId is required' }, { status: 400 });
+      }
+      if (!body.title || !body.employer || !body.description || !body.sourceUrl) {
+        return NextResponse.json(
+          { error: 'title, employer, description and sourceUrl are required' },
+          { status: 400 }
+        );
+      }
+
       const newJob = repo.addJobListing({
-        sourceId: body.sourceId || 'src-jobinrwanda',
-        sourceName: body.sourceName || 'Job in Rwanda',
-        externalId: body.externalId || `JIR-${Date.now()}`,
+        sourceId: source.id,
+        sourceName: source.name,
+        externalId: body.externalId,
         title: body.title,
         employer: body.employer,
         location: body.location || 'Kigali, Rwanda',
@@ -47,9 +58,9 @@ export async function POST(request: NextRequest) {
         salaryRange: body.salaryRange,
         sourceUrl: body.sourceUrl,
         deadline: body.deadline,
-        verificationStatus: 'VERIFIED',
+        verificationStatus: 'PENDING',
         isExpired: false,
-        tags: body.tags || ['Rwanda', 'Verified'],
+        tags: body.tags || [],
       });
       return NextResponse.json({ success: true, job: newJob });
     }

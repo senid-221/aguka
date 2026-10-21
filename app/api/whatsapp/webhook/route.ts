@@ -27,6 +27,13 @@ export async function GET(request: NextRequest) {
     });
   }
 
+  if (!process.env.WHATSAPP_VERIFY_TOKEN) {
+    return NextResponse.json(
+      { error: 'WHATSAPP_VERIFY_TOKEN is not configured on this server; webhook cannot be verified' },
+      { status: 403 }
+    );
+  }
+
   return NextResponse.json(
     { error: 'Invalid verification token or challenge mismatch' },
     { status: 403 }

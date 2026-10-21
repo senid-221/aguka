@@ -38,56 +38,13 @@ interface ChatMessage {
 }
 
 export function SimulatorScreen() {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: 'm1',
-      sender: 'user',
-      text: 'Muraho! Nshaka akazi ka Software Developer mu Rwanda cyangwa se Remote.',
-      timestamp: '22:00',
-    },
-    {
-      id: 'm2',
-      sender: 'assistant',
-      text: 'Muraho! Nakuboneye imyanya 3 yizewe y’akazi ka Software Developer:\n\n1. [MINICT / RISA] Senior Software Engineer (Kigali, Gasabo)\n   • Umushahara: RWF 1,450,000 - 1,850,000\n   • Isoko: MIFOTRA (https://recruitment.mifotra.gov.rw)\n\n2. [Bank of Kigali] Full Stack Fintech Developer\n   • Isoko: Job in Rwanda (https://www.jobinrwanda.com)\n\n3. [GitLab] Remote Backend Engineer (USD 65,000 - 85,000/yr)\n\nWifuza ko ngufasha gukora CV cyangwa ibaruwa yo gusaba?',
-      timestamp: '22:00',
-      buttons: [
-        { id: 'btn_cv_help', title: 'Fasha gukora CV' },
-        { id: 'btn_job_alerts', title: 'Akazi gashya (Alerts)' },
-      ],
-      agentType: 'JOB_FINDER',
-    },
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
 
   const [inputVal, setInputVal] = useState('');
-  const [phoneNumber] = useState('+250788912345');
-  const [userName] = useState('Jean Claude Mugisha');
+  const [phoneNumber, setPhoneNumber] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [lastAgentResult, setLastAgentResult] = useState<AgentExecutionResult | null>({
-    agentType: 'JOB_FINDER',
-    intent: 'DISCOVER_VERIFIED_JOBS',
-    detectedLanguage: 'KINYARWANDA',
-    replyText: 'Sample verified response from MIFOTRA & Job in Rwanda...',
-    tokensUsed: 310,
-    latencyMs: 780,
-    toolCalls: [
-      {
-        name: 'search_verified_jobs',
-        args: { isRemote: true, verifiedOnly: true },
-        result: { count: 3, source: 'MIFOTRA & Job in Rwanda' },
-      },
-    ],
-  });
-
-  const [lastOutgoingPayload, setLastOutgoingPayload] = useState<Record<string, unknown> | null>({
-    messaging_product: 'whatsapp',
-    recipient_type: 'individual',
-    to: '250788912345',
-    type: 'interactive',
-    interactive: {
-      type: 'button',
-      body: { text: 'Verified response dispatched to WhatsApp' },
-    },
-  });
+  const [lastAgentResult, setLastAgentResult] = useState<AgentExecutionResult | null>(null);
+  const [lastOutgoingPayload, setLastOutgoingPayload] = useState<Record<string, unknown> | null>(null);
 
   const quickPrompts = [
     {
@@ -96,7 +53,7 @@ export function SimulatorScreen() {
     },
     {
       label: 'Career & CV (English)',
-      text: 'Can you help me build a professional CV and draft a cover letter for Bank of Kigali?',
+      text: 'Can you help me build a professional CV and draft a cover letter?',
     },
     {
       label: 'Coding Agent (Scaffold)',
@@ -120,6 +77,23 @@ export function SimulatorScreen() {
     const text = textToSend || inputVal;
     if (!text.trim() || isLoading) return;
 
+    const cleanPhone = phoneNumber.trim().startsWith('+')
+      ? phoneNumber.trim()
+      : `+${phoneNumber.trim()}`;
+
+    if (!phoneNumber.trim()) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: getNextMessageId('err'),
+          sender: 'assistant',
+          text: 'Enter a simulated WhatsApp number before sending.',
+          timestamp: getCurrentTimeString(),
+        },
+      ]);
+      return;
+    }
+
     const userMsgId = getNextMessageId('m');
     const userMsg: ChatMessage = {
       id: userMsgId,
@@ -137,8 +111,7 @@ export function SimulatorScreen() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          phoneNumber,
-          name: userName,
+          phoneNumber: cleanPhone,
           messageText: text,
         }),
       });
@@ -190,10 +163,10 @@ export function SimulatorScreen() {
           <div className="flex items-center gap-2">
             <h1 className="text-xl font-bold text-white flex items-center gap-2">
               <Smartphone className="w-5 h-5 text-emerald-400" />
-              <span>Live WhatsApp Simulator & Webhook Inspector</span>
+              <span>WhatsApp Simulator &amp; Webhook Inspector</span>
             </h1>
-            <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-semibold">
-              End-to-End Ready
+            <span className="px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-300 border border-zinc-700 text-[10px] font-semibold">
+              Local Payload Preview
             </span>
           </div>
           <p className="text-xs text-zinc-400 mt-1">
@@ -201,15 +174,24 @@ export function SimulatorScreen() {
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
-          <div className="text-right hidden sm:block">
-            <p className="text-[11px] font-semibold text-zinc-300">Simulated WhatsApp ID</p>
-            <p className="text-[10px] text-zinc-400 font-mono">{phoneNumber}</p>
-          </div>
+        <div className="flex items-end gap-3">
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] uppercase tracking-wider font-semibold text-zinc-400">
+              Simulated WhatsApp Number
+            </span>
+            <input
+              type="tel"
+              value={phoneNumber}
+              onChange={(e) => setPhoneNumber(e.target.value)}
+              placeholder="+250..."
+              className="w-40 bg-zinc-950 text-zinc-100 placeholder-zinc-500 text-xs font-mono rounded-lg px-2.5 py-1.5 border border-zinc-800 outline-hidden focus:border-emerald-500/50"
+            />
+          </label>
           <button
             onClick={() => {
               setMessages([]);
               setLastAgentResult(null);
+              setLastOutgoingPayload(null);
             }}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 border border-zinc-700 transition-colors"
           >
@@ -276,7 +258,7 @@ export function SimulatorScreen() {
             <div className="flex-1 overflow-y-auto p-3 space-y-3 bg-[#0B141A] bg-[radial-gradient(#12242b_1px,transparent_1px)] [background-size:16px_16px]">
               <div className="text-center my-1">
                 <span className="text-[9px] bg-zinc-900/90 text-zinc-400 px-2.5 py-1 rounded-md border border-zinc-800/80 shadow-xs">
-                  🔒 Messages are protected by Rwanda DPPA Law & WhatsApp encryption
+                  Local simulator — nothing is delivered to Meta or to a real WhatsApp number
                 </span>
               </div>
 
@@ -322,6 +304,16 @@ export function SimulatorScreen() {
                   )}
                 </div>
               ))}
+
+              {messages.length === 0 && !isLoading && (
+                <div className="flex flex-col items-center justify-center text-center gap-2 px-6 py-16">
+                  <WhatsAppLogo className="w-7 h-7 text-emerald-400/60" />
+                  <p className="text-xs text-zinc-400 leading-relaxed">
+                    No messages yet. Enter a simulated number above and send a Kinyarwanda or English
+                    message to see how the router answers.
+                  </p>
+                </div>
+              )}
 
               {isLoading && (
                 <div className="flex items-center gap-2 p-2 rounded-xl bg-zinc-900/90 text-zinc-400 text-xs w-max border border-zinc-800 animate-pulse">
@@ -394,10 +386,10 @@ export function SimulatorScreen() {
                   </p>
                 </div>
                 <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-                  <p className="text-[10px] text-zinc-400 font-medium">Security & Redaction</p>
+                  <p className="text-[10px] text-zinc-400 font-medium">Answering Model</p>
                   <p className="text-xs font-bold text-zinc-200 mt-0.5 flex items-center gap-1">
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>0 Leaks (Protected)</span>
+                    <span className="truncate">{lastAgentResult.modelUsed}</span>
                   </p>
                 </div>
               </div>
@@ -420,7 +412,7 @@ export function SimulatorScreen() {
                     >
                       <div className="flex items-center justify-between text-blue-400 font-bold">
                         <span>⚡ {tc.name}()</span>
-                        <span className="text-[10px] text-zinc-400 font-normal">verified</span>
+                        <span className="text-[10px] text-zinc-400 font-normal">{tc.latencyMs}ms</span>
                       </div>
                       <div className="text-zinc-400 text-[11px]">
                         Args: {JSON.stringify(tc.args)}
@@ -440,13 +432,25 @@ export function SimulatorScreen() {
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
                 <Code2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Meta WhatsApp Outgoing API Payload</span>
+                <span>Meta WhatsApp Outgoing Payload</span>
               </span>
               <span className="text-[10px] text-zinc-400 font-mono">POST /v21.0/messages</span>
             </div>
-            <pre className="p-3 rounded-lg bg-zinc-950 text-emerald-300 font-mono text-[11px] overflow-x-auto max-h-48 border border-zinc-800/80">
-              {JSON.stringify(lastOutgoingPayload, null, 2)}
-            </pre>
+            {lastOutgoingPayload ? (
+              <>
+                <pre className="p-3 rounded-lg bg-zinc-950 text-emerald-300 font-mono text-[11px] overflow-x-auto max-h-48 border border-zinc-800/80">
+                  {JSON.stringify(lastOutgoingPayload, null, 2)}
+                </pre>
+                <p className="text-[10px] text-zinc-500">
+                  Preview only. The simulator never sends this payload; real delivery happens in
+                  POST /api/whatsapp/webhook with Meta credentials configured.
+                </p>
+              </>
+            ) : (
+              <p className="text-xs text-zinc-400">
+                Nothing yet — send a message to build the outgoing payload shape.
+              </p>
+            )}
           </div>
         </div>
       </div>

@@ -52,7 +52,8 @@ export function EmploymentScreen() {
             <span>Rwanda Employment Marketplace & Talent Matcher</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Verified local professionals, employers, and algorithmic talent-vacancy matchmaking with transparent, explainable scoring.
+            Profiles, vacancies and match scores appear only from records that were really registered or
+            posted. Nothing is invented here, and scoring is deterministic skill/location arithmetic.
           </p>
         </div>
 
@@ -96,11 +97,17 @@ export function EmploymentScreen() {
           <div className="p-3.5 rounded-xl bg-zinc-900 border border-zinc-800 flex items-center justify-between text-xs text-zinc-300">
             <span className="flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-emerald-400" />
-              <span>Transparent AI Matching: Scores are computed strictly on verified technical skills, location proximity, and experience. Non-discriminatory.</span>
+              <span>Skill matching: scores come from stored skills, district and experience only. No model scores a person, and nothing is scored on gender, ethnicity or religion.</span>
             </span>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {matches.length === 0 && (
+              <p className="md:col-span-2 text-xs text-zinc-500 p-6 rounded-xl bg-zinc-900 border border-zinc-800 text-center">
+                No matches computed yet. A match appears once a worker profile and a vacancy are both
+                registered on this server.
+              </p>
+            )}
             {matches.map((match) => (
               <div
                 key={match.id}
@@ -160,9 +167,9 @@ export function EmploymentScreen() {
                     ))}
                   </div>
 
-                  <button className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-semibold text-zinc-200 border border-zinc-700 transition-colors">
-                    Introduce Candidate
-                  </button>
+                  <span className="text-[10px] text-zinc-500">
+                    Introduction not wired
+                  </span>
                 </div>
               </div>
             ))}
@@ -173,6 +180,12 @@ export function EmploymentScreen() {
       {/* Tab: Talent Directory */}
       {activeTab === 'workers' && (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {workers.length === 0 && (
+            <p className="md:col-span-2 lg:col-span-3 text-xs text-zinc-500 p-6 rounded-xl bg-zinc-900 border border-zinc-800 text-center">
+              No worker profiles registered. New ones appear when someone signs up through WhatsApp or
+              the marketplace API.
+            </p>
+          )}
           {workers.map((w) => (
             <div
               key={w.id}
@@ -221,6 +234,11 @@ export function EmploymentScreen() {
       {/* Tab: Vacancies */}
       {activeTab === 'vacancies' && (
         <div className="space-y-4">
+          {vacancies.length === 0 && (
+            <p className="text-xs text-zinc-500 p-6 rounded-xl bg-zinc-900 border border-zinc-800 text-center">
+              No vacancies posted. Employers add them through the marketplace API.
+            </p>
+          )}
           {vacancies.map((v) => (
             <div
               key={v.id}

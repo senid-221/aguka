@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
-import Image from 'next/image';
 import {
   Users,
   MessageSquare,
@@ -11,18 +10,12 @@ import {
   Activity,
   CheckCircle2,
   AlertCircle,
-  Clock,
   ArrowUpRight,
   RefreshCw,
   ExternalLink,
-  ShieldCheck,
-  Cpu,
-  Maximize2,
-  FileCode,
   Workflow,
-  Sparkles,
 } from 'lucide-react';
-import { WhatsAppLogo, RwandaFlagIcon, PostgresLogo, RedisLogo, DockerLogo } from '@/components/icons/logos';
+import { WhatsAppLogo, RwandaFlagIcon, PostgresLogo, RedisLogo } from '@/components/icons/logos';
 import { SystemHealth, JobSource, QueuedJob } from '@/lib/types';
 
 interface OverviewProps {
@@ -32,11 +25,8 @@ interface OverviewProps {
 export function OverviewDashboard({ onNavigate }: OverviewProps) {
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [sources, setSources] = useState<JobSource[]>([]);
-  const [jobsCount, setJobsCount] = useState(6);
   const [queuedJobs, setQueuedJobs] = useState<QueuedJob[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [selectedDiagram, setSelectedDiagram] = useState<'flow' | 'coding'>('flow');
-  const [isZoomModalOpen, setIsZoomModalOpen] = useState(false);
 
   const reloadData = () => {
     setIsLoading(true);
@@ -49,7 +39,6 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
         if (healthData) setHealth(healthData);
         if (jobsData) {
           setSources(jobsData.sources || []);
-          setJobsCount(jobsData.totalCount || 6);
         }
         if (agentsData) {
           setQueuedJobs(agentsData.queuedJobs || []);
@@ -71,7 +60,6 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
         if (healthData) setHealth(healthData);
         if (jobsData) {
           setSources(jobsData.sources || []);
-          setJobsCount(jobsData.totalCount || 6);
         }
         if (agentsData) {
           setQueuedJobs(agentsData.queuedJobs || []);
@@ -84,34 +72,36 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
     };
   }, []);
 
+  const statsCount = health?.stats;
+
   const stats = [
     {
       label: 'Verified Job Listings',
-      value: jobsCount.toString(),
-      subtext: 'MIFOTRA & Rwanda boards',
+      value: statsCount ? String(statsCount.verifiedJobListings) : '—',
+      subtext: 'Stored in this server’s in-memory store',
       icon: <Briefcase className="w-5 h-5 text-emerald-400" />,
-      change: '+18% this week',
+      change: statsCount?.verifiedJobListings ? 'Active' : 'No crawl wired yet',
     },
     {
-      label: 'Processed Messages',
-      value: '1,429',
-      subtext: 'Bilingual WA exchanges',
+      label: 'Messages Exchanged',
+      value: statsCount ? String(statsCount.messages) : '—',
+      subtext: `${statsCount?.conversations ?? 0} conversation(s)`,
       icon: <MessageSquare className="w-5 h-5 text-blue-400" />,
-      change: '100% deduplicated',
+      change: 'Bilingual Kinyarwanda / English',
     },
     {
-      label: 'Active WhatsApp Users',
-      value: '482',
-      subtext: 'Rwanda + International',
+      label: 'Registered Users',
+      value: statsCount ? String(statsCount.totalUsers) : '—',
+      subtext: 'Created from real WhatsApp traffic',
       icon: <Users className="w-5 h-5 text-purple-400" />,
-      change: '+42 new today',
+      change: health?.whatsappApi.configured ? 'Live number allowed' : 'Simulator only',
     },
     {
-      label: 'Agent Runs & Tools',
-      value: '2,108',
-      subtext: 'Gemini 3.8-Flash routed',
+      label: 'Agent Runs & Tool Calls',
+      value: statsCount ? `${statsCount.agentRuns} / ${statsCount.toolCalls}` : '—',
+      subtext: health ? health.geminiAi.model : 'Model not loaded',
       icon: <Bot className="w-5 h-5 text-amber-400" />,
-      change: 'Avg 650ms latency',
+      change: health?.geminiAi.configured ? 'Gemini configured' : 'GEMINI_API_KEY missing',
     },
   ];
 
@@ -125,12 +115,19 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
               <span>Aguka AI Rwanda Operations Hub</span>
               <RwandaFlagIcon className="w-5 h-3.5 rounded-xs" />
             </h1>
-            <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-semibold">
-              Live Gateway
+            <span
+              className={`px-2.5 py-0.5 rounded-full text-xs font-semibold border ${
+                health?.status === 'OPTIMAL'
+                  ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
+                  : 'bg-amber-500/10 border-amber-500/20 text-amber-400'
+              }`}
+            >
+              {health ? (health.status === 'OPTIMAL' ? 'All Services Configured' : 'Partially Configured') : 'Checking Config'}
             </span>
           </div>
           <p className="text-xs sm:text-sm text-zinc-400">
-            Orchestrating bilingual WhatsApp jobs discovery, career acceleration, AI coding sandbox, and employment matchmaking.
+            Bilingual WhatsApp jobs discovery, career guidance, coding assistance and employment
+            matchmaking. {health?.database.status === 'IN_MEMORY' && 'Records live in this process only and clear on restart.'}
           </p>
         </div>
 
@@ -177,7 +174,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
         ))}
       </div>
 
-      {/* System Architecture & Blueprint Viewer (Uko Sisitemu Ikora) */}
+      {/* How a message is processed on this server */}
       <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-4 shadow-sm">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-zinc-800/80 pb-4">
           <div>
@@ -188,85 +185,15 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
               </h2>
             </div>
             <p className="text-xs text-zinc-400 mt-1">
-              Visual architectural blueprints: user interaction flow, security barriers, BullMQ queue dispatch, and AI microservices.
+              What actually happens to a message on this server, written from the code paths that run.
             </p>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <div className="flex p-1 bg-zinc-950 rounded-xl border border-zinc-800">
-              <button
-                onClick={() => setSelectedDiagram('flow')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  selectedDiagram === 'flow'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                1. System Workflow (Uko Ikora)
-              </button>
-              <button
-                onClick={() => setSelectedDiagram('coding')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  selectedDiagram === 'coding'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                2. Coding System Architecture
-              </button>
-            </div>
-
-            <button
-              onClick={() => setIsZoomModalOpen(true)}
-              className="p-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 transition-colors"
-              title="Expand blueprint diagram"
-            >
-              <Maximize2 className="w-4 h-4" />
-            </button>
           </div>
         </div>
 
-        {/* Blueprint Display Canvas */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-center">
-          {/* Left / Main: The Diagram Image */}
-          <div className="lg:col-span-8 bg-zinc-950 border border-zinc-800 rounded-xl p-3 relative group overflow-hidden">
-            <div className="relative w-full aspect-16/9 rounded-lg overflow-hidden flex items-center justify-center bg-black/60">
-              {selectedDiagram === 'flow' ? (
-                <Image
-                  src="/assets/aistudio/UKO_SYSTEM_IKORA_d9eb03d8.png"
-                  alt="Uko Sisitemu Ikora - WhatsApp Architecture Diagram"
-                  fill
-                  className="object-contain"
-                  referrerPolicy="no-referrer"
-                  priority
-                />
-              ) : (
-                <Image
-                  src="/assets/aistudio/CODING_SYSTEM_f37205c4.png"
-                  alt="Coding System and Sandboxed AI Architecture"
-                  fill
-                  className="object-contain"
-                  referrerPolicy="no-referrer"
-                  priority
-                />
-              )}
-            </div>
-
-            <button
-              onClick={() => setIsZoomModalOpen(true)}
-              className="absolute bottom-5 right-5 px-3 py-1.5 rounded-lg bg-zinc-900/90 hover:bg-zinc-800 text-xs text-white border border-zinc-700 font-semibold flex items-center gap-1.5 transition-all backdrop-blur-sm cursor-pointer"
-            >
-              <Maximize2 className="w-3.5 h-3.5" />
-              <span>Full Screen View</span>
-            </button>
-          </div>
-
-          {/* Right: Technical Blueprint Specifications */}
-          <div className="lg:col-span-4 space-y-3">
-            {selectedDiagram === 'flow' ? (
-              <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 space-y-3 text-xs">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 space-y-3 text-xs">
                 <div className="flex items-center justify-between">
-                  <span className="font-bold text-white text-sm">Blueprint Breakdown</span>
+                  <span className="font-bold text-white text-sm">Message Flow</span>
                   <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-mono text-[10px]">
                     Bilingual Ingress
                   </span>
@@ -274,19 +201,19 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                 <div className="space-y-2 text-zinc-300">
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">1</span>
-                    <span><strong>WhatsApp Ingress:</strong> Verified via HMAC-SHA256 signature and deduplicated against replay attacks.</span>
+                    <span><strong>WhatsApp Ingress:</strong> HMAC check runs only when WHATSAPP_APP_SECRET is set; repeated message ids are ignored.</span>
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-red-500/20 text-red-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">2</span>
-                    <span><strong>Durable Queue (BullMQ):</strong> Asynchronous dispatch with exponential retry backoff.</span>
+                    <span><strong>In-Memory Queue:</strong> BullMQ semantics are modelled in process; no Redis worker runs today.</span>
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-blue-500/20 text-blue-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">3</span>
-                    <span><strong>Bilingual Router:</strong> Kinyarwanda & English intent classification with Gemini 3.8-Flash.</span>
+                    <span><strong>Bilingual Router:</strong> Keyword intent classification, then one Gemini call per reply.</span>
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-cyan-500/20 text-cyan-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">4</span>
-                    <span><strong>Official Job Feeds:</strong> Live sync with MIFOTRA e-recruitment & Job in Rwanda.</span>
+                    <span><strong>Job Boards:</strong> MIFOTRA, Job in Rwanda and remote feeds are registered; live crawlers are not wired yet, so listings start empty.</span>
                   </p>
                 </div>
                 <button
@@ -296,26 +223,26 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                   Test Flow in Simulator
                 </button>
               </div>
-            ) : (
+
               <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 space-y-3 text-xs">
                 <div className="flex items-center justify-between">
                   <span className="font-bold text-white text-sm">Coding Engine Specs</span>
                   <span className="px-2 py-0.5 rounded bg-purple-500/10 text-purple-400 font-mono text-[10px]">
-                    Isolated Sandbox
+                    Text Assistance Only
                   </span>
                 </div>
                 <div className="space-y-2 text-zinc-300">
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-purple-500/20 text-purple-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">1</span>
-                    <span><strong>Microservice Scaffolding:</strong> Generates Fastify, TypeScript, and Prisma schemas directly.</span>
+                    <span><strong>Generated Drafts:</strong> Scaffolds, fixes and explanations come back as text from Gemini.</span>
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-amber-500/20 text-amber-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">2</span>
-                    <span><strong>Resource Capping:</strong> 128MB RAM limit, 1.0 CPU limit, and zero production network egress.</span>
+                    <span><strong>No Execution Engine:</strong> this product never runs submitted code, so no exit codes or timings are reported.</span>
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-emerald-500/20 text-emerald-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">3</span>
-                    <span><strong>Zero Shell Access:</strong> Untrusted code executes solely in ephemeral cgroups containers.</span>
+                    <span><strong>Task Records:</strong> prompts and replies are stored in memory and listed in the coding hub.</span>
                   </p>
                 </div>
                 <button
@@ -325,8 +252,6 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                   Open Coding Hub
                 </button>
               </div>
-            )}
-          </div>
         </div>
       </div>
 
@@ -341,7 +266,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                 <span>Job Sources & Crawler Health</span>
               </h2>
               <p className="text-xs text-zinc-400 mt-0.5">
-                Official connectors: MIFOTRA, Job in Rwanda & Remote boards (no hallucinated jobs).
+                Registered boards only: MIFOTRA, Job in Rwanda and a remote feed. Listings appear after a real crawl.
               </p>
             </div>
             <button
@@ -354,6 +279,11 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
           </div>
 
           <div className="space-y-3">
+            {sources.length === 0 && (
+              <p className="text-xs text-zinc-400 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+                No job boards registered on this server yet.
+              </p>
+            )}
             {sources.map((src) => (
               <div
                 key={src.id}
@@ -384,15 +314,27 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
 
                 <div className="flex items-center gap-3 justify-between sm:justify-end">
                   <div className="text-right">
-                    <p className="text-xs font-bold text-white">{src.activeListingsCount} active</p>
+                    <p className="text-xs font-bold text-white">{src.activeListingsCount} stored listings</p>
                     <p className="text-[10px] text-zinc-400">
-                      Last crawled {new Date(src.lastCrawledAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      {src.lastCrawledAt
+                        ? `Last crawled ${new Date(src.lastCrawledAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                        : 'Never crawled'}
                     </p>
                   </div>
-                  <div className="flex items-center gap-1 text-[11px] font-semibold text-emerald-400 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20">
-                    <CheckCircle2 className="w-3 h-3" />
-                    <span>Healthy</span>
-                  </div>
+                  <span
+                    className={`flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded border ${
+                      src.healthStatus === 'HEALTHY'
+                        ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
+                        : src.healthStatus === 'WARNING'
+                        ? 'text-amber-400 bg-amber-500/10 border-amber-500/20'
+                        : src.healthStatus === 'DOWN'
+                        ? 'text-red-400 bg-red-500/10 border-red-500/20'
+                        : 'text-zinc-400 bg-zinc-800 border-zinc-700'
+                    }`}
+                  >
+                    {src.healthStatus === 'HEALTHY' ? <CheckCircle2 className="w-3 h-3" /> : <AlertCircle className="w-3 h-3" />}
+                    <span>{src.healthStatus === 'UNKNOWN' ? 'Not crawled yet' : src.healthStatus}</span>
+                  </span>
                 </div>
               </div>
             ))}
@@ -404,12 +346,19 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-white flex items-center gap-2">
               <Layers className="w-4 h-4 text-purple-400" />
-              <span>Durable Job Queue (BullMQ)</span>
+              <span>Background Job Queue</span>
             </h2>
-            <span className="text-xs text-zinc-400 font-mono">4 Workers Active</span>
+            <span className="text-xs text-zinc-400 font-mono">
+              {health ? `${health.redisQueue.queuedJobs} queued • ${health.redisQueue.activeWorkers} workers` : 'Loading…'}
+            </span>
           </div>
 
           <div className="space-y-2.5">
+            {queuedJobs.length === 0 && (
+              <p className="text-xs text-zinc-400 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+                Queue is empty — no jobs enqueued since this process started.
+              </p>
+            )}
             {queuedJobs.slice(0, 4).map((qj) => (
               <div
                 key={qj.id}
@@ -439,59 +388,15 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
           <div className="pt-3 border-t border-zinc-800/80 flex items-center justify-between text-xs text-zinc-400">
             <div className="flex items-center gap-2">
               <PostgresLogo className="w-4 h-4 text-blue-400" />
-              <span>PostgreSQL Schema Ready</span>
+              <span>{health?.database.status === 'CONNECTED' ? 'PostgreSQL connected' : 'In-memory store (schema not applied)'}</span>
             </div>
             <div className="flex items-center gap-2">
               <RedisLogo className="w-4 h-4 text-red-400" />
-              <span>Redis Deduplication</span>
+              <span>{health?.redisQueue.status === 'ACTIVE' ? 'Redis deduplication' : 'In-process deduplication'}</span>
             </div>
           </div>
         </div>
       </div>
-
-      {/* Zoom Modal for Blueprint Image */}
-      {isZoomModalOpen && (
-        <div
-          className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4"
-          onClick={() => setIsZoomModalOpen(false)}
-        >
-          <div
-            className="w-full max-w-5xl bg-zinc-950 border border-zinc-800 rounded-2xl overflow-hidden p-4 space-y-3"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <Workflow className="w-4 h-4 text-emerald-400" />
-                <span>
-                  {selectedDiagram === 'flow'
-                    ? 'Aguka AI WhatsApp End-to-End Workflow (Uko Sisitemu Ikora)'
-                    : 'Aguka AI Coding System Architecture & Sandbox Pipeline'}
-                </span>
-              </h3>
-              <button
-                onClick={() => setIsZoomModalOpen(false)}
-                className="text-xs px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
-              >
-                Close (ESC)
-              </button>
-            </div>
-
-            <div className="relative w-full aspect-16/9 rounded-xl overflow-hidden bg-black/80 flex items-center justify-center">
-              <Image
-                src={
-                  selectedDiagram === 'flow'
-                    ? '/assets/aistudio/UKO_SYSTEM_IKORA_d9eb03d8.png'
-                    : '/assets/aistudio/CODING_SYSTEM_f37205c4.png'
-                }
-                alt="System Architecture Diagram Fullscreen"
-                fill
-                className="object-contain"
-                referrerPolicy="no-referrer"
-              />
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
