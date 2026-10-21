@@ -1,13 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { 
-  verifyWebhookChallenge, 
-  verifyMetaSignature, 
+import {
+  verifyWebhookChallenge,
+  verifyMetaSignature,
   parseWhatsAppWebhookPayload,
   sendWhatsAppMessage,
-  WhatsAppOutgoingMessage
+  downloadWhatsAppMedia,
+  buildTextMessage,
+  buildButtonMessage,
+  buildListMessage,
 } from '@/lib/whatsapp/gateway';
 import { repo } from '@/lib/db/repository';
-import { executeAgent } from '@/lib/ai/bilingual-router';
+import { handleIncomingImage, handleIncomingText, InboundOutcome } from '@/lib/whatsapp/inbound';
 
 /**
  * GET handler: Verifies WhatsApp Webhook during Meta App Setup
@@ -80,77 +83,80 @@ export async function POST(request: NextRequest) {
       const user = repo.getOrCreateUserByPhone(`+${msg.from}`);
       const conversation = repo.getOrCreateConversation(user.id);
 
-      // Extract message text
-      let userText = '';
-      if (msg.type === 'text' && msg.text) {
-        userText = msg.text.body;
-      } else if (msg.type === 'interactive' && msg.interactive) {
-        if (msg.interactive.button_reply) {
-          userText = msg.interactive.button_reply.title;
-        } else if (msg.interactive.list_reply) {
-          userText = msg.interactive.list_reply.title;
+      let outcome: InboundOutcome;
+
+      if (msg.type === 'image' && msg.image) {
+        // Payment screenshots arrive as image attachments.
+        const downloaded = await downloadWhatsAppMedia(msg.image.id);
+        if (!downloaded.ok || !downloaded.buffer) {
+          outcome = {
+            replyText: `The attachment could not be retrieved: ${downloaded.error}`,
+            agentType: 'ROUTER',
+            intent: 'MEDIA_DOWNLOAD_FAILED',
+            tokensUsed: 0,
+            modelUsed: 'media',
+          };
+        } else {
+          repo.addMessage(conversation.id, {
+            waMessageId: msg.id,
+            role: 'USER',
+            type: 'IMAGE',
+            content: `image (${downloaded.mimeType})`,
+            mediaUrl: `whatsapp-media:${msg.image.id}`,
+          });
+          outcome = await handleIncomingImage(user, conversation, downloaded.buffer, `${msg.id}.jpg`, downloaded.mimeType);
         }
+      } else {
+        // Extract message text. A list/button reply carries the row id, which is
+        // the reliable way to map a service selection back to the catalog.
+        let userText = '';
+        if (msg.type === 'text' && msg.text) {
+          userText = msg.text.body;
+        } else if (msg.interactive) {
+          if (msg.interactive.button_reply) {
+            userText = msg.interactive.button_reply.id || msg.interactive.button_reply.title;
+          } else if (msg.interactive.list_reply) {
+            userText = msg.interactive.list_reply.id || msg.interactive.list_reply.title;
+          }
+        }
+
+        if (!userText.trim()) continue;
+
+        // Add user message to conversation history
+        repo.addMessage(conversation.id, {
+          waMessageId: msg.id,
+          role: 'USER',
+          type: msg.interactive ? 'INTERACTIVE_REPLY' : 'TEXT',
+          content: userText,
+        });
+
+        // 5. Process through the shared inbound pipeline (service selection →
+        //    entitlement gate → agent)
+        repo.enqueueJob('PROCESS_WHATSAPP_MESSAGE', {
+          userId: user.id,
+          conversationId: conversation.id,
+          userText,
+        });
+
+        outcome = await handleIncomingText(user, conversation, userText);
       }
-
-      if (!userText.trim()) continue;
-
-      // Add user message to conversation history
-      repo.addMessage(conversation.id, {
-        waMessageId: msg.id,
-        role: 'USER',
-        type: 'TEXT',
-        content: userText,
-      });
-
-      // 5. Asynchronously execute AI orchestrator
-      // In production, this can also be queued into Redis BullMQ
-      repo.enqueueJob('PROCESS_WHATSAPP_MESSAGE', {
-        userId: user.id,
-        conversationId: conversation.id,
-        userText,
-      });
-
-      const agentResult = await executeAgent(user, conversation, userText);
 
       // Save assistant response to conversation history
       repo.addMessage(conversation.id, {
         role: 'ASSISTANT',
         type: 'TEXT',
-        content: agentResult.replyText,
-        tokensUsed: agentResult.tokensUsed,
+        content: outcome.replyText,
+        tokensUsed: outcome.tokensUsed,
       });
 
       // 6. Dispatch reply to user via WhatsApp Gateway
-      const outgoing: WhatsAppOutgoingMessage = agentResult.buttons && agentResult.buttons.length > 0
-        ? {
-            messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: msg.from,
-            type: 'interactive',
-            interactive: {
-              type: 'button',
-              body: { text: agentResult.replyText },
-              footer: { text: 'Aguka AI • Rwanda' },
-              action: {
-                buttons: agentResult.buttons.slice(0, 3).map((b) => ({
-                  type: 'reply',
-                  reply: { id: b.id, title: b.title.slice(0, 20) },
-                })),
-              },
-            },
-          }
-        : {
-            messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: msg.from,
-            type: 'text',
-            text: {
-              body: agentResult.replyText,
-              preview_url: true,
-            },
-          };
+      const payload = outcome.listMenu
+        ? buildListMessage(msg.from, outcome.listMenu.interactive)
+        : outcome.buttons && outcome.buttons.length > 0
+          ? buildButtonMessage(msg.from, outcome.replyText, outcome.buttons)
+          : buildTextMessage(msg.from, outcome.replyText);
 
-      await sendWhatsAppMessage(outgoing);
+      await sendWhatsAppMessage(payload);
     }
 
     // Always acknowledge quickly to Meta with 200 OK

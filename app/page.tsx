@@ -7,6 +7,10 @@ import { OverviewDashboard } from '@/components/screens/overview-dashboard';
 import { SimulatorScreen } from '@/components/screens/simulator-screen';
 import { ConversationsScreen } from '@/components/screens/conversations-screen';
 import { AgentsScreen } from '@/components/screens/agents-screen';
+import { ServicesPricingScreen } from '@/components/screens/services-pricing-screen';
+import { RoadSafetyAdminScreen } from '@/components/screens/road-safety-admin-screen';
+import { PaymentsReviewScreen } from '@/components/screens/payments-review-screen';
+import { AccessAuditScreen } from '@/components/screens/access-audit-screen';
 import { JobsScreen } from '@/components/screens/jobs-screen';
 import { EmploymentScreen } from '@/components/screens/employment-screen';
 import { CodingScreen } from '@/components/screens/coding-screen';
@@ -48,6 +52,10 @@ export default function HomePage() {
           {currentScreen === 'simulator' && <SimulatorScreen />}
           {currentScreen === 'conversations' && <ConversationsScreen />}
           {currentScreen === 'agents' && <AgentsScreen />}
+          {currentScreen === 'services' && <ServicesPricingScreen />}
+          {currentScreen === 'road-safety' && <RoadSafetyAdminScreen />}
+          {currentScreen === 'payments' && <PaymentsReviewScreen />}
+          {currentScreen === 'access' && <AccessAuditScreen />}
           {currentScreen === 'jobs' && <JobsScreen />}
           {currentScreen === 'employment' && <EmploymentScreen />}
           {currentScreen === 'coding' && <CodingScreen />}

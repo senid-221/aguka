@@ -1,9 +1,17 @@
-import { runPlatformTestSuiteAsync } from '@/lib/testing/suite';
+/**
+ * The suite writes real records (trial users, orders, receipts, exam attempts),
+ * so a command-line run gets its own durable directory and can never touch the
+ * live store.
+ */
+process.env.AGUKA_DATA_DIR = process.env.AGUKA_DATA_DIR || '.aguka-test-data';
 
 async function main() {
+  const { runPlatformTestSuiteAsync } = await import('@/lib/testing/suite');
+
   console.log('\n======================================================');
   console.log('  AGUKA AI — BACKEND FOUNDATION AUTOMATED TEST SUITE');
   console.log('======================================================\n');
+  console.log(` Data directory: ${process.env.AGUKA_DATA_DIR}\n`);
 
   const startTime = Date.now();
   const suite = await runPlatformTestSuiteAsync();

@@ -48,6 +48,7 @@ enum AgentType {
   CODING_AGENT
   STUDY_TUTOR
   EMPLOYMENT_MARKETPLACE
+  ROAD_SAFETY_ACADEMY
 }
 
 enum TaskStatus {
@@ -96,6 +97,8 @@ model User {
   role            UserRole           @default(CANDIDATE)
   isActive        Boolean            @default(true)
   isBlocked       Boolean            @default(false)
+  selectedServiceCode String?        // last WhatsApp menu choice
+  serviceSelectedAt   DateTime?
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
 
@@ -111,6 +114,12 @@ model User {
   studySessions   StudySession[]
   usageRecords    UsageRecord[]
   auditLogs       AuditLog[]
+  entitlements    Entitlement[]
+  trialGrants     TrialGrant[]
+  paymentOrders   PaymentOrder[]
+  paymentProofs   PaymentProof[]
+  examAttempts    ExamAttempt[]
+  lessonProgress  LessonProgress[]
 
   @@index([phoneNumber])
   @@index([preferredLang])
@@ -149,6 +158,8 @@ model Conversation {
   userId       String
   user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   lastAgent    AgentType     @default(ROUTER)
+  activeServiceCode String?  // service the conversation is currently routed to
+  menuSentAt   DateTime?     // when the WhatsApp service menu was last offered
   isActive     Boolean       @default(true)
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
@@ -508,4 +519,363 @@ model UsageRecord {
 
   @@index([service])
   @@index([timestamp])
+}
+
+// ---------------------------------------------------------------------------
+// Commercial layer: services, entitlements, trials, payments
+// ---------------------------------------------------------------------------
+
+enum Currency {
+  RWF
+  USD
+  EUR
+}
+
+enum BillingPeriod {
+  PER_USE
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+enum EntitlementStatus {
+  NONE
+  TRIAL
+  ACTIVE
+  EXPIRED
+}
+
+enum PaymentOrderStatus {
+  AWAITING_PROOF
+  PROOF_UPLOADED
+  UNDER_REVIEW
+  VERIFIED
+  REJECTED
+  EXPIRED
+}
+
+enum PaymentVerificationSource {
+  MANUAL_ADMIN
+  PAYMENT_PROVIDER_API
+}
+
+enum RiskBand {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum ProofReviewStatus {
+  UNREVIEWED
+  ACCEPTED
+  FLAGGED
+}
+
+enum PublishStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum RoadSignCategory {
+  WARNING
+  PROHIBITORY
+  MANDATORY
+  DANGER
+  INFORMATION
+  SERVICE
+}
+
+enum QuestionDifficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum ExamKind {
+  PRACTICE
+  MOCK_EXAM
+}
+
+enum AuditActorRole {
+  ADMIN
+  SYSTEM
+  USER
+}
+
+model ServiceDefinition {
+  id                  String        @id @default(uuid())
+  code                String        @unique
+  nameEn              String
+  nameRw              String
+  descriptionEn       String
+  descriptionRw       String
+  agentType           AgentType
+  isEnabled           Boolean       @default(true)
+  showInWhatsAppMenu  Boolean       @default(true)
+  isFree              Boolean       @default(true)
+  // Charging stays off until an administrator confirms a price.
+  chargeEnabled       Boolean       @default(false)
+  price               Float         @default(0.0)
+  currency            Currency      @default(RWF)
+  billingPeriod       BillingPeriod @default(MONTHLY)
+  trialHours          Int           @default(24)
+  trialUsageLimit     Int           @default(0)
+  paidUsageLimit      Int           @default(0)
+  sortOrder           Int           @default(100)
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  entitlements        Entitlement[]
+  paymentOrders       PaymentOrder[]
+
+  @@index([isEnabled, showInWhatsAppMenu])
+}
+
+model Entitlement {
+  id             String            @id @default(uuid())
+  userId         String
+  user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serviceCode    String
+  service        ServiceDefinition @relation(fields: [serviceCode], references: [code], onDelete: Restrict)
+  status         EntitlementStatus @default(NONE)
+  trialStartsAt  DateTime?
+  trialExpiresAt DateTime?
+  paidUntil      DateTime?
+  usageCount     Int               @default(0)
+  usageLimit     Int?
+  lastUsedAt     DateTime?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  @@unique([userId, serviceCode])
+  @@index([serviceCode, status])
+}
+
+// Append-only: the existence of a row is what blocks a second free trial.
+model TrialGrant {
+  id          String          @id @default(uuid())
+  userId      String
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serviceCode String
+  identityKey String          // normalised WhatsApp id / phone, catches same-person relinks
+  grantedAt   DateTime
+  expiresAt   DateTime
+
+  @@index([userId, serviceCode])
+  @@index([identityKey, serviceCode])
+}
+
+model PaymentOrder {
+  id                    String                   @id @default(uuid())
+  reference             String                   @unique
+  userId                String
+  user                  User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serviceCode           String
+  service               ServiceDefinition        @relation(fields: [serviceCode], references: [code], onDelete: Restrict)
+  userPhone             String
+  amount                Float
+  currency              Currency                 @default(RWF)
+  billingPeriod         BillingPeriod            @default(MONTHLY)
+  payeeName             String
+  payeeMomoCode         String
+  status                PaymentOrderStatus       @default(AWAITING_PROOF)
+  idempotencyKey        String?                  @unique
+  riskBand              RiskBand?
+  verificationSource    PaymentVerificationSource?
+  verifiedBy            String?
+  verifiedAt            DateTime?
+  providerTransactionId String?
+  rejectionReason       String?
+  grantedEntitlementUntil DateTime?
+  createdAt             DateTime                 @default(now())
+  updatedAt             DateTime                 @updatedAt
+
+  proofs                PaymentProof[]
+
+  @@index([userId, serviceCode])
+  @@index([status])
+}
+
+model PaymentProof {
+  id                String         @id @default(uuid())
+  orderId           String
+  order             PaymentOrder   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  userId            String
+  user              User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reference         String
+  uploadedBy        String
+  storageKey        String         @unique // opaque; bytes live outside the web root
+  fileName          String
+  mimeType          String
+  sizeBytes         Int
+  sha256            String         // duplicate-screenshot detection
+  width             Int?
+  height            Int?
+  duplicateProofIds String[]
+  signals           Json           // forensic findings with severity + weight
+  riskScore         Int            @default(0)
+  riskBand          RiskBand       @default(LOW)
+  ocr               Json           // text extraction + reference/amount/payee match results
+  reviewStatus      ProofReviewStatus @default(UNREVIEWED)
+  createdAt         DateTime       @default(now())
+
+  @@index([sha256])
+  @@index([orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Road Safety Academy
+// ---------------------------------------------------------------------------
+
+model RoadSafetyModule {
+  id         String        @id @default(uuid())
+  code       String        @unique
+  titleEn    String
+  titleRw    String
+  summaryEn  String
+  summaryRw  String
+  sortOrder  Int           @default(0)
+  status     PublishStatus @default(DRAFT)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  lessons    RoadSafetyLesson[]
+  questions  RoadSafetyQuestion[]
+  exams      ExamTemplate[]
+}
+
+model RoadSafetyLesson {
+  id              String        @id @default(uuid())
+  moduleId        String
+  module          RoadSafetyModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  titleEn         String
+  titleRw         String
+  bodyEn          String
+  bodyRw          String
+  keyPointsEn     String[]
+  keyPointsRw     String[]
+  citations       Json          // sources this lesson was verified against
+  legalVerifiedAt DateTime?
+  lastReviewedBy  String?
+  status          PublishStatus @default(DRAFT)
+  sortOrder       Int           @default(0)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  questions       RoadSafetyQuestion[]
+  progress        LessonProgress[]
+
+  @@index([moduleId, status])
+}
+
+model RoadSign {
+  id               String           @id @default(uuid())
+  code             String           @unique
+  category         RoadSignCategory
+  nameEn           String
+  nameRw           String
+  meaningEn        String
+  meaningRw        String
+  shape            String
+  colourConvention String
+  citations        Json
+  legalVerifiedAt  DateTime?
+  status           PublishStatus    @default(DRAFT)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@index([category, status])
+}
+
+model RoadSafetyQuestion {
+  id             String            @id @default(uuid())
+  moduleId       String
+  module         RoadSafetyModule  @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  lessonId       String?
+  lesson         RoadSafetyLesson? @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  questionEn     String
+  questionRw     String
+  optionsEn      String[]
+  optionsRw      String[]
+  correctIndex   Int
+  explanationEn  String
+  explanationRw  String
+  difficulty     QuestionDifficulty @default(MEDIUM)
+  citations      Json
+  legalVerifiedAt DateTime?
+  status         PublishStatus     @default(DRAFT)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  @@index([moduleId, status])
+}
+
+model ExamTemplate {
+  id                String            @id @default(uuid())
+  nameEn            String
+  nameRw            String
+  moduleId          String?
+  module            RoadSafetyModule? @relation(fields: [moduleId], references: [id], onDelete: SetNull)
+  questionCount     Int               @default(10)
+  passPercent       Int               @default(70)
+  timeLimitMinutes  Int?
+  status            PublishStatus     @default(DRAFT)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  attempts          ExamAttempt[]
+
+  @@index([status])
+}
+
+model ExamAttempt {
+  id              String        @id @default(uuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind            ExamKind
+  examTemplateId  String?
+  examTemplate    ExamTemplate? @relation(fields: [examTemplateId], references: [id], onDelete: SetNull)
+  moduleId        String?
+  language        LanguagePreference
+  questionIds     String[]
+  answers         Json          // per-question correction + bilingual explanation
+  totalQuestions  Int
+  correctCount    Int           @default(0)
+  scorePercent    Int           @default(0)
+  passPercent     Int           @default(0)
+  passed          Boolean       @default(false)
+  startedAt       DateTime
+  submittedAt     DateTime?
+  durationSeconds Int?
+
+  @@index([userId, kind])
+}
+
+model LessonProgress {
+  id          String            @id @default(uuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lessonId    String
+  lesson      RoadSafetyLesson  @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  completedAt DateTime
+
+  @@unique([userId, lessonId])
+}
+
+// Structured before/after trail for commercial and curriculum changes.
+model AuditEntry {
+  id         String         @id @default(uuid())
+  actor      String
+  actorRole  AuditActorRole
+  action     String
+  targetType String
+  targetId   String
+  summary    String
+  before     Json?
+  after      Json?
+  createdAt  DateTime       @default(now())
+
+  @@index([action, createdAt])
+  @@index([targetType, targetId])
 }

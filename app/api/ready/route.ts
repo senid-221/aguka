@@ -44,6 +44,18 @@ export async function GET() {
         mode: systemHealth.whatsappApi.mode,
         verified: systemHealth.whatsappApi.webhookVerified,
       },
+      payments: {
+        status: configResult.config.payments.providerEndpointConfigured ? 'PASS' : 'MANUAL_REVIEW_ONLY',
+        ...configResult.config.payments,
+      },
+      persistence: {
+        status: systemHealth.persistence.mode,
+        loadedFromDisk: systemHealth.persistence.loadedFromDisk,
+        records: systemHealth.persistence.records,
+        lastSavedAt: systemHealth.persistence.lastSavedAt,
+        lastSaveError: systemHealth.persistence.lastSaveError,
+        productionDatabase: systemHealth.productionDatabase,
+      },
     },
   };
 

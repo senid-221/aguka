@@ -160,6 +160,20 @@ export function parseWhatsAppWebhookPayload(body: Record<string, unknown>): What
             parsed.text = { body: String(t.body || '') };
           } else if (type === 'interactive' && m.interactive) {
             parsed.interactive = m.interactive as WhatsAppIncomingMessage['interactive'];
+          } else if (type === 'image' && m.image) {
+            const img = m.image as { id?: string; mime_type?: string; sha256?: string };
+            parsed.image = {
+              id: String(img.id || ''),
+              mime_type: String(img.mime_type || 'image/jpeg'),
+              sha256: String(img.sha256 || ''),
+            };
+          } else if (type === 'document' && m.document) {
+            const doc = m.document as { id?: string; filename?: string; mime_type?: string };
+            parsed.document = {
+              id: String(doc.id || ''),
+              filename: String(doc.filename || 'document'),
+              mime_type: String(doc.mime_type || 'application/octet-stream'),
+            };
           } else if (type === 'button' && m.button) {
             const btn = m.button as { text?: string; payload?: string };
             parsed.interactive = {
@@ -245,5 +259,133 @@ export async function sendWhatsAppMessage(payload: WhatsAppOutgoingMessage): Pro
     mode: 'NOT_CONFIGURED',
     error:
       'WhatsApp credentials (WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN) are not configured. Nothing was dispatched.',
+  };
+}
+
+function liveCredentials(): { phoneNumberId: string; accessToken: string } | null {
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!phoneNumberId || phoneNumberId === '109876543210987' || !accessToken || accessToken.includes('replace_with')) {
+    return null;
+  }
+  return { phoneNumberId, accessToken };
+}
+
+/**
+ * Fetches an inbound media attachment (a payment screenshot, for example) from
+ * the Meta media API. Returns an explicit failure when credentials are missing
+ * or the download errors — an unconfigured server never pretends to have the
+ * image bytes.
+ */
+export async function downloadWhatsAppMedia(
+  mediaId: string,
+  maxBytes = 10 * 1024 * 1024
+): Promise<{ ok: boolean; buffer: Buffer | null; mimeType: string; error: string | null }> {
+  const creds = liveCredentials();
+  if (!creds) {
+    return {
+      ok: false,
+      buffer: null,
+      mimeType: '',
+      error: 'WhatsApp media download needs WHATSAPP_PHONE_NUMBER_ID and WHATSAPP_ACCESS_TOKEN.',
+    };
+  }
+  if (!mediaId) {
+    return { ok: false, buffer: null, mimeType: '', error: 'The incoming message carried no media id.' };
+  }
+
+  try {
+    const metaRes = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${creds.accessToken}` },
+    });
+    const meta = (await metaRes.json()) as { url?: string; mime_type?: string; error?: { message?: string } };
+    if (!metaRes.ok || !meta.url) {
+      return {
+        ok: false,
+        buffer: null,
+        mimeType: meta.mime_type || '',
+        error: meta.error?.message || `Media lookup failed with status ${metaRes.status}`,
+      };
+    }
+
+    const fileRes = await fetch(meta.url, { headers: { Authorization: `Bearer ${creds.accessToken}` } });
+    if (!fileRes.ok) {
+      return { ok: false, buffer: null, mimeType: meta.mime_type || '', error: `Media fetch failed with status ${fileRes.status}` };
+    }
+    const bytes = Buffer.from(await fileRes.arrayBuffer());
+    if (bytes.byteLength > maxBytes) {
+      return { ok: false, buffer: null, mimeType: meta.mime_type || '', error: 'Attachment is larger than the 10 MB proof limit.' };
+    }
+    return { ok: true, buffer: bytes, mimeType: meta.mime_type || 'image/jpeg', error: null };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      buffer: null,
+      mimeType: '',
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export function buildTextMessage(to: string, body: string): WhatsAppOutgoingMessage {
+  return {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'text',
+    text: { body, preview_url: false },
+  };
+}
+
+export function buildButtonMessage(
+  to: string,
+  body: string,
+  buttons: Array<{ id: string; title: string }>
+): WhatsAppOutgoingMessage {
+  return {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: body },
+      footer: { text: 'Aguka AI • Rwanda' },
+      action: {
+        buttons: buttons.slice(0, 3).map((b) => ({
+          type: 'reply',
+          reply: { id: b.id, title: b.title.slice(0, 20) },
+        })),
+      },
+    },
+  };
+}
+
+/**
+ * A WhatsApp list message needs a text header ≤ 60 characters, so the header is
+ * always present even when only the first section fits the row limits.
+ */
+export function buildListMessage(
+  to: string,
+  list: {
+    type: 'list';
+    header: { type: 'string'; string: string };
+    body: { text: string };
+    footer: { text: string };
+    action: { button: string; sections: Array<{ title: string; rows: Array<{ id: string; title: string; description?: string }> }> };
+  }
+): WhatsAppOutgoingMessage {
+  return {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: list.header.string.slice(0, 60) },
+      body: { text: list.body.text },
+      footer: { text: list.footer.text },
+      action: { button: list.action.button, sections: list.action.sections },
+    },
   };
 }

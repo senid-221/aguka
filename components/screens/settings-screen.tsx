@@ -21,16 +21,47 @@ interface ReadinessPayload {
     queue: { status: string; mode: string; pendingJobs: number };
     aiProvider: { status: string; provider: string; model: string };
     whatsappWebhook: { status: string; mode: string; verified: boolean };
+    payments: {
+      status: string;
+      payeeName: string;
+      momoCode: string;
+      providerEndpointConfigured: boolean;
+      webhookSecretConfigured: boolean;
+      autoVerifyEnabled: boolean;
+      ocrConfigured: boolean;
+    };
+    persistence: {
+      status: string;
+      loadedFromDisk: boolean;
+      records: number;
+      lastSavedAt: string | null;
+      lastSaveError: string | null;
+      productionDatabase: {
+        prismaInstalled: boolean;
+        schemaFilePresent: boolean;
+        migrationsPresent: number;
+        applied: boolean;
+        note: string;
+      };
+    };
   };
 }
 
 const ENV_LABELS: Array<{ name: string; note: string }> = [
   { name: 'GEMINI_API_KEY', note: 'Required for any agent reply' },
+  { name: 'OPENAI_API_KEY', note: 'Reads text out of MoMo receipt screenshots (vision OCR)' },
   { name: 'WHATSAPP_PHONE_NUMBER_ID', note: 'Meta number that sends replies' },
   { name: 'WHATSAPP_ACCESS_TOKEN', note: 'Cloud API bearer token' },
   { name: 'WHATSAPP_VERIFY_TOKEN', note: 'Must match Meta webhook setup' },
   { name: 'WHATSAPP_APP_SECRET', note: 'Enforces HMAC-SHA256 signature checks' },
-  { name: 'DATABASE_URL', note: 'PostgreSQL target for Prisma schema' },
+  { name: 'MOMO_PAYEE_NAME', note: 'Recipient name shown in payment instructions (falls back to "Vincent")' },
+  { name: 'MOMO_PAYEE_CODE', note: 'MoMo Pay code users pay to (falls back to "935237")' },
+  { name: 'MOMO_VERIFY_API_URL', note: 'Official transaction-lookup endpoint; without it payments need manual confirmation' },
+  { name: 'MOMO_VERIFY_API_TOKEN', note: 'Bearer token for that lookup endpoint' },
+  { name: 'PAYMENT_WEBHOOK_SECRET', note: 'HMAC key for POST /api/payments/webhook — unset means every callback is rejected' },
+  { name: 'PAYMENT_AUTO_VERIFY', note: 'Set to "true" so a provider confirmation unlocks the service without an admin click' },
+  { name: 'AGUKA_DATA_DIR', note: 'Where the durable store and receipt binaries live (defaults to ./.aguka-data)' },
+  { name: 'DATABASE_URL', note: 'PostgreSQL target for the Prisma schema' },
   { name: 'REDIS_URL', note: 'External queue and dedup store' },
   { name: 'ADMIN_JWT_SECRET', note: 'Signs admin dashboard sessions' },
   { name: 'ADMIN_DEFAULT_EMAIL', note: 'Admin login identity' },
@@ -209,6 +240,85 @@ export function SettingsScreen() {
             {readiness?.checks.aiProvider.status === 'PASS' ? 'Responding' : 'Not configured or unreachable'}
           </p>
         </div>
+        <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+          <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">MoMo Destination</p>
+          <p className="text-xs font-bold text-white mt-1 font-mono">
+            {readiness ? readiness.checks.payments.momoCode : 'Loading…'}
+          </p>
+          <p className="text-[11px] text-zinc-400 mt-0.5">
+            {readiness ? `Recipient: ${readiness.checks.payments.payeeName}` : 'Reading payment config'}
+          </p>
+        </div>
+        <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+          <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">Payment Verification</p>
+          <p className="text-xs font-bold text-white mt-1">
+            {readiness?.checks.payments.providerEndpointConfigured
+              ? 'Provider lookup configured'
+              : 'Manual confirmation only'}
+          </p>
+          <p className="text-[11px] text-zinc-400 mt-0.5 space-y-0.5">
+            {readiness && (
+              <>
+                Webhook HMAC {readiness.checks.payments.webhookSecretConfigured ? 'enforced' : 'not configured'} ·
+                receipt OCR {readiness.checks.payments.ocrConfigured ? 'on' : 'off'} · auto-unlock{' '}
+                {readiness.checks.payments.autoVerifyEnabled ? 'on' : 'off'}
+              </>
+            )}
+            {!readiness?.checks.payments.providerEndpointConfigured && (
+              <span className="block text-amber-400 mt-1">
+                No payment is ever unlocked by a screenshot. Until an official lookup exists, an
+                administrator must confirm each one.
+              </span>
+            )}
+          </p>
+        </div>
+        <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+          <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">Durable Store</p>
+          <p className="text-xs font-bold text-white mt-1">
+            {readiness?.checks.persistence.status ?? 'Loading…'}
+          </p>
+          <p className="text-[11px] text-zinc-400 mt-0.5">
+            {readiness
+              ? `${readiness.checks.persistence.records} record(s)${
+                  readiness.checks.persistence.lastSavedAt
+                    ? ` · saved ${new Date(readiness.checks.persistence.lastSavedAt).toLocaleTimeString('en-GB')}`
+                    : ' · not yet flushed'
+                }`
+              : 'Reading store status'}
+          </p>
+          {readiness?.checks.persistence.lastSaveError && (
+            <p className="text-[11px] text-red-400 mt-1">Last write failed: {readiness.checks.persistence.lastSaveError}</p>
+          )}
+        </div>
+      </div>
+
+      {/* Production Database Path */}
+      <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-2">
+        <h2 className="text-sm font-bold text-white">Production Database Path</h2>
+        <p className="text-xs text-zinc-400 leading-relaxed">
+          {readiness?.checks.persistence.productionDatabase.note ??
+            'Reading schema/migration presence from the server…'}
+        </p>
+        <div className="flex flex-wrap gap-2 text-[10px] font-mono">
+          <span className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300">
+            schema.prisma: {readiness ? (readiness.checks.persistence.productionDatabase.schemaFilePresent ? 'present' : 'missing') : '…'}
+          </span>
+          <span className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300">
+            migrations: {readiness ? readiness.checks.persistence.productionDatabase.migrationsPresent : '…'}
+          </span>
+          <span className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300">
+            @prisma/client: {readiness ? (readiness.checks.persistence.productionDatabase.prismaInstalled ? 'installed' : 'not installed') : '…'}
+          </span>
+          <span
+            className={`px-2 py-1 rounded border font-semibold ${
+              readiness?.checks.persistence.productionDatabase.applied
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {readiness?.checks.persistence.productionDatabase.applied ? 'PostgreSQL live' : 'file store is authoritative'}
+          </span>
+        </div>
       </div>
 
       {/* Deployment Guide */}
@@ -218,17 +328,19 @@ export function SettingsScreen() {
           <span>Production Deployment Quick Guide (Render, AWS, or Docker)</span>
         </h2>
         <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 font-mono text-xs text-zinc-300 space-y-2">
-          <p className="text-zinc-500"># 1. Point DATABASE_URL at PostgreSQL, then apply the schema:</p>
-          <p className="text-emerald-400">npx prisma migrate deploy</p>
+          <p className="text-zinc-500"># 1. Install the Prisma client and point DATABASE_URL at PostgreSQL:</p>
+          <p className="text-emerald-400">npm install prisma @prisma/client && npx prisma migrate deploy</p>
           <p className="text-zinc-500 mt-2"># 2. Build the production Next.js application:</p>
           <p className="text-emerald-400">npm run build</p>
           <p className="text-zinc-500 mt-2"># 3. Start the server:</p>
           <p className="text-emerald-400">npm run start</p>
         </div>
-        <p className="text-[11px] text-zinc-500">
-          Note: the application code reads and writes through the in-memory repository. The Prisma
-          schema and migration exist but are not connected yet, so step 1 prepares a database the app
-          does not use until a Prisma client is wired into lib/db.
+        <p className="text-[11px] text-zinc-500 leading-relaxed">
+          Until step 1 is run, live reads and writes go through the atomic JSON snapshot plus the
+          private receipts directory in AGUKA_DATA_DIR (default <span className="font-mono">./.aguka-data</span>),
+          which is git-ignored. The Prisma schema and both migrations describe the same tables, so the
+          data written here is production-shaped but not yet in PostgreSQL — back it up like a real
+          database and never commit that folder.
         </p>
       </div>
     </div>

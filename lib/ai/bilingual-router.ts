@@ -2,6 +2,15 @@ import { AgentType, LanguagePreference, Conversation, User } from '@/lib/types';
 import { repo } from '@/lib/db/repository';
 import { sanitizeUserInput, redactSecrets } from './prompt-security';
 import { getAIProvider } from './provider-adapter';
+import {
+  consumeUsage,
+  evaluateAccess,
+  buildAccessReply,
+  type ReplyLanguage,
+} from '@/lib/services/entitlements';
+import { getService } from '@/lib/services/catalog';
+import { handleRoadSafetyMessage } from '@/lib/road-safety/whatsapp-flow';
+import { publishedLessons, progressFor, formatProgress } from '@/lib/road-safety/academy';
 
 export interface AgentExecutionResult {
   agentType: AgentType;
@@ -23,22 +32,30 @@ export interface AgentExecutionResult {
 /**
  * Detects whether the user is typing in Kinyarwanda, English, or a mixture
  */
+/**
+ * Distinctive Kinyarwanda stems, matched as substrings because the language
+ * glues prefixes and possessives onto the root (ndashaka, amasomo, kwishyura).
+ * Includes the command words the platform itself teaches in the service menu,
+ * the academy and the payment prompts, so a learner replying "amasomo" is not
+ * answered in English.
+ */
+const KINYARWANDA_STEMS = [
+  'muraho', 'bite', 'amakuru', 'akazi', 'mifotra', 'kwandika', 'ibaruwa', 'ifoto', 'kwiga',
+  'sobanurira', 'umurimo', 'umushahara', 'ngufashe', 'gufasha', 'ndifuza', 'shaka',
+  'cyangwa', 'hano', 'nyamuneka', 'ryanjye', 'muri', 'kandi',
+  'amasomo', 'isomo', 'ikizamini', 'imyitozo', 'ibibazo', 'ikibazo',
+  'ibimenyetso', 'ikimenyetso', 'umuhanda', 'ubwitonzi',
+  'ishyur', 'igiciro', 'imerere', 'hitamo', 'guhindura',
+  'serivisi', 'ubutumwa', 'nkobora', 'wakoze',
+];
+
+/** Short roots that only count as whole words, so English text is not misread. */
+const KINYARWANDA_WORDS = ['mu', 'ya', 'kuri', 'reba', 'ndi', 'kwa', 'iyo'];
+
 export function detectLanguage(text: string): LanguagePreference {
   const t = text.toLowerCase();
-  const kinyarwandaKeywords = [
-    'muraho', 'bite', 'amakuru', 'akazi', 'mifotra', 'kwandika', 'ibaruwa',
-    'ifoto', 'kwiga', 'sobanurira', 'umurimo', 'umushahara', 'ngufashe',
-    'ndifuza', 'kuri', 'mu', 'ya', 'ryanjye', 'cyangwa', 'hano', 'nyamuneka'
-  ];
-
-  let kinyCount = 0;
-  for (const kw of kinyarwandaKeywords) {
-    if (t.includes(kw)) kinyCount++;
-  }
-
-  if (kinyCount >= 1) {
-    return 'KINYARWANDA';
-  }
+  if (KINYARWANDA_STEMS.some((stem) => t.includes(stem))) return 'KINYARWANDA';
+  if (t.split(/[^a-z]+/).some((word) => KINYARWANDA_WORDS.includes(word))) return 'KINYARWANDA';
   return 'ENGLISH';
 }
 
@@ -47,6 +64,27 @@ export function detectLanguage(text: string): LanguagePreference {
  */
 export function classifyIntent(text: string): { agentType: AgentType; intent: string } {
   const t = text.toLowerCase();
+
+  // 0. Road Safety Academy — checked first so "highway code" or "driving
+  //    licence exam" is not swallowed by the coding or study tutors.
+  if (
+    t.includes('road') ||
+    t.includes('driving') ||
+    t.includes('driver') ||
+    t.includes('licence') ||
+    t.includes('license') ||
+    t.includes('traffic') ||
+    t.includes('umuhanda') ||
+    t.includes('amategeko') ||
+    t.includes('ikizamini cy\'imodoka') ||
+    t.includes('moteri') ||
+    t.includes('ikimenyetso') ||
+    t.includes('ibimenyetso') ||
+    t.includes('pedestrian') ||
+    t.includes('patrol')
+  ) {
+    return { agentType: 'ROAD_SAFETY_ACADEMY', intent: 'ROAD_SAFETY_LEARNING' };
+  }
 
   // 1. Coding Agent
   if (
@@ -154,6 +192,8 @@ const AGENT_SYSTEM_INSTRUCTIONS: Record<AgentType, string> = {
     'You are a patient STEM and language tutor for Rwandan students. Explain the exact concept the user asked about, then end with one practice question. Use Kinyarwanda only when the user wrote in Kinyarwanda.',
   EMPLOYMENT_MARKETPLACE:
     'You connect Rwandan employers with workers. Report only the marketplace figures given in the platform data section and never name or describe a professional who is not listed there.',
+  ROAD_SAFETY_ACADEMY:
+    'You teach Rwandan road safety and traffic rules. Use ONLY the published lesson material supplied in the platform data section, and state its legal-review status. If a rule is not in that material, say you have not verified it for Rwanda and direct the learner to the official authority instead of guessing. Never present a fine amount, licence category, age limit, speed limit or pass mark that is not in the supplied material.',
 };
 
 const AGENT_BUTTONS: Record<AgentType, Array<{ id: string; en: string; rw: string }>> = {
@@ -182,6 +222,11 @@ const AGENT_BUTTONS: Record<AgentType, Array<{ id: string; en: string; rw: strin
     { id: 'btn_post_vacancy', en: 'Post a Vacancy', rw: 'Tanga umwanya' },
     { id: 'btn_browse_talent', en: 'Browse Talent', rw: 'Reba abakozi' },
   ],
+  ROAD_SAFETY_ACADEMY: [
+    { id: 'btn_rs_lessons', en: 'Lessons', rw: 'Amasomo' },
+    { id: 'btn_rs_practice', en: 'Practice', rw: 'Imyitozo' },
+    { id: 'btn_rs_exam', en: 'Mock exam', rw: 'Ikizamini' },
+  ],
 };
 
 const AI_NOT_CONFIGURED: Record<'KINYARWANDA' | 'ENGLISH', string> = {
@@ -199,10 +244,22 @@ const AI_UNAVAILABLE: Record<'KINYARWANDA' | 'ENGLISH', string> = {
 /**
  * Orchestrates the AI Agent execution
  */
+export interface ExecuteAgentOptions {
+  /** Service the user picked from the WhatsApp menu; overrides keyword routing. */
+  serviceCode?: string | null;
+  /**
+   * Reply language already resolved by the inbound flow, which knows the language
+   * the user last wrote in. Pass it so a bare "6" or an exam answer does not send
+   * a Kinyarwanda speaker back to English mid-conversation.
+   */
+  replyLang?: ReplyLanguage;
+}
+
 export async function executeAgent(
   user: User,
   conversation: Conversation,
-  userMessageText: string
+  userMessageText: string,
+  opts: ExecuteAgentOptions = {}
 ): Promise<AgentExecutionResult> {
   const startTime = Date.now();
 
@@ -222,13 +279,122 @@ export async function executeAgent(
   }
 
   const lang = detectLanguage(sanitization.cleanText);
-  const replyLang: 'KINYARWANDA' | 'ENGLISH' = lang === 'KINYARWANDA' ? 'KINYARWANDA' : 'ENGLISH';
-  const { agentType, intent } = classifyIntent(sanitization.cleanText);
+  const replyLang: ReplyLanguage = opts.replyLang ?? (lang === 'KINYARWANDA' ? 'KINYARWANDA' : 'ENGLISH');
+
+  // Routing preference: an admin-selected service beats keyword guessing, and
+  // the choice is remembered on both the user and the conversation.
+  const serviceCode = opts.serviceCode ?? conversation.activeServiceCode ?? user.selectedServiceCode ?? null;
+  const service = serviceCode ? getService(serviceCode) : undefined;
+  const classified = classifyIntent(sanitization.cleanText);
+  const agentType: AgentType = service?.agentType ?? classified.agentType;
+  const intent = service ? `SERVICE:${service.code}` : classified.intent;
 
   // Update conversation active agent
   repo.setConversationAgent(conversation.id, agentType);
 
-  // 2. Collect facts that the model is allowed to repeat
+  // 2. Entitlement gate. Charging and trial expiry are enforced here, on the
+  //    server, before any model call — never by asking the model to behave.
+  if (service) {
+    const decision = evaluateAccess(user, service);
+    if (!decision.allowed) {
+      const denialIntent = `ACCESS_${decision.denialReason ?? 'DENIED'}`;
+      if (decision.denialReason === 'SERVICE_DISABLED') {
+        return {
+          agentType,
+          intent: denialIntent,
+          detectedLanguage: lang,
+          replyText: buildAccessReply(service, decision, replyLang),
+          buttons: [{ id: 'btn_menu', title: replyLang === 'KINYARWANDA' ? 'Menya izindi' : 'Other services' }],
+          tokensUsed: 0,
+          latencyMs: Date.now() - startTime,
+          modelUsed: 'access-control',
+          toolCalls: [],
+        };
+      }
+
+      consumeUsage(user, service.code);
+      repo.recordAgentRun(
+        {
+          conversationId: conversation.id,
+          agentType,
+          intentDetected: denialIntent,
+          modelUsed: 'access-control',
+          tokensInput: 0,
+          tokensOutput: 0,
+          latencyMs: Date.now() - startTime,
+          status: 'COMPLETED',
+          toolCallsCount: 0,
+        },
+        []
+      );
+
+      return {
+        agentType,
+        intent: denialIntent,
+        detectedLanguage: lang,
+        replyText: buildAccessReply(service, decision, replyLang),
+        buttons: [
+          { id: 'btn_pay', title: replyLang === 'KINYARWANDA' ? 'Ohereza reresita' : 'Pay with MoMo' },
+          { id: 'btn_menu', title: replyLang === 'KINYARWANDA' ? 'Izindi serivisi' : 'Other services' },
+        ],
+        tokensUsed: 0,
+        latencyMs: Date.now() - startTime,
+        modelUsed: 'access-control',
+        toolCalls: [],
+      };
+    }
+  }
+
+  // 3. Road Safety runs its lessons, exams and scoring deterministically in the
+  //    backend, so it works with or without an AI provider.
+  if (agentType === 'ROAD_SAFETY_ACADEMY') {
+    const flow = handleRoadSafetyMessage(user, sanitization.cleanText, replyLang);
+    if (flow) {
+      if (service) consumeUsage(user, service.code);
+      const latencyMs = Date.now() - startTime;
+      repo.recordAgentRun(
+        {
+          conversationId: conversation.id,
+          agentType,
+          intentDetected: flow.intent,
+          modelUsed: 'road-safety-engine',
+          tokensInput: 0,
+          tokensOutput: 0,
+          latencyMs,
+          status: 'COMPLETED',
+          toolCallsCount: 1,
+        },
+        [
+          {
+            toolName: 'road_safety_flow',
+            arguments: { intent: flow.intent, userId: user.id },
+            result: { replyLength: flow.replyText.length },
+            latencyMs,
+            redacted: false,
+          },
+        ]
+      );
+
+      return {
+        agentType,
+        intent: flow.intent,
+        detectedLanguage: lang,
+        replyText: flow.replyText,
+        buttons: flow.intent === 'GRADE_ATTEMPT' || flow.intent === 'COMPLETE_LESSON'
+          ? [{ id: 'btn_rs_exam', title: replyLang === 'KINYARWANDA' ? 'Ikizamini' : 'Mock exam' }]
+          : AGENT_BUTTONS.ROAD_SAFETY_ACADEMY.map((b) => ({
+              id: b.id,
+              title: replyLang === 'KINYARWANDA' ? b.rw : b.en,
+            })),
+        tokensUsed: 0,
+        latencyMs,
+        modelUsed: 'road-safety-engine',
+        toolCalls: [],
+      };
+    }
+  }
+
+  // 4. Collect facts that the model is allowed to repeat
   const toolCalls: AgentExecutionResult['toolCalls'] = [];
   const contextParts: string[] = [];
 
@@ -274,7 +440,31 @@ export async function executeAgent(
     );
   }
 
-  // 3. Ask the configured provider; never answer from a scripted reply
+  if (agentType === 'ROAD_SAFETY_ACADEMY') {
+    const toolStart = Date.now();
+    const lessons = publishedLessons();
+    const progress = progressFor(user.id);
+    toolCalls.push({
+      name: 'read_road_safety_library',
+      args: {},
+      result: { publishedLessons: lessons.length, lessonsCompleted: progress.lessonsCompleted },
+      latencyMs: Date.now() - toolStart,
+    });
+
+    contextParts.push(
+      lessons.length === 0
+        ? 'Published Road Safety Academy lessons: none. Tell the learner that no verified material is published yet.'
+        : `Published Road Safety Academy lessons (the only material you may teach from):\n${lessons
+            .slice(0, 8)
+            .map(
+              (l) =>
+                `- ${l.titleEn} | ${l.bodyEn.slice(0, 600)} | legal review: ${l.legalVerifiedAt ? l.legalVerifiedAt.slice(0, 10) : 'NOT REVIEWED'} | sources: ${l.citations.map((c) => c.url).join(' ') || 'none'}`
+            )
+            .join('\n')}\n\nLearner progress: ${progress.lessonsCompleted} lessons completed, ${progress.mockExams} mock exams, best score ${progress.bestExamPercent}%.`
+    );
+  }
+
+  // 5. Ask the configured provider; never answer from a scripted reply
   const provider = getAIProvider();
   let replyText = '';
   let modelUsed = 'not-configured';
@@ -292,7 +482,7 @@ export async function executeAgent(
       : '';
     const prompt =
       `User name: ${user.fullName || 'User'}\n` +
-      `Reply language: ${lang === 'KINYARWANDA' ? 'Kinyarwanda' : 'English'}\n` +
+      `Reply language: ${replyLang === 'KINYARWANDA' ? 'Kinyarwanda' : 'English'}\n` +
       `User message: "${sanitization.cleanText}"${platformData}`;
 
     try {
@@ -316,10 +506,14 @@ export async function executeAgent(
   const buttonDefinitions = AGENT_BUTTONS[agentType];
   const buttons =
     buttonDefinitions.length > 0
-      ? buttonDefinitions.map((b) => ({ id: b.id, title: lang === 'KINYARWANDA' ? b.rw : b.en }))
+      ? buttonDefinitions.map((b) => ({ id: b.id, title: replyLang === 'KINYARWANDA' ? b.rw : b.en }))
       : undefined;
 
   const latencyMs = Date.now() - startTime;
+
+  // Only a completed answer costs a use, so a provider outage cannot burn a
+  // limited trial.
+  if (service && status === 'COMPLETED') consumeUsage(user, service.code);
 
   // Record Agent Run & Tool Call Traces for transparency & audit logs
   repo.recordAgentRun(

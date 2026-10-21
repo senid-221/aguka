@@ -7,6 +7,37 @@ import { logger } from '@/lib/logging/logger';
 import { getAIProvider, GeminiAIProvider } from '@/lib/ai/provider-adapter';
 import { GEMINI_MODEL } from '@/lib/gemini';
 import { queueService } from '@/lib/queue/redis-queue';
+import {
+  activateTrial,
+  buildAccessReply,
+  consumeUsage,
+  evaluateAccess,
+  grantPaidAccess,
+  identityKeyOf,
+} from '@/lib/services/entitlements';
+import { ensureCatalogSeeded, listMenuServices } from '@/lib/services/catalog';
+import { rowIdFor } from '@/lib/services/selection';
+import {
+  attachPaymentProof,
+  createOrder,
+  paymentConfig,
+  paymentInstructions,
+  reconcileOrder,
+  verifyPayment,
+} from '@/lib/payments/orders';
+import { durableStore } from '@/lib/db/store';
+import { handleIncomingText } from '@/lib/whatsapp/inbound';
+import { importContentPack } from '@/lib/road-safety/content-pack';
+import {
+  extractAnswerIndexes,
+  gradeAttempt,
+  looksLikeAnswers,
+  publishedQuestions,
+  startAttempt,
+} from '@/lib/road-safety/academy';
+import { NextRequest } from 'next/server';
+import { POST as paymentsWebhookPOST } from '@/app/api/payments/webhook/route';
+import { readFileSync } from 'node:fs';
 import crypto from 'node:crypto';
 
 export interface TestResultItem {
@@ -279,6 +310,386 @@ export async function runPlatformTestSuiteAsync(): Promise<{
     actual: `Job ID: ${testJob.id}, Processed: ${processed}`,
     durationMs: Date.now() - t13Start,
   });
+
+  // Tests 14-23: service selection, trials, MoMo payments, curriculum and durability.
+  const suiteStamp = Date.now();
+  const baseTime = suiteStamp;
+  const HOUR = 3_600_000;
+  // Seed the real catalog first: ensureCatalogSeeded() only fills an empty table,
+  // so creating the suite service before it would silently skip the seed.
+  ensureCatalogSeeded();
+
+  const suitePatch = {
+    code: 'SUITE_TRIAL',
+    nameEn: 'Automated Suite Service',
+    nameRw: "Serpisi y'igerageza",
+    descriptionEn: 'Created by the automated test suite. Never offered to customers.',
+    descriptionRw: "Iyakozwe n'igerageza ry'ubwenge. Ntiyashyizwe kuri menu y'abakiriya.",
+    agentType: 'ROUTER' as const,
+    isEnabled: true,
+    showInWhatsAppMenu: false,
+    isFree: false,
+    chargeEnabled: true,
+    price: 500,
+    currency: 'RWF' as const,
+    billingPeriod: 'PER_USE' as const,
+    trialHours: 24,
+    trialUsageLimit: 3,
+    paidUsageLimit: 0,
+    sortOrder: 900,
+  };
+  const suiteService = repo.getServiceByCode('SUITE_TRIAL')
+    ? repo.updateService('SUITE_TRIAL', suitePatch)!
+    : repo.createService(suitePatch);
+
+  const userA = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp).slice(-8)}`, 'Suite Trial User');
+  const userB = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 1).slice(-8)}`, 'Suite Second User');
+
+  // Test 13b: accounts created in the same millisecond must not merge
+  const tIdStart = Date.now();
+  const twins = Array.from({ length: 6 }, (_, i) =>
+    repo.getOrCreateUserByPhone(`+250788${String(suiteStamp % 1000000).padStart(6, '0')}${i}`, `Suite Signup ${i + 1}`)
+  );
+  const twinIds = new Set(twins.map((u) => u.id));
+  results.push({
+    id: 'test-user-id-uniqueness',
+    category: 'Backend Foundation',
+    name: 'Users Registered In The Same Millisecond Get Distinct Accounts',
+    passed: twinIds.size === twins.length && userA.id !== userB.id,
+    expected: 'one id per phone number; entitlements and conversations of simultaneous signups can never be shared',
+    actual: `${twinIds.size} unique id(s) across ${twins.length} simultaneous signups, trialPair=${userA.id !== userB.id}`,
+    durationMs: Date.now() - tIdStart,
+  });
+
+  // Test 14: One free trial per identity, ever
+  const t14Start = Date.now();
+  const act1 = activateTrial(userA, suiteService, baseTime);
+  const act2 = activateTrial(userA, suiteService, baseTime + 60_000);
+  repo.updateUser(userB.id, { whatsappId: identityKeyOf(userA) });
+  const act3 = activateTrial(repo.getUserById(userB.id)!, suiteService, baseTime);
+  const menuCodes = listMenuServices().map((s) => s.code);
+  const trialExpires = act1.entitlement?.trialExpiresAt ?? null;
+  results.push({
+    id: 'test-trial-single-grant',
+    category: 'Service Catalog & Trials',
+    name: '24-Hour Free Trial Is Granted Once And Cannot Be Re-Trialled',
+    passed:
+      act1.outcome === 'TRIAL_STARTED' &&
+      act1.decision.allowed === true &&
+      trialExpires === new Date(baseTime + 24 * HOUR).toISOString() &&
+      act2.outcome === 'TRIAL_ALREADY_RUNNING' &&
+      act3.outcome === 'TRIAL_ALREADY_USED' &&
+      act3.decision.denialReason === 'TRIAL_USED' &&
+      !menuCodes.includes('SUITE_TRIAL'),
+    expected: 'TRIAL_STARTED -> TRIAL_ALREADY_RUNNING for the same user, TRIAL_ALREADY_USED for a second account sharing the WhatsApp identity, suite service absent from the customer menu',
+    actual: `${act1.outcome}, ${act2.outcome}, ${act3.outcome}/${act3.decision.denialReason}, expiresAt=${trialExpires}, inMenu=${menuCodes.includes('SUITE_TRIAL')}`,
+    durationMs: Date.now() - t14Start,
+  });
+
+  // Test 15: Expiry and usage ceiling deny access server-side
+  const t15Start = Date.now();
+  consumeUsage(userA, suiteService.code);
+  consumeUsage(userA, suiteService.code);
+  consumeUsage(userA, suiteService.code);
+  const limitDecision = evaluateAccess(userA, suiteService, baseTime + 60_000);
+  const expiryDecision = evaluateAccess(userA, suiteService, baseTime + 25 * HOUR);
+  const priceReply = buildAccessReply(suiteService, expiryDecision, 'ENGLISH');
+  const rwReply = buildAccessReply(suiteService, expiryDecision, 'KINYARWANDA');
+  const claimsPayment = /payment (received|confirmed|verified)|you have been charged/i.test(priceReply);
+  results.push({
+    id: 'test-trial-gating',
+    category: 'Service Catalog & Trials',
+    name: 'Trial Expiry And Usage Limit Block Access And State The Price First',
+    passed:
+      limitDecision.allowed === false &&
+      limitDecision.denialReason === 'USAGE_LIMIT_REACHED' &&
+      expiryDecision.allowed === false &&
+      expiryDecision.denialReason === 'TRIAL_EXPIRED' &&
+      priceReply.includes('500 RWF') &&
+      rwReply.includes('500 RWF') &&
+      priceReply.includes('Reply PAY') &&
+      !claimsPayment,
+    expected: 'USAGE_LIMIT_REACHED then TRIAL_EXPIRED, bilingual reply quoting 500 RWF and the PAY path, never a claim of payment',
+    actual: `${limitDecision.denialReason}, ${expiryDecision.denialReason}, priceQuoted=${priceReply.includes('500 RWF')}, claimsPayment=${claimsPayment}`,
+    durationMs: Date.now() - t15Start,
+  });
+
+  // Test 16: The live inbound pipeline shows the menu, then remembers the choice
+  const t16Start = Date.now();
+  const conversation = repo.getOrCreateConversation(userB.id);
+  const menuOutcome = await handleIncomingText(userB, conversation, 'muraho');
+  const offeredRows =
+    menuOutcome.listMenu?.interactive.action.sections.flatMap((s) => s.rows) ?? [];
+  const picked = listMenuServices()[0];
+  const pickOutcome = picked ? await handleIncomingText(userB, conversation, rowIdFor(picked)) : null;
+  const storedConversation = repo.getConversationById(conversation.id);
+  const storedUser = repo.getUserById(userB.id);
+  results.push({
+    id: 'test-inbound-service-selection',
+    category: 'Service Catalog & Trials',
+    name: 'First WhatsApp Message Gets The Dynamic Menu And The Pick Is Remembered',
+    passed:
+      menuOutcome.intent === 'SERVICE_MENU' &&
+      offeredRows.length === listMenuServices().length &&
+      offeredRows.every((r) => r.id.startsWith('svc:')) &&
+      pickOutcome !== null &&
+      pickOutcome.intent.startsWith('SERVICE_SELECTED(') &&
+      /Selected|Wahisemo/.test(pickOutcome.replyText) &&
+      storedConversation?.activeServiceCode === picked?.code &&
+      storedUser?.selectedServiceCode === picked?.code,
+    expected: 'menu with one row per enabled menu service, then activeServiceCode + user.selectedServiceCode set to the picked code',
+    actual: `menuRows=${offeredRows.length}/${listMenuServices().length}, intent=${pickOutcome?.intent ?? 'none'}, conversation=${storedConversation?.activeServiceCode ?? 'none'}, user=${storedUser?.selectedServiceCode ?? 'none'}`,
+    durationMs: Date.now() - t16Start,
+  });
+
+  // Test 17: Orders are idempotent and instructions name the real payee
+  const t17Start = Date.now();
+  const orderKey = `suite:${suiteStamp}`;
+  const o1 = createOrder(userA, suiteService, { idempotencyKey: orderKey, actor: userA.phoneNumber, actorRole: 'USER' });
+  const o2 = createOrder(userA, suiteService, { idempotencyKey: orderKey });
+  const o3 = createOrder(userA, suiteService, {});
+  const cfg = paymentConfig();
+  const instructions = paymentInstructions(o1.order, suiteService, 'ENGLISH');
+  results.push({
+    id: 'test-order-idempotency',
+    category: 'MoMo Payments',
+    name: 'Payment Order Is Idempotent, Uniquely Referenced And Grants Nothing',
+    passed:
+      !o1.reused &&
+      o2.reused &&
+      o2.order.id === o1.order.id &&
+      o3.order.reference !== o1.order.reference &&
+      o1.order.status === 'AWAITING_PROOF' &&
+      instructions.includes(o1.order.reference) &&
+      instructions.includes(cfg.momoCode) &&
+      instructions.includes(cfg.payeeName) &&
+      evaluateAccess(userA, suiteService, baseTime + 1000).allowed === false,
+    expected: 'same idempotency key returns the same order, a new order gets a new reference, instructions name the payee and reference, creating an order never unlocks the service',
+    actual: `reused=${o1.reused}/${o2.reused}, refs=${o1.order.reference}|${o3.order.reference}, status=${o1.order.status}, unlocked=${evaluateAccess(userA, suiteService, baseTime + 1000).allowed}`,
+    durationMs: Date.now() - t17Start,
+  });
+
+  // Test 18: Receipt bytes are stored privately and a re-used screenshot is flagged
+  const t18Start = Date.now();
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+    'base64'
+  );
+  const p1 = await attachPaymentProof(o1.order, png, 'suite-receipt.png', 'image/png', userA.phoneNumber);
+  const p2 = await attachPaymentProof(o3.order, png, 'suite-receipt-copy.png', 'image/png', userA.phoneNumber);
+  const storedBytes = durableStore.readBinary(p1.proof.storageKey);
+  results.push({
+    id: 'test-proof-storage-and-duplication',
+    category: 'MoMo Payments',
+    name: 'Receipt Screenshot Stored Outside The Web Root And Re-Upload Flagged',
+    passed:
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9a-f]{16}$/.test(p1.proof.storageKey) &&
+      p1.proof.sha256.length === 64 &&
+      p1.order.status === 'UNDER_REVIEW' &&
+      storedBytes !== null &&
+      storedBytes.equals(png) &&
+      p2.proof.duplicateProofIds.includes(p1.proof.id) &&
+      p2.proof.signals.some((s) => s.code === 'DUPLICATE_IMAGE') &&
+      p2.proof.riskBand === 'HIGH',
+    expected: 'opaque storage key whose bytes read back identical, order queued for review, identical image on another order carries a HIGH duplicate-screenshot signal',
+    actual: `key=${p1.proof.storageKey.slice(0, 8)}…, bytesMatch=${storedBytes?.length === png.length}, orderStatus=${p1.order.status}, duplicates=${p2.proof.duplicateProofIds.length}, band=${p2.proof.riskBand}`,
+    durationMs: Date.now() - t18Start,
+  });
+
+  // Test 19: Only an identified confirmation unlocks; screenshots never do
+  const t19Start = Date.now();
+  const anonymous = verifyPayment(p2.order, { actor: '  ', source: 'MANUAL_ADMIN' });
+  const o4 = createOrder(userA, suiteService, {});
+  const withoutProof = verifyPayment(o4.order, { actor: 'suite-admin@aguka', source: 'MANUAL_ADMIN' });
+  const confirmed = verifyPayment(p2.order, { actor: 'suite-admin@aguka', source: 'MANUAL_ADMIN' });
+  const paidEntitlement = repo.getEntitlement(userA.id, suiteService.code);
+  const unlockedAfter = evaluateAccess(userA, suiteService, baseTime + 2000);
+  results.push({
+    id: 'test-verification-unlocks-only-with-identity',
+    category: 'MoMo Payments',
+    name: 'Unlock Requires An Identified Confirmation Of A Receipt',
+    passed:
+      anonymous.ok === false &&
+      withoutProof.ok === false &&
+      o4.order.status !== 'VERIFIED' &&
+      confirmed.ok === true &&
+      confirmed.order.status === 'VERIFIED' &&
+      confirmed.order.verifiedBy === 'suite-admin@aguka' &&
+      paidEntitlement?.status === 'ACTIVE' &&
+      unlockedAfter.allowed === true,
+    expected: 'anonymous verify refused, proof-less order refused, identified verify flips to VERIFIED, entitlement ACTIVE and access allowed',
+    actual: `anonymous=${anonymous.ok}, noProof=${withoutProof.ok}, confirmed=${confirmed.ok}/${confirmed.order.status}, entitlement=${paidEntitlement?.status ?? 'none'}, allowed=${unlockedAfter.allowed}`,
+    durationMs: Date.now() - t19Start,
+  });
+
+  // Test 20: Reconciliation can never invent a confirmation
+  const t20Start = Date.now();
+  const reconciled = await reconcileOrder(o4.order, 'suite-admin@aguka');
+  const afterReconcile = repo.getPaymentOrderById(o4.order.id);
+  results.push({
+    id: 'test-provider-reconciliation-cannot-fabricate',
+    category: 'MoMo Payments',
+    name: 'Provider Reconciliation Leaves An Unknown Payment Unlocked',
+    passed:
+      reconciled.ok === false &&
+      afterReconcile?.status !== 'VERIFIED' &&
+      repo.getEntitlement(userB.id, suiteService.code)?.status !== 'ACTIVE',
+    expected: 'no provider confirmation, so the order is never VERIFIED and no paid access is granted',
+    actual: `ok=${reconciled.ok}, status=${afterReconcile?.status ?? 'missing'}, providerConfigured=${cfg.providerEndpointConfigured}, message="${reconciled.message.slice(0, 90)}"`,
+    durationMs: Date.now() - t20Start,
+  });
+
+  // Test 21: Payment webhooks fail closed
+  const t21Start = Date.now();
+  const webhookSecret = (process.env.PAYMENT_WEBHOOK_SECRET || '').trim();
+  const webhookBody = JSON.stringify({
+    reference: 'SUITE-UNKNOWN-REF',
+    status: 'SUCCESSFUL',
+    amount: 500,
+    currency: 'RWF',
+  });
+  const unsignedRes = await paymentsWebhookPOST(
+    new NextRequest('http://localhost/api/payments/webhook', {
+      method: 'POST',
+      body: webhookBody,
+      headers: { 'content-type': 'application/json' },
+    })
+  );
+  let signedOutcome = 'skipped: no PAYMENT_WEBHOOK_SECRET on this server';
+  let signedOk = true;
+  if (webhookSecret) {
+    const signature = `sha256=${crypto.createHmac('sha256', webhookSecret).update(webhookBody).digest('hex')}`;
+    const signedRes = await paymentsWebhookPOST(
+      new NextRequest('http://localhost/api/payments/webhook', {
+        method: 'POST',
+        body: webhookBody,
+        headers: { 'content-type': 'application/json', 'x-aguka-signature': signature },
+      })
+    );
+    const signedJson = (await signedRes.json()) as { received?: boolean; matched?: boolean };
+    signedOk = signedRes.status === 200 && signedJson.received === true && signedJson.matched === false;
+    signedOutcome = `status=${signedRes.status}, received=${signedJson.received}, matched=${signedJson.matched}`;
+  }
+  results.push({
+    id: 'test-payment-webhook-fail-closed',
+    category: 'MoMo Payments',
+    name: 'Payment Webhook Rejects Unsigned And Unknown References',
+    passed:
+      (webhookSecret ? unsignedRes.status === 401 : unsignedRes.status === 503) &&
+      signedOk &&
+      !repo.getPaymentOrderByReference('SUITE-UNKNOWN-REF'),
+    expected: '503 when no secret is configured, 401 for an unsigned body, and a signed event for an unknown reference is recorded without unlocking anything',
+    actual: `unsigned=${unsignedRes.status}, signed(${signedOutcome}), unknownOrderCreated=${Boolean(repo.getPaymentOrderByReference('SUITE-UNKNOWN-REF'))}`,
+    durationMs: Date.now() - t21Start,
+  });
+
+  // Test 22: Road Safety grading is deterministic and explains every answer
+  const t22Start = Date.now();
+  const packReport = importContentPack();
+  const questionPool = publishedQuestions();
+  const started = questionPool.length > 0 ? startAttempt(userA, 'MOCK_EXAM', { count: 5 }) : null;
+  const gradedPerfect = started ? gradeAttempt(started.attempt, started.questions.map((q) => q.correctIndex)) : null;
+  const startedPractice = questionPool.length > 0 ? startAttempt(userB, 'PRACTICE', { count: 3 }) : null;
+  const gradedWrong = startedPractice
+    ? gradeAttempt(
+        startedPractice.attempt,
+        startedPractice.questions.map((q) => (q.correctIndex + 1) % Math.max(1, q.optionsEn.length))
+      )
+    : null;
+  results.push({
+    id: 'test-road-safety-grading',
+    category: 'Road Safety Academy',
+    name: 'Mock Exam Scores Server-Side With Corrections And Explanations',
+    passed:
+      questionPool.length >= 10 &&
+      started !== null &&
+      gradedPerfect !== null &&
+      gradedPerfect.correctCount === gradedPerfect.totalQuestions &&
+      gradedPerfect.scorePercent === 100 &&
+      gradedPerfect.passed === true &&
+      gradedPerfect.submittedAt !== null &&
+      gradedWrong !== null &&
+      gradedWrong.passed === false &&
+      gradedWrong.answers.length === gradedWrong.totalQuestions &&
+      gradedWrong.answers.every((a) => a.explanationEn.length > 0 && a.correctAnswerEn.length > 0) &&
+      extractAnswerIndexes('A,2').join(',') === '0,1' &&
+      looksLikeAnswers('1,2,3', 3) &&
+      !looksLikeAnswers('muraho', 3),
+    expected: 'published pool >= 10 questions, all-correct attempt scores 100% and passes, wrong practice attempt fails but stores a correction and explanation per question',
+    actual: `pool=${questionPool.length}, packCreated=${packReport.created.length}, perfect=${gradedPerfect?.scorePercent ?? 'n/a'}%/passed=${gradedPerfect?.passed ?? 'n/a'}, wrong=${gradedWrong?.scorePercent ?? 'n/a'}/passed=${gradedWrong?.passed ?? 'n/a'}`,
+    durationMs: Date.now() - t22Start,
+  });
+
+  // Test 23: A paid user is never sold a second order, and a bare command keeps
+  // the language the person last wrote in.
+  const t23Start = Date.now();
+  const paidUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 40).slice(-8)}`, 'Suite Paid User');
+  const paidConv = repo.getOrCreateConversation(paidUser.id);
+  repo.updateConversation(paidConv.id, { activeServiceCode: suiteService.code });
+  grantPaidAccess(paidUser, suiteService, { verifiedBy: 'suite@aguka.test', source: 'MANUAL_ADMIN' });
+  const paidConvNow = repo.getConversationById(paidConv.id)!;
+  repo.updateUser(paidUser.id, { preferredLang: 'KINYARWANDA' });
+  const ordersBefore = repo.getPaymentOrders().filter((o) => o.userId === paidUser.id).length;
+  const payRw = await handleIncomingText(repo.getUserById(paidUser.id)!, paidConvNow, 'pay');
+  repo.updateUser(paidUser.id, { preferredLang: 'ENGLISH' });
+  const payEn = await handleIncomingText(repo.getUserById(paidUser.id)!, paidConvNow, 'pay');
+  const ordersAfter = repo.getPaymentOrders().filter((o) => o.userId === paidUser.id).length;
+  results.push({
+    id: 'test-paid-user-not-resold',
+    category: 'MoMo Payments',
+    name: 'Active Paid User Is Not Given A New Order And Language Stay Sticky',
+    passed:
+      payRw.intent === 'PAY_NOT_REQUIRED_ACTIVE' &&
+      payEn.intent === 'PAY_NOT_REQUIRED_ACTIVE' &&
+      ordersAfter === ordersBefore &&
+      payRw.replyText.includes('Wamaze kubohora') &&
+      payEn.replyText.includes('already active'),
+    expected: 'no new payment order for an active entitlement, and the same one-word command answers in the stored language on both sides',
+    actual: `rwIntent=${payRw.intent}, enIntent=${payEn.intent}, orders=${ordersBefore}->${ordersAfter}, rw="${payRw.replyText.slice(0, 40)}", en="${payEn.replyText.slice(0, 40)}"`,
+    durationMs: Date.now() - t23Start,
+  });
+
+  // Test 24: Everything written above survives on disk
+  const t24Start = Date.now();
+  durableStore.flushNow(repo);
+  let snapshotDetail = 'snapshot file not readable';
+  let durablePassed = false;
+  try {
+    const parsed = JSON.parse(readFileSync(durableStore.status.filePath, 'utf8')) as {
+      schemaVersion?: number;
+      data?: Record<string, unknown>;
+    };
+    const users = (parsed.data?.users ?? []) as Array<{ id: string }>;
+    const orders = (parsed.data?.paymentOrders ?? []) as Array<{ id: string; status: string }>;
+    const proofs = (parsed.data?.paymentProofs ?? []) as Array<{ sha256: string; storageKey: string }>;
+    const attempts = (parsed.data?.rsAttempts ?? []) as Array<{ id: string }>;
+    durablePassed =
+      durableStore.status.mode === 'FILE_BACKED_JSON' &&
+      parsed.schemaVersion === 1 &&
+      users.some((u) => u.id === userA.id) &&
+      users.some((u) => u.id === userB.id) &&
+      orders.some((o) => o.id === o1.order.id && o.status === 'UNDER_REVIEW') &&
+      orders.some((o) => o.id === o3.order.id && o.status === 'VERIFIED') &&
+      proofs.some((p) => p.sha256 === p1.proof.sha256 && p.storageKey === p1.proof.storageKey) &&
+      attempts.some((a) => a.id === gradedPerfect?.id) &&
+      storedBytes !== null &&
+      storedBytes.length === png.length;
+    snapshotDetail = `users=${users.length}, orders=${orders.length}, proofs=${proofs.length}, attempts=${attempts.length}, mode=${durableStore.status.mode}`;
+  } catch (err: unknown) {
+    snapshotDetail = err instanceof Error ? err.message : String(err);
+  }
+  results.push({
+    id: 'test-durability-snapshot',
+    category: 'Durability',
+    name: 'Users, Orders, Receipts And Exam Attempts Persist To Disk',
+    passed: durablePassed,
+    expected: 'atomic JSON snapshot holds the trial user, the verified order, the receipt hash and the graded attempt, with the receipt bytes still readable from the private proofs directory',
+    actual: `${snapshotDetail}${durableStore.status.lastSaveError ? `, lastSaveError=${durableStore.status.lastSaveError}` : ''}`,
+    durationMs: Date.now() - t24Start,
+  });
+
+  // The suite service only exists to prove gating, so it must not linger in the catalog.
+  repo.deleteService('SUITE_TRIAL');
 
   const passedCount = results.filter((r) => r.passed).length;
   const failedCount = results.length - passedCount;

@@ -34,6 +34,14 @@ export interface AppConfig {
     maxMessagesPerMinute: number;
     maxDailyTokensPerUser: number;
   };
+  payments: {
+    payeeName: string;
+    momoCode: string;
+    providerEndpointConfigured: boolean;
+    webhookSecretConfigured: boolean;
+    autoVerifyEnabled: boolean;
+    ocrConfigured: boolean;
+  };
 }
 
 export interface ConfigValidationResult {
@@ -96,6 +104,29 @@ export function parseAndValidateConfig(env: NodeJS.ProcessEnv = process.env): Co
   const maxMessagesPerMinute = parseInt(env.MAX_MESSAGES_PER_MINUTE_PER_USER || '20', 10) || 20;
   const maxDailyTokensPerUser = parseInt(env.MAX_DAILY_AI_TOKENS_PER_USER || '50000', 10) || 50000;
 
+  // Payments: MoMo payee, optional provider reconciliation and receipt OCR
+  const payeeName = (env.MOMO_PAYEE_NAME || 'Vincent').trim();
+  const momoCode = (env.MOMO_PAYEE_CODE || '935237').trim();
+  const providerEndpointConfigured = Boolean((env.MOMO_VERIFY_API_URL || '').trim() && (env.MOMO_VERIFY_API_TOKEN || '').trim());
+  const webhookSecretConfigured = Boolean((env.PAYMENT_WEBHOOK_SECRET || '').trim());
+  const autoVerifyEnabled = env.PAYMENT_AUTO_VERIFY === 'true';
+  const ocrConfigured = Boolean((env.OPENAI_API_KEY || '').trim()) && !(env.OPENAI_API_KEY || '').includes('replace_with');
+
+  if (!providerEndpointConfigured) {
+    warnings.push(
+      'No MoMo reconciliation endpoint (MOMO_VERIFY_API_URL / MOMO_VERIFY_API_TOKEN): receipts are evidence only and every payment waits for administrator confirmation.'
+    );
+  }
+  if (!webhookSecretConfigured) {
+    warnings.push('PAYMENT_WEBHOOK_SECRET is not set: POST /api/payments/webhook rejects all callbacks.');
+  }
+  if (!ocrConfigured) {
+    warnings.push('OPENAI_API_KEY is not set: receipt screenshots are still hash- and metadata-checked, but their text cannot be read.');
+  }
+  if (autoVerifyEnabled && !providerEndpointConfigured) {
+    warnings.push('PAYMENT_AUTO_VERIFY is on but no reconciliation endpoint exists, so auto-verification can never trigger.');
+  }
+
   const config: AppConfig = {
     env: nodeEnv,
     port,
@@ -124,6 +155,14 @@ export function parseAndValidateConfig(env: NodeJS.ProcessEnv = process.env): Co
       jwtSecret,
       maxMessagesPerMinute,
       maxDailyTokensPerUser,
+    },
+    payments: {
+      payeeName,
+      momoCode,
+      providerEndpointConfigured,
+      webhookSecretConfigured,
+      autoVerifyEnabled,
+      ocrConfigured,
     },
   };
 
@@ -168,5 +207,13 @@ export function getEnvPresence(env: NodeJS.ProcessEnv = process.env): Record<str
     ADMIN_JWT_SECRET: present('ADMIN_JWT_SECRET'),
     ADMIN_DEFAULT_EMAIL: present('ADMIN_DEFAULT_EMAIL'),
     ADMIN_DEFAULT_PASSWORD: present('ADMIN_DEFAULT_PASSWORD'),
+    OPENAI_API_KEY: present('OPENAI_API_KEY'),
+    MOMO_PAYEE_NAME: present('MOMO_PAYEE_NAME'),
+    MOMO_PAYEE_CODE: present('MOMO_PAYEE_CODE'),
+    MOMO_VERIFY_API_URL: present('MOMO_VERIFY_API_URL'),
+    MOMO_VERIFY_API_TOKEN: present('MOMO_VERIFY_API_TOKEN'),
+    PAYMENT_WEBHOOK_SECRET: present('PAYMENT_WEBHOOK_SECRET'),
+    PAYMENT_AUTO_VERIFY: present('PAYMENT_AUTO_VERIFY'),
+    AGUKA_DATA_DIR: present('AGUKA_DATA_DIR'),
   };
 }

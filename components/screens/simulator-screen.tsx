@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Send,
   RefreshCw,
@@ -11,9 +11,11 @@ import {
   Sparkles,
   Layers,
   Code2,
+  Paperclip,
+  List,
+  ImageIcon,
 } from 'lucide-react';
 import { WhatsAppLogo } from '@/components/icons/logos';
-import { AgentExecutionResult } from '@/lib/ai/bilingual-router';
 
 let msgSequence = 1000;
 function getNextMessageId(prefix: string): string {
@@ -28,13 +30,47 @@ function getCurrentTimeString(): string {
   return `${hours}:${minutes}`;
 }
 
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+
+interface MenuRow {
+  id: string;
+  title: string;
+  description: string;
+}
+
+interface SimOutcome {
+  replyText: string;
+  buttons?: Array<{ id: string; title: string }>;
+  listMenu?: {
+    bodyText: string;
+    interactive: {
+      action: { button: string; sections: Array<{ title: string; rows: MenuRow[] }> };
+    };
+  };
+  agentType: string;
+  intent: string;
+  tokensUsed: number;
+  modelUsed: string;
+  detectedLanguage?: string;
+  latencyMs?: number;
+  toolCalls?: Array<{
+    name: string;
+    args: Record<string, unknown>;
+    result: Record<string, unknown>;
+    latencyMs: number;
+  }>;
+}
+
 interface ChatMessage {
   id: string;
   sender: 'user' | 'assistant';
   text: string;
   timestamp: string;
   buttons?: Array<{ id: string; title: string }>;
+  rows?: MenuRow[];
   agentType?: string;
+  attachment?: string;
+  receipt?: string;
 }
 
 export function SimulatorScreen() {
@@ -43,18 +79,25 @@ export function SimulatorScreen() {
   const [inputVal, setInputVal] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [lastAgentResult, setLastAgentResult] = useState<AgentExecutionResult | null>(null);
+  const [lastOutcome, setLastOutcome] = useState<SimOutcome | null>(null);
   const [lastOutgoingPayload, setLastOutgoingPayload] = useState<Record<string, unknown> | null>(null);
+  const [serviceCode, setServiceCode] = useState<string | null>(null);
+  const [deliveryNote, setDeliveryNote] = useState<string | null>(null);
+  const [pendingImage, setPendingImage] = useState<{ base64: string; mimeType: string; name: string; dataUrl: string } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const quickPrompts = [
+    { label: 'Service Menu (Kinyarwanda)', text: 'muraho' },
+    { label: 'Service Menu (English)', text: 'menu' },
     {
       label: 'Job Discovery (Kinyarwanda)',
-      text: 'Muraho! Nshaka akazi ka Software Developer mu Rwanda cyangwa se Remote.',
+      text: 'Nshaka akazi ka Software Developer mu Rwanda cyangwa se Remote.',
     },
     {
       label: 'Career & CV (English)',
       text: 'Can you help me build a professional CV and draft a cover letter?',
     },
+    { label: 'Road Safety (Kinyarwanda)', text: 'Nshaka kwiga amategeko y\'umuhanda' },
     {
       label: 'Coding Agent (Scaffold)',
       text: 'Scaffold a production Fastify webhook receiver with HMAC signature verification in TypeScript.',
@@ -63,97 +106,179 @@ export function SimulatorScreen() {
       label: 'Study Tutor (Kinyarwanda)',
       text: 'Sobanurira mu Kinyarwanda icyo Binary Search bivuze n’ukuntu ikora.',
     },
-    {
-      label: 'Photo Studio (Passport)',
-      text: 'Nkeneye gusukura ifoto ya Pasiporo 35x45mm yera inyuma.',
-    },
-    {
-      label: 'Marketplace (Hire Worker)',
-      text: 'Nshaka umukozi uzi React Native muri Kigali.',
-    },
+    { label: 'Payment Instructions', text: 'pay' },
+    { label: 'Order Status', text: 'status' },
   ];
 
+  const pushLocal = (msg: Omit<ChatMessage, 'id' | 'timestamp'>) =>
+    setMessages((prev) => [...prev, { ...msg, id: getNextMessageId('err'), timestamp: getCurrentTimeString() }]);
+
+  const requirePhone = (): string | null => {
+    const trimmed = phoneNumber.trim();
+    if (!trimmed) {
+      pushLocal({
+        sender: 'assistant',
+        text: 'Enter a simulated WhatsApp number before sending.',
+      });
+      return null;
+    }
+    return trimmed.startsWith('+') ? trimmed : `+${trimmed}`;
+  };
+
+  async function postSimulate(body: Record<string, unknown>) {
+    const res = await fetch('/api/whatsapp/simulate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return res.json();
+  }
+
   const handleSend = async (textToSend?: string) => {
+    if (pendingImage) return handleSendImage();
     const text = textToSend || inputVal;
     if (!text.trim() || isLoading) return;
 
-    const cleanPhone = phoneNumber.trim().startsWith('+')
-      ? phoneNumber.trim()
-      : `+${phoneNumber.trim()}`;
+    const cleanPhone = requirePhone();
+    if (!cleanPhone) return;
 
-    if (!phoneNumber.trim()) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: getNextMessageId('err'),
-          sender: 'assistant',
-          text: 'Enter a simulated WhatsApp number before sending.',
-          timestamp: getCurrentTimeString(),
-        },
-      ]);
-      return;
-    }
-
-    const userMsgId = getNextMessageId('m');
-    const userMsg: ChatMessage = {
-      id: userMsgId,
-      sender: 'user',
-      text,
-      timestamp: getCurrentTimeString(),
-    };
-
-    setMessages((prev) => [...prev, userMsg]);
+    setMessages((prev) => [
+      ...prev,
+      { id: getNextMessageId('m'), sender: 'user', text, timestamp: getCurrentTimeString() },
+    ]);
     setInputVal('');
     setIsLoading(true);
 
     try {
-      const res = await fetch('/api/whatsapp/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          phoneNumber: cleanPhone,
-          messageText: text,
-        }),
-      });
-
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setLastAgentResult(data.agentResult);
-        setLastOutgoingPayload(data.outgoingPayload);
-
-        const aiMsg: ChatMessage = {
-          id: getNextMessageId('ai'),
-          sender: 'assistant',
-          text: data.agentResult.replyText,
-          timestamp: getCurrentTimeString(),
-          buttons: data.agentResult.buttons,
-          agentType: data.agentResult.agentType,
-        };
-        setMessages((prev) => [...prev, aiMsg]);
-      } else {
-        const errorMsg: ChatMessage = {
-          id: getNextMessageId('err'),
-          sender: 'assistant',
-          text: `Error processing request: ${data.error || 'Server error'}`,
-          timestamp: getCurrentTimeString(),
-        };
-        setMessages((prev) => [...prev, errorMsg]);
+      const data = await postSimulate({ phoneNumber: cleanPhone, messageText: text });
+      if (data.error) {
+        pushLocal({ sender: 'assistant', text: `Error processing request: ${data.error}` });
+        return;
       }
+      applyResult(data);
     } catch (err: unknown) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: getNextMessageId('err'),
-          sender: 'assistant',
-          text: `Network failure: ${errorMsg}`,
-          timestamp: getCurrentTimeString(),
-        },
-      ]);
+      pushLocal({
+        sender: 'assistant',
+        text: `Network failure: ${err instanceof Error ? err.message : String(err)}`,
+      });
     } finally {
       setIsLoading(false);
     }
   };
+
+  const handleSendImage = async () => {
+    if (!pendingImage || isLoading) return;
+    const cleanPhone = requirePhone();
+    if (!cleanPhone) return;
+
+    const caption = inputVal.trim();
+    const image = pendingImage;
+    setPendingImage(null);
+    setInputVal('');
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: getNextMessageId('m'),
+        sender: 'user',
+        text: caption || '(image)',
+        timestamp: getCurrentTimeString(),
+        attachment: image.name,
+        receipt: image.dataUrl,
+      },
+    ]);
+    setIsLoading(true);
+
+    try {
+      const data = await postSimulate({
+        phoneNumber: cleanPhone,
+        messageText: caption || undefined,
+        imageBase64: image.base64,
+        imageMimeType: image.mimeType,
+      });
+      if (data.error) {
+        pushLocal({ sender: 'assistant', text: `Error processing request: ${data.error}` });
+        return;
+      }
+      applyResult(data);
+    } catch (err: unknown) {
+      pushLocal({
+        sender: 'assistant',
+        text: `Network failure: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const applyResult = (data: {
+    outcome?: SimOutcome;
+    outgoingPayload?: Record<string, unknown>;
+    serviceCode?: string | null;
+    delivery?: { dispatched: boolean; reason: string };
+  }) => {
+    const outcome = data.outcome;
+    if (!outcome) {
+      pushLocal({ sender: 'assistant', text: 'The simulator returned no inbound outcome.' });
+      return;
+    }
+    setLastOutcome(outcome);
+    setLastOutgoingPayload(data.outgoingPayload ?? null);
+    setServiceCode(data.serviceCode ?? null);
+    setDeliveryNote(data.delivery?.reason ?? null);
+
+    const rows = outcome.listMenu?.interactive.action.sections.flatMap((s) => s.rows) ?? [];
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: getNextMessageId('ai'),
+        sender: 'assistant',
+        text: outcome.replyText,
+        timestamp: getCurrentTimeString(),
+        buttons: outcome.buttons,
+        rows: rows.length > 0 ? rows : undefined,
+        agentType: outcome.agentType,
+      },
+    ]);
+  };
+
+  const handlePickFile = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      pushLocal({ sender: 'assistant', text: 'Select a receipt screenshot (PNG or JPG).' });
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      pushLocal({ sender: 'assistant', text: `That file is ${(file.size / 1048576).toFixed(1)}MB — keep it under 4MB.` });
+      return;
+    }
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error('unreadable'));
+        reader.readAsDataURL(file);
+      });
+      setPendingImage({
+        base64: dataUrl.split(',')[1] ?? '',
+        mimeType: file.type,
+        name: file.name,
+        dataUrl,
+      });
+    } catch {
+      pushLocal({ sender: 'assistant', text: 'Could not read that image file.' });
+    }
+  };
+
+  const resetChat = () => {
+    setMessages([]);
+    setLastOutcome(null);
+    setLastOutgoingPayload(null);
+    setServiceCode(null);
+    setDeliveryNote(null);
+    setPendingImage(null);
+    setInputVal('');
+  };
+
+  const menuRows = lastOutcome?.listMenu?.interactive.action.sections.flatMap((s) => s.rows) ?? [];
 
   return (
     <div className="p-4 sm:p-6 space-y-6">
@@ -170,7 +295,8 @@ export function SimulatorScreen() {
             </span>
           </div>
           <p className="text-xs text-zinc-400 mt-1">
-            Simulate incoming Meta WhatsApp Cloud API webhooks. Test bilingual Kinyarwanda/English routing, tool execution, and outgoing payload.
+            Runs the real inbound pipeline: service menu, selection memory, trial gating, payment
+            orders, receipt forensics and bilingual routing. Nothing is delivered to Meta.
           </p>
         </div>
 
@@ -188,11 +314,7 @@ export function SimulatorScreen() {
             />
           </label>
           <button
-            onClick={() => {
-              setMessages([]);
-              setLastAgentResult(null);
-              setLastOutgoingPayload(null);
-            }}
+            onClick={resetChat}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 border border-zinc-700 transition-colors"
           >
             <RefreshCw className="w-3.5 h-3.5" />
@@ -219,6 +341,10 @@ export function SimulatorScreen() {
             </button>
           ))}
         </div>
+        <p className="text-[10px] text-zinc-500">
+          A number that has never picked a service always receives the service menu first — that is
+          the same rule the live webhook applies. Use a distinct number per persona to test trials.
+        </p>
       </div>
 
       {/* Main Grid: Device Phone + Inspector */}
@@ -244,7 +370,11 @@ export function SimulatorScreen() {
                   </div>
                   <p className="text-[10px] text-emerald-100 flex items-center gap-1">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-300 animate-pulse" />
-                    Online • Kinyarwanda & English
+                    {serviceCode ? (
+                      <span className="font-mono">{serviceCode}</span>
+                    ) : (
+                      <span>No service selected yet</span>
+                    )}
                   </p>
                 </div>
               </div>
@@ -280,6 +410,21 @@ export function SimulatorScreen() {
                         <span>{m.agentType.replace('_', ' ')}</span>
                       </div>
                     )}
+                    {m.attachment && (
+                      <div className="mb-1.5">
+                        {m.receipt ? (
+                          <img
+                            src={m.receipt}
+                            alt={m.attachment}
+                            className="max-h-32 rounded-lg border border-white/10 mb-1"
+                          />
+                        ) : null}
+                        <div className="flex items-center gap-1 text-[10px] text-emerald-200/80">
+                          <ImageIcon className="w-3 h-3" />
+                          <span className="truncate">{m.attachment}</span>
+                        </div>
+                      </div>
+                    )}
                     {m.text}
                     <div className="text-[9px] text-zinc-400 text-right mt-1 flex items-center justify-end gap-1">
                       <span>{m.timestamp}</span>
@@ -294,10 +439,32 @@ export function SimulatorScreen() {
                         <button
                           key={btn.id}
                           onClick={() => handleSend(btn.title)}
+                          disabled={isLoading}
                           className="w-full py-1.5 px-3 rounded-lg bg-[#202C33] hover:bg-zinc-800 text-emerald-400 font-medium text-xs border border-emerald-500/20 text-center transition-all flex items-center justify-center gap-1.5 shadow-sm"
                         >
                           <WhatsAppLogo className="w-3.5 h-3.5" />
                           <span>{btn.title}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Interactive List Menu Rows */}
+                  {m.rows && m.rows.length > 0 && (
+                    <div className="mt-1.5 w-[85%] rounded-lg overflow-hidden border border-emerald-500/20 shadow-md">
+                      <div className="px-2.5 py-1 bg-[#202C33] text-[9px] uppercase tracking-wider text-zinc-400 flex items-center gap-1">
+                        <List className="w-3 h-3" />
+                        <span>Choose service — tap a row (sends its row id)</span>
+                      </div>
+                      {m.rows.map((row) => (
+                        <button
+                          key={row.id}
+                          onClick={() => handleSend(row.id)}
+                          disabled={isLoading}
+                          className="w-full px-2.5 py-1.5 bg-[#202C33] hover:bg-zinc-800 text-left border-t border-zinc-800/70 transition-colors"
+                        >
+                          <span className="block text-xs font-semibold text-emerald-400">{row.title}</span>
+                          <span className="block text-[10px] text-zinc-400 leading-snug">{row.description}</span>
                         </button>
                       ))}
                     </div>
@@ -310,7 +477,7 @@ export function SimulatorScreen() {
                   <WhatsAppLogo className="w-7 h-7 text-emerald-400/60" />
                   <p className="text-xs text-zinc-400 leading-relaxed">
                     No messages yet. Enter a simulated number above and send a Kinyarwanda or English
-                    message to see how the router answers.
+                    message — the service menu comes back first.
                   </p>
                 </div>
               )}
@@ -325,6 +492,29 @@ export function SimulatorScreen() {
               )}
             </div>
 
+            {/* Pending receipt strip */}
+            {pendingImage && (
+              <div className="px-2.5 py-2 bg-[#111B21] border-t border-zinc-800/80 flex items-center gap-2">
+                <img
+                  src={pendingImage.dataUrl}
+                  alt={pendingImage.name}
+                  className="w-10 h-10 object-cover rounded-md border border-zinc-700"
+                />
+                <div className="flex-1 min-w-0">
+                  <p className="text-[11px] text-zinc-200 truncate">{pendingImage.name}</p>
+                  <p className="text-[10px] text-zinc-500">
+                    Attached as a receipt screenshot — press send to file it
+                  </p>
+                </div>
+                <button
+                  onClick={() => setPendingImage(null)}
+                  className="text-[10px] px-2 py-1 rounded-md bg-zinc-800 text-zinc-300 hover:bg-zinc-700 border border-zinc-700"
+                >
+                  Remove
+                </button>
+              </div>
+            )}
+
             {/* WhatsApp Input Bar */}
             <form
               onSubmit={(e) => {
@@ -334,15 +524,35 @@ export function SimulatorScreen() {
               className="p-2.5 bg-[#202C33] border-t border-zinc-800/80 flex items-center gap-2"
             >
               <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) void handlePickFile(file);
+                  e.target.value = '';
+                }}
+                className="hidden"
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading}
+                title="Attach a MoMo payment receipt screenshot"
+                className="w-9 h-9 shrink-0 rounded-full bg-[#2A3942] hover:bg-zinc-700 disabled:opacity-40 text-zinc-300 flex items-center justify-center transition-colors"
+              >
+                <Paperclip className="w-4 h-4" />
+              </button>
+              <input
                 type="text"
                 value={inputVal}
                 onChange={(e) => setInputVal(e.target.value)}
-                placeholder="Type in Kinyarwanda or English..."
+                placeholder={pendingImage ? 'Optional caption for the receipt...' : 'Type in Kinyarwanda or English...'}
                 className="flex-1 bg-[#2A3942] text-zinc-100 placeholder-zinc-400 text-xs rounded-xl px-3.5 py-2.5 outline-hidden focus:ring-1 focus:ring-emerald-500"
               />
               <button
                 type="submit"
-                disabled={isLoading || !inputVal.trim()}
+                disabled={isLoading || (!inputVal.trim() && !pendingImage)}
                 className="w-9 h-9 rounded-full bg-[#00A884] hover:bg-emerald-500 disabled:opacity-40 text-white flex items-center justify-center shadow-md transition-all cursor-pointer"
               >
                 <Send className="w-4 h-4 ml-0.5" />
@@ -357,55 +567,76 @@ export function SimulatorScreen() {
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-white flex items-center gap-2">
                 <Terminal className="w-4 h-4 text-emerald-400" />
-                <span>Real-Time Execution Trace & Inspector</span>
+                <span>Real-Time Execution Trace &amp; Inspector</span>
               </h2>
-              {lastAgentResult && (
+              {lastOutcome && (
                 <div className="flex items-center gap-2 text-[10px]">
                   <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 font-mono">
-                    {lastAgentResult.latencyMs}ms
+                    {lastOutcome.latencyMs != null ? `${lastOutcome.latencyMs}ms` : 'rule-based'}
                   </span>
                   <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-semibold border border-emerald-500/20">
-                    {lastAgentResult.detectedLanguage}
+                    {lastOutcome.detectedLanguage ?? 'NO MODEL CALL'}
                   </span>
                 </div>
               )}
             </div>
 
-            {lastAgentResult ? (
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {lastOutcome ? (
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
                 <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
                   <p className="text-[10px] text-zinc-400 font-medium">Routed Agent</p>
-                  <p className="text-xs font-bold text-white mt-0.5">
-                    {lastAgentResult.agentType}
-                  </p>
+                  <p className="text-xs font-bold text-white mt-0.5">{lastOutcome.agentType}</p>
                 </div>
                 <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
                   <p className="text-[10px] text-zinc-400 font-medium">Detected Intent</p>
-                  <p className="text-xs font-bold text-emerald-400 mt-0.5 font-mono">
-                    {lastAgentResult.intent}
+                  <p className="text-xs font-bold text-emerald-400 mt-0.5 font-mono break-all">
+                    {lastOutcome.intent}
                   </p>
                 </div>
                 <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
                   <p className="text-[10px] text-zinc-400 font-medium">Answering Model</p>
                   <p className="text-xs font-bold text-zinc-200 mt-0.5 flex items-center gap-1">
-                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                    <span className="truncate">{lastAgentResult.modelUsed}</span>
+                    <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+                    <span className="truncate">{lastOutcome.modelUsed}</span>
                   </p>
+                </div>
+                <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+                  <p className="text-[10px] text-zinc-400 font-medium">Active Service / Tokens</p>
+                  <p className="text-xs font-bold text-zinc-200 mt-0.5 font-mono">
+                    {serviceCode ?? 'none'}
+                  </p>
+                  <p className="text-[10px] text-zinc-500 font-mono mt-0.5">{lastOutcome.tokensUsed} tokens</p>
                 </div>
               </div>
             ) : (
               <p className="text-xs text-zinc-400">Send a message to view the agent execution breakdown.</p>
             )}
 
+            {menuRows.length > 0 && (
+              <div className="p-2.5 rounded-lg bg-zinc-950 border border-zinc-800 flex flex-wrap gap-1.5">
+                <span className="text-[10px] text-zinc-400 font-medium w-full">
+                  Menu rows offered by the selection engine (row id sent on tap):
+                </span>
+                {menuRows.map((r) => (
+                  <span
+                    key={r.id}
+                    className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800 text-emerald-300 border border-zinc-700"
+                  >
+                    {r.id}
+                  </span>
+                ))}
+              </div>
+            )}
+
             {/* Tool Calls Execution */}
-            {lastAgentResult && lastAgentResult.toolCalls.length > 0 && (
+            {lastOutcome && lastOutcome.toolCalls && lastOutcome.toolCalls.length > 0 && (
               <div className="space-y-2 pt-2 border-t border-zinc-800">
                 <p className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
                   <Layers className="w-3.5 h-3.5 text-blue-400" />
-                  <span>Executed Agent Tools ({lastAgentResult.toolCalls.length})</span>
+                  <span>Executed Agent Tools ({lastOutcome.toolCalls.length})</span>
                 </p>
                 <div className="space-y-2">
-                  {lastAgentResult.toolCalls.map((tc, idx) => (
+                  {lastOutcome.toolCalls.map((tc, idx) => (
                     <div
                       key={idx}
                       className="p-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-xs font-mono space-y-1"
@@ -414,16 +645,19 @@ export function SimulatorScreen() {
                         <span>⚡ {tc.name}()</span>
                         <span className="text-[10px] text-zinc-400 font-normal">{tc.latencyMs}ms</span>
                       </div>
-                      <div className="text-zinc-400 text-[11px]">
-                        Args: {JSON.stringify(tc.args)}
-                      </div>
-                      <div className="text-emerald-400 text-[11px]">
-                        Result: {JSON.stringify(tc.result)}
-                      </div>
+                      <div className="text-zinc-400 text-[11px]">Args: {JSON.stringify(tc.args)}</div>
+                      <div className="text-emerald-400 text-[11px]">Result: {JSON.stringify(tc.result)}</div>
                     </div>
                   ))}
                 </div>
               </div>
+            )}
+
+            {lastOutcome && (!lastOutcome.toolCalls || lastOutcome.toolCalls.length === 0) && (
+              <p className="text-[10px] text-zinc-500 pt-1 border-t border-zinc-800">
+                No tool calls on this turn — menu, selection, payment and gating replies are answered
+                by deterministic rules before any model is consulted.
+              </p>
             )}
           </div>
 
@@ -442,8 +676,8 @@ export function SimulatorScreen() {
                   {JSON.stringify(lastOutgoingPayload, null, 2)}
                 </pre>
                 <p className="text-[10px] text-zinc-500">
-                  Preview only. The simulator never sends this payload; real delivery happens in
-                  POST /api/whatsapp/webhook with Meta credentials configured.
+                  {deliveryNote ??
+                    'Preview only. The simulator never sends this payload; real delivery happens in POST /api/whatsapp/webhook with Meta credentials configured.'}
                 </p>
               </>
             ) : (

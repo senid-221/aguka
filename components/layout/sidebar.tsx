@@ -15,6 +15,10 @@ import {
   Settings,
   Flame,
   CheckCircle2,
+  Wallet,
+  Car,
+  Banknote,
+  ScrollText,
 } from 'lucide-react';
 import { WhatsAppLogo, RwandaFlagIcon } from '@/components/icons/logos';
 
@@ -23,11 +27,15 @@ export type ScreenId =
   | 'simulator'
   | 'conversations'
   | 'agents'
+  | 'services'
+  | 'road-safety'
   | 'jobs'
   | 'employment'
   | 'coding'
   | 'media'
   | 'study'
+  | 'payments'
+  | 'access'
   | 'users'
   | 'settings';
 
@@ -50,11 +58,33 @@ export function Sidebar({ currentScreen, onSelectScreen, isOpenMobile, onCloseMo
     },
     { id: 'conversations', label: 'Conversations', icon: <MessageSquare className="w-4 h-4" /> },
     { id: 'agents', label: 'AI Agents Hub', icon: <Bot className="w-4 h-4" /> },
+    {
+      id: 'services',
+      label: 'Services & Pricing',
+      icon: <Wallet className="w-4 h-4" />,
+      badge: 'Admin',
+      badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/25',
+    },
+    {
+      id: 'road-safety',
+      label: 'Road Safety Curriculum',
+      icon: <Car className="w-4 h-4" />,
+      badge: 'Admin',
+      badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/25',
+    },
     { id: 'jobs', label: 'Jobs Discovery & MIFOTRA', icon: <Briefcase className="w-4 h-4" /> },
     { id: 'employment', label: 'Employment Marketplace', icon: <Users2 className="w-4 h-4" /> },
     { id: 'coding', label: 'Coding Agent & Arch Map', icon: <Code2 className="w-4 h-4" /> },
     { id: 'media', label: 'Passport & Photo Studio', icon: <ImageIcon className="w-4 h-4" /> },
     { id: 'study', label: 'Study Tutor & Quizzes', icon: <GraduationCap className="w-4 h-4" /> },
+    {
+      id: 'payments',
+      label: 'MoMo Payment Review',
+      icon: <Banknote className="w-4 h-4" />,
+      badge: 'Admin',
+      badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/25',
+    },
+    { id: 'access', label: 'Access & Audit', icon: <ScrollText className="w-4 h-4" /> },
     { id: 'users', label: 'Users & DPPA Consent', icon: <ShieldCheck className="w-4 h-4" /> },
     { id: 'settings', label: 'System Settings', icon: <Settings className="w-4 h-4" /> },
   ];

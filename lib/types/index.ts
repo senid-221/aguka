@@ -13,7 +13,8 @@ export type AgentType =
   | 'IMAGE_STUDIO'
   | 'CODING_AGENT'
   | 'STUDY_TUTOR'
-  | 'EMPLOYMENT_MARKETPLACE';
+  | 'EMPLOYMENT_MARKETPLACE'
+  | 'ROAD_SAFETY_ACADEMY';
 
 export type TaskStatus = 'PENDING' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 
@@ -39,6 +40,8 @@ export interface User {
   role: UserRole;
   isActive: boolean;
   isBlocked: boolean;
+  selectedServiceCode?: string | null; // last WhatsApp menu choice
+  serviceSelectedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -78,6 +81,8 @@ export interface Conversation {
   id: string;
   userId: string;
   lastAgent: AgentType;
+  activeServiceCode?: string | null;
+  menuSentAt?: string | null;
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
@@ -282,7 +287,7 @@ export interface SystemHealth {
   uptimeSeconds: number;
   database: {
     status: 'CONNECTED' | 'IN_MEMORY';
-    provider: 'PostgreSQL' | 'In-Memory Store';
+    provider: 'PostgreSQL' | 'File-Backed JSON Store' | 'In-Memory Store';
     latencyMs: number | null;
   };
   redisQueue: {
@@ -309,4 +314,358 @@ export interface SystemHealth {
     agentRuns: number;
     toolCalls: number;
   };
+  // Server filesystem paths are deliberately not part of this health payload.
+  persistence: {
+    mode: 'IN_MEMORY_ONLY' | 'FILE_BACKED_JSON';
+    loadedFromDisk: boolean;
+    lastSavedAt: string | null;
+    lastSaveError: string | null;
+    records: number;
+  };
+  productionDatabase: {
+    prismaInstalled: boolean;
+    schemaFilePresent: boolean;
+    migrationsPresent: number;
+    applied: boolean;
+    note: string;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Service catalog, entitlements and billing
+// ---------------------------------------------------------------------------
+
+export type Currency = 'RWF' | 'USD' | 'EUR';
+
+export type BillingPeriod = 'PER_USE' | 'DAILY' | 'WEEKLY' | 'MONTHLY';
+
+export interface ServiceDefinition {
+  id: string;
+  code: string; // stable key used by routing + entitlements
+  nameEn: string;
+  nameRw: string;
+  descriptionEn: string;
+  descriptionRw: string;
+  agentType: AgentType;
+  isEnabled: boolean;
+  showInWhatsAppMenu: boolean;
+  isFree: boolean;
+  /**
+   * Charging stays switched off until an administrator confirms the price, so a
+   * default catalog entry can never bill a real person by accident.
+   */
+  chargeEnabled: boolean;
+  price: number; // 0 when isFree
+  currency: Currency;
+  billingPeriod: BillingPeriod;
+  trialHours: number; // 0 disables the free trial
+  trialUsageLimit: number; // 0 = unlimited during trial
+  paidUsageLimit: number; // 0 = unlimited once paid
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type EntitlementStatus = 'NONE' | 'TRIAL' | 'ACTIVE' | 'EXPIRED';
+
+export interface Entitlement {
+  id: string;
+  userId: string;
+  serviceCode: string;
+  status: EntitlementStatus;
+  trialStartsAt: string | null;
+  trialExpiresAt: string | null;
+  paidUntil: string | null;
+  usageCount: number;
+  usageLimit: number | null; // null = unlimited
+  lastUsedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Append-only record that a free trial was granted. Existence of a row is what
+ * blocks a second trial, so trials cannot be relinked by clearing an entitlement.
+ */
+export interface TrialGrant {
+  id: string;
+  userId: string;
+  serviceCode: string;
+  identityKey: string; // normalised whatsapp id / phone used to catch same-person relinks
+  grantedAt: string;
+  expiresAt: string;
+}
+
+export type AccessDenialReason =
+  | 'SERVICE_DISABLED'
+  | 'TRIAL_USED'
+  | 'TRIAL_EXPIRED'
+  | 'USAGE_LIMIT_REACHED'
+  | 'PAYMENT_REQUIRED';
+
+export interface AccessDecision {
+  allowed: boolean;
+  serviceCode: string;
+  status: EntitlementStatus;
+  denialReason?: AccessDenialReason;
+  remainingUsage?: number | null;
+  trialExpiresAt?: string | null;
+  paidUntil?: string | null;
+  price?: number;
+  currency?: Currency;
+  billingPeriod?: BillingPeriod;
+}
+
+// ---------------------------------------------------------------------------
+// MoMo payment orders and proof-of-payment analysis
+// ---------------------------------------------------------------------------
+
+export type PaymentOrderStatus =
+  | 'AWAITING_PROOF'
+  | 'PROOF_UPLOADED'
+  | 'UNDER_REVIEW'
+  | 'VERIFIED'
+  | 'REJECTED'
+  | 'EXPIRED';
+
+export type PaymentVerificationSource = 'MANUAL_ADMIN' | 'PAYMENT_PROVIDER_API';
+
+export interface PaymentOrder {
+  id: string;
+  reference: string; // unique, customer-quoted MoMo payment reference
+  userId: string;
+  userPhone: string;
+  serviceCode: string;
+  amount: number;
+  currency: Currency;
+  billingPeriod: BillingPeriod;
+  payeeName: string;
+  payeeMomoCode: string;
+  status: PaymentOrderStatus;
+  idempotencyKey: string | null;
+  proofIds: string[];
+  riskBand: RiskBand | null;
+  verificationSource: PaymentVerificationSource | null;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  providerTransactionId: string | null;
+  rejectionReason: string | null;
+  grantedEntitlementUntil: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type RiskBand = 'LOW' | 'MEDIUM' | 'HIGH';
+
+export type ProofSignalSeverity = 'INFO' | 'WARN' | 'HIGH';
+
+export interface ProofSignal {
+  code: string;
+  label: string;
+  detail: string;
+  severity: ProofSignalSeverity;
+  weight: number;
+}
+
+export interface OcrOutcome {
+  attempted: boolean;
+  available: boolean;
+  provider: string;
+  reason: string;
+  extractedText: string | null;
+  matchedAmount: boolean | null;
+  matchedReference: boolean | null;
+  matchedPayee: boolean | null;
+}
+
+export interface PaymentProof {
+  id: string;
+  orderId: string;
+  reference: string;
+  userId: string;
+  uploadedBy: string;
+  storageKey: string; // opaque id; bytes live outside the public web root
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  width: number | null;
+  height: number | null;
+  duplicateProofIds: string[];
+  signals: ProofSignal[];
+  riskScore: number;
+  riskBand: RiskBand;
+  ocr: OcrOutcome;
+  reviewStatus: 'UNREVIEWED' | 'ACCEPTED' | 'FLAGGED';
+  createdAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Road Safety Academy
+// ---------------------------------------------------------------------------
+
+export type PublishStatus = 'DRAFT' | 'PUBLISHED' | 'ARCHIVED';
+
+export interface SourceCitation {
+  title: string;
+  publisher: string;
+  url: string;
+  accessedOn: string;
+  quote?: string;
+}
+
+export interface RoadSafetyModule {
+  id: string;
+  code: string;
+  titleEn: string;
+  titleRw: string;
+  summaryEn: string;
+  summaryRw: string;
+  sortOrder: number;
+  status: PublishStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RoadSafetyLesson {
+  id: string;
+  moduleId: string;
+  titleEn: string;
+  titleRw: string;
+  bodyEn: string;
+  bodyRw: string;
+  keyPointsEn: string[];
+  keyPointsRw: string[];
+  citations: SourceCitation[];
+  legalVerifiedAt: string | null;
+  lastReviewedBy: string | null;
+  status: PublishStatus;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type RoadSignCategory =
+  | 'WARNING'
+  | 'PROHIBITORY'
+  | 'MANDATORY'
+  | 'DANGER'
+  | 'INFORMATION'
+  | 'SERVICE';
+
+export interface RoadSign {
+  id: string;
+  code: string;
+  category: RoadSignCategory;
+  nameEn: string;
+  nameRw: string;
+  meaningEn: string;
+  meaningRw: string;
+  shape: string;
+  colourConvention: string;
+  citations: SourceCitation[];
+  legalVerifiedAt: string | null;
+  status: PublishStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type QuestionDifficulty = 'EASY' | 'MEDIUM' | 'HARD';
+
+export interface RoadSafetyQuestion {
+  id: string;
+  moduleId: string;
+  lessonId: string | null;
+  questionEn: string;
+  questionRw: string;
+  optionsEn: string[];
+  optionsRw: string[];
+  correctIndex: number;
+  explanationEn: string;
+  explanationRw: string;
+  difficulty: QuestionDifficulty;
+  citations: SourceCitation[];
+  legalVerifiedAt: string | null;
+  status: PublishStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ExamTemplate {
+  id: string;
+  nameEn: string;
+  nameRw: string;
+  moduleId: string | null; // null = mixed across published modules
+  questionCount: number;
+  passPercent: number;
+  timeLimitMinutes: number | null;
+  status: PublishStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ExamAnswer {
+  questionId: string;
+  selectedIndex: number | null;
+  isCorrect: boolean;
+  givenAnswerEn: string | null;
+  correctAnswerEn: string;
+  explanationEn: string;
+  explanationRw: string;
+}
+
+export interface ExamAttempt {
+  id: string;
+  userId: string;
+  kind: 'PRACTICE' | 'MOCK_EXAM';
+  examTemplateId: string | null;
+  moduleId: string | null;
+  language: 'ENGLISH' | 'KINYARWANDA';
+  questionIds: string[];
+  answers: ExamAnswer[];
+  totalQuestions: number;
+  correctCount: number;
+  scorePercent: number;
+  passPercent: number;
+  passed: boolean;
+  startedAt: string;
+  submittedAt: string | null;
+  durationSeconds: number | null;
+}
+
+export interface LessonProgress {
+  userId: string;
+  lessonId: string;
+  completedAt: string;
+}
+
+export interface RoadSafetyProgress {
+  userId: string;
+  lessonsCompleted: number;
+  practiceAttempts: number;
+  mockExams: number;
+  examsPassed: number;
+  totalAnswered: number;
+  totalCorrect: number;
+  bestExamPercent: number;
+  lastActivityAt: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail
+// ---------------------------------------------------------------------------
+
+export type AuditActorRole = 'ADMIN' | 'SYSTEM' | 'USER';
+
+export interface AuditEntry {
+  id: string;
+  actor: string;
+  actorRole: AuditActorRole;
+  action: string;
+  targetType: string;
+  targetId: string;
+  summary: string;
+  before: unknown;
+  after: unknown;
+  createdAt: string;
 }

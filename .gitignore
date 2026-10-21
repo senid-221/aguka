@@ -9,3 +9,8 @@ package-lock.json
 !.env.example
 
 .aistudio/
+
+# Durable local store: real user records and payment receipts must never be committed
+.aguka-data/
+# Separate store used by `npm test` so the suite never writes into live data
+.aguka-test-data/
