@@ -1,0 +1,511 @@
+// Aguka AI - Production Prisma Schema for PostgreSQL
+// Multi-tenant, bilingual Kinyarwanda/English WhatsApp AI platform
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum LanguagePreference {
+  KINYARWANDA
+  ENGLISH
+  BOTH
+}
+
+enum UserRole {
+  CANDIDATE
+  WORKER
+  EMPLOYER
+  STUDENT
+  DEVELOPER
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+  TOOL
+}
+
+enum MessageContentType {
+  TEXT
+  IMAGE
+  DOCUMENT
+  AUDIO
+  INTERACTIVE_REPLY
+  LOCATION
+}
+
+enum AgentType {
+  ROUTER
+  JOB_FINDER
+  CAREER_ASSISTANT
+  IMAGE_STUDIO
+  CODING_AGENT
+  STUDY_TUTOR
+  EMPLOYMENT_MARKETPLACE
+}
+
+enum TaskStatus {
+  PENDING
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum JobType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERNSHIP
+  REMOTE
+  HYBRID
+}
+
+enum VerificationStatus {
+  VERIFIED
+  PENDING
+  UNVERIFIED
+  EXPIRED
+  REJECTED
+}
+
+enum ConsentType {
+  TERMS_OF_SERVICE
+  PRIVACY_POLICY
+  JOB_ALERTS
+  PROFILE_SHARING
+  DATA_RETENTION
+  ANALYTICS
+}
+
+// Core User Account
+model User {
+  id              String             @id @default(uuid())
+  phoneNumber     String             @unique // E.164 format: +250780000000
+  whatsappId      String?            @unique
+  fullName        String?
+  email           String?
+  preferredLang   LanguagePreference @default(KINYARWANDA)
+  role            UserRole           @default(CANDIDATE)
+  isActive        Boolean            @default(true)
+  isBlocked       Boolean            @default(false)
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  preferences     UserPreference?
+  consents        Consent[]
+  conversations   Conversation[]
+  jobAlerts       JobAlert[]
+  applications    Application[]
+  workerProfile   WorkerProfile?
+  employerProfile EmployerProfile?
+  mediaAssets     MediaAsset[]
+  codingProjects  CodingProject[]
+  studySessions   StudySession[]
+  usageRecords    UsageRecord[]
+  auditLogs       AuditLog[]
+
+  @@index([phoneNumber])
+  @@index([preferredLang])
+}
+
+model UserPreference {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  quietHoursStart String?  // e.g. "21:00"
+  quietHoursEnd   String?  // e.g. "07:00"
+  notifyViaSms    Boolean  @default(false)
+  notifyViaWa     Boolean  @default(true)
+  autoCvSharing   Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+}
+
+model Consent {
+  id          String      @id @default(uuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        ConsentType
+  granted     Boolean     @default(true)
+  ipAddress   String?
+  userAgent   String?
+  grantedAt   DateTime    @default(now())
+  revokedAt   DateTime?
+
+  @@unique([userId, type])
+  @@index([userId])
+}
+
+// WhatsApp Conversations & Messages
+model Conversation {
+  id           String        @id @default(uuid())
+  userId       String
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastAgent    AgentType     @default(ROUTER)
+  isActive     Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  messages     Message[]
+  memories     ConversationMemory[]
+  agentRuns    AgentRun[]
+
+  @@index([userId])
+  @@index([updatedAt])
+}
+
+model Message {
+  id             String             @id @default(uuid())
+  conversationId String
+  conversation   Conversation       @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  waMessageId    String?            @unique
+  role           MessageRole
+  type           MessageContentType @default(TEXT)
+  content        String             @db.Text
+  mediaUrl       String?
+  tokensUsed     Int?               @default(0)
+  timestamp      DateTime           @default(now())
+
+  @@index([conversationId])
+  @@index([timestamp])
+}
+
+model ConversationMemory {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  key            String       // e.g. "target_job_role", "education_level", "district"
+  value          String       @db.Text
+  confidence     Float        @default(1.0)
+  updatedAt      DateTime     @updatedAt
+
+  @@unique([conversationId, key])
+}
+
+// Jobs & Sources
+model JobSource {
+  id             String             @id @default(uuid())
+  name           String             // e.g. "MIFOTRA E-Recruitment", "Job in Rwanda", "WeWorkRemotely"
+  code           String             @unique // e.g. "MIFOTRA", "JOB_IN_RWANDA"
+  baseUrl        String
+  feedUrl        String?
+  isPermitted    Boolean            @default(true)
+  healthStatus   String             @default("HEALTHY") // HEALTHY, WARNING, DOWN
+  lastCrawledAt  DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  listings       JobListing[]
+}
+
+model JobListing {
+  id                 String             @id @default(uuid())
+  sourceId           String
+  source             JobSource          @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  externalId         String?            // id on MIFOTRA or JobInRwanda
+  title              String
+  employer           String
+  location           String             // e.g. "Kigali, Rwanda", "Remote", "Musanze"
+  jobType            JobType            @default(FULL_TIME)
+  description        String             @db.Text
+  requirements       String?            @db.Text
+  salaryRange        String?            // e.g. "RWF 450,000 - 600,000"
+  sourceUrl          String
+  deadline           DateTime?
+  discoveredAt       DateTime           @default(now())
+  lastVerifiedAt     DateTime           @default(now())
+  verificationStatus VerificationStatus @default(VERIFIED)
+  isExpired          Boolean            @default(false)
+
+  applications       Application[]
+  matches            JobMatch[]
+
+  @@unique([sourceId, externalId])
+  @@index([location])
+  @@index([deadline])
+  @@index([verificationStatus])
+}
+
+model JobAlert {
+  id         String             @id @default(uuid())
+  userId     String
+  user       User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  keywords   String             // e.g. "Software Engineer, Rwanda, Python"
+  location   String?
+  jobType    JobType?
+  language   LanguagePreference @default(KINYARWANDA)
+  isActive   Boolean            @default(true)
+  createdAt  DateTime           @default(now())
+
+  @@index([userId])
+}
+
+model Application {
+  id           String      @id @default(uuid())
+  userId       String
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobListingId String
+  jobListing   JobListing  @relation(fields: [jobListingId], references: [id], onDelete: Cascade)
+  cvUrl        String?
+  coverLetter  String?     @db.Text
+  status       TaskStatus  @default(PENDING)
+  appliedAt    DateTime    @default(now())
+
+  @@index([userId])
+  @@index([jobListingId])
+}
+
+// Employment Marketplace
+model WorkerProfile {
+  id           String     @id @default(uuid())
+  userId       String     @unique
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title        String     // e.g. "Senior Full-Stack TypeScript Engineer"
+  bio          String?    @db.Text
+  skills       String[]   // e.g. ["React", "PostgreSQL", "Node.js", "Docker"]
+  experienceYrs Int       @default(0)
+  district     String     @default("Kigali") // Gasabo, Kicukiro, Nyarugenge, etc.
+  isAvailable  Boolean    @default(true)
+  hourlyRateRwf Int?
+  cvUrl        String?
+  rating       Float      @default(5.0)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  matches      JobMatch[]
+}
+
+model EmployerProfile {
+  id           String     @id @default(uuid())
+  userId       String     @unique
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyName  String
+  industry     String
+  tinNumber    String?    // Rwanda Revenue Authority TIN
+  isVerified   Boolean    @default(false)
+  hqLocation   String     @default("Kigali")
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  vacancies    Vacancy[]
+}
+
+model Vacancy {
+  id           String          @id @default(uuid())
+  employerId   String
+  employer     EmployerProfile @relation(fields: [employerId], references: [id], onDelete: Cascade)
+  title        String
+  description  String          @db.Text
+  requiredSkills String[]
+  budgetRwf    Int?
+  deadline     DateTime?
+  status       TaskStatus      @default(PENDING)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  matches      JobMatch[]
+}
+
+model JobMatch {
+  id             String         @id @default(uuid())
+  workerId       String
+  worker         WorkerProfile  @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  jobListingId   String?
+  jobListing     JobListing?    @relation(fields: [jobListingId], references: [id], onDelete: Cascade)
+  vacancyId      String?
+  vacancy        Vacancy?       @relation(fields: [vacancyId], references: [id], onDelete: Cascade)
+  score          Float          // 0.0 - 100.0
+  explainability Json           // Breakdown: skillsMatch, locationMatch, experienceMatch
+  isContacted    Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+
+  @@index([workerId])
+}
+
+// Media & Photos
+model MediaAsset {
+  id           String      @id @default(uuid())
+  userId       String
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  originalUrl  String
+  processedUrl String?
+  fileType     String
+  fileSize     Int
+  mimeType     String
+  retentionDays Int        @default(30)
+  expiresAt    DateTime
+  createdAt    DateTime    @default(now())
+
+  tasks        ImageTask[]
+}
+
+model ImageTask {
+  id           String      @id @default(uuid())
+  mediaAssetId String
+  mediaAsset   MediaAsset  @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+  operation    String      // "ENHANCE", "REMOVE_BG", "PASSPORT_CROP", "CV_PHOTO"
+  status       TaskStatus  @default(PENDING)
+  errorMessage String?
+  createdAt    DateTime    @default(now())
+  completedAt  DateTime?
+}
+
+// Coding Agent & Sandbox
+model CodingProject {
+  id           String       @id @default(uuid())
+  userId       String
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title        String
+  repoUrl      String?
+  license      String       @default("MIT")
+  framework    String       @default("TypeScript / Next.js")
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  tasks        CodingTask[]
+}
+
+model CodingTask {
+  id           String        @id @default(uuid())
+  projectId    String
+  project      CodingProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  taskType     String        // "SCAFFOLD", "DEBUG", "EXPLAIN", "SANDBOX_RUN"
+  status       TaskStatus    @default(PENDING)
+  inputPrompt  String        @db.Text
+  outputResult String?       @db.Text
+  sandboxExitCode Int?
+  executionTimeMs Int?
+  createdAt    DateTime      @default(now())
+}
+
+// Study Tutor
+model StudySession {
+  id           String      @id @default(uuid())
+  userId       String
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject      String      // "Mathematics", "Science", "Programming", "English", "Ikinyarwanda"
+  topic        String
+  language     LanguagePreference @default(KINYARWANDA)
+  notes        String?     @db.Text
+  createdAt    DateTime    @default(now())
+
+  quizzes      Quiz[]
+}
+
+model Quiz {
+  id             String       @id @default(uuid())
+  studySessionId String
+  studySession   StudySession @relation(fields: [studySessionId], references: [id], onDelete: Cascade)
+  question       String       @db.Text
+  options        String[]
+  correctIndex   Int
+  explanation    String       @db.Text
+  userAnswer     Int?
+  isCorrect      Boolean?
+  createdAt      DateTime     @default(now())
+}
+
+// AI Agent Orchestration, Tool Calls & Audits
+model AgentRun {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  agentType      AgentType
+  intentDetected String
+  modelUsed      String       // "gemini-2.5-flash", "mock-agent"
+  tokensInput    Int          @default(0)
+  tokensOutput   Int          @default(0)
+  latencyMs      Int          @default(0)
+  status         TaskStatus   @default(COMPLETED)
+  errorMessage   String?
+  createdAt      DateTime     @default(now())
+
+  toolCalls      ToolCall[]
+
+  @@index([agentType])
+  @@index([createdAt])
+}
+
+model ToolCall {
+  id          String     @id @default(uuid())
+  agentRunId  String
+  agentRun    AgentRun   @relation(fields: [agentRunId], references: [id], onDelete: Cascade)
+  toolName    String     // "search_mifotra_jobs", "generate_bilingual_cv", "run_sandbox_code", etc.
+  arguments   Json
+  result      Json
+  latencyMs   Int        @default(0)
+  createdAt   DateTime   @default(now())
+}
+
+// Webhook & Reliability
+model WebhookEvent {
+  id          String     @id @default(uuid())
+  eventId     String     @unique // Meta message id or event hash
+  eventType   String     // "messages", "message_deliveries", "message_reads"
+  senderWaId  String
+  rawPayload  Json
+  isProcessed Boolean    @default(false)
+  receivedAt  DateTime   @default(now())
+  processedAt DateTime?
+
+  @@index([senderWaId])
+  @@index([receivedAt])
+}
+
+model ScheduledTask {
+  id          String     @id @default(uuid())
+  taskName    String     // "CRAWL_MIFOTRA", "SEND_JOB_ALERTS", "CLEANUP_EXPIRED_MEDIA"
+  schedule    String     // cron or interval e.g. "0 */4 * * *"
+  status      TaskStatus @default(PENDING)
+  lastRunAt   DateTime?
+  nextRunAt   DateTime?
+}
+
+// Admin & Security
+model AdminUser {
+  id          String     @id @default(uuid())
+  email       String     @unique
+  passwordHash String
+  name        String
+  role        String     @default("SUPERADMIN") // SUPERADMIN, MODERATOR, AUDITOR
+  isActive    Boolean    @default(true)
+  lastLoginAt DateTime?
+  createdAt   DateTime   @default(now())
+
+  auditLogs   AuditLog[]
+}
+
+model AuditLog {
+  id          String     @id @default(uuid())
+  adminId     String?
+  admin       AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  userId      String?
+  user        User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action      String     // "VERIFY_JOB", "BAN_USER", "EXPORT_USER_DATA", "DELETE_USER"
+  details     Json?
+  ipAddress   String?
+  timestamp   DateTime   @default(now())
+
+  @@index([action])
+  @@index([timestamp])
+}
+
+model UsageRecord {
+  id          String     @id @default(uuid())
+  userId      String?
+  user        User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  service     String     // "GEMINI_API", "WHATSAPP_CLOUD", "SANDBOX_COMPUTE"
+  units       Int        // tokens, messages, seconds
+  costUsd     Float      @default(0.0)
+  timestamp   DateTime   @default(now())
+
+  @@index([service])
+  @@index([timestamp])
+}
