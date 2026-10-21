@@ -131,14 +131,16 @@ export async function POST(request: NextRequest) {
         });
 
         // 5. Process through the shared inbound pipeline (service selection →
-        //    entitlement gate → agent)
-        repo.enqueueJob('PROCESS_WHATSAPP_MESSAGE', {
+        //    entitlement gate → agent). The record is closed once the inline run
+        //    finishes, so the queue view never shows work still pending.
+        const traceJob = repo.enqueueJob('PROCESS_WHATSAPP_MESSAGE', {
           userId: user.id,
           conversationId: conversation.id,
           userText,
         });
 
         outcome = await handleIncomingText(user, conversation, userText);
+        repo.updateJobStatus(traceJob.id, 'COMPLETED');
       }
 
       // Save assistant response to conversation history

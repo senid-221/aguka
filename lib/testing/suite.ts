@@ -7,6 +7,7 @@ import { logger } from '@/lib/logging/logger';
 import { getAIProvider, GeminiAIProvider } from '@/lib/ai/provider-adapter';
 import { GEMINI_MODEL } from '@/lib/gemini';
 import { queueService } from '@/lib/queue/redis-queue';
+import { resolveRedisEndpoint } from '@/lib/queue/redis-connection';
 import {
   activateTrial,
   buildAccessReply,
@@ -690,6 +691,51 @@ export async function runPlatformTestSuiteAsync(): Promise<{
 
   // The suite service only exists to prove gating, so it must not linger in the catalog.
   repo.deleteService('SUITE_TRIAL');
+
+  // Test 25: BullMQ only connects when a real endpoint resolves, and the shipped
+  // example value never counts as one.
+  const t25Start = Date.now();
+  const hosted = resolveRedisEndpoint({ REDIS_URL: 'rediss://default:tok321@proxy.eu1.upstash.io:6379' });
+  const local = resolveRedisEndpoint({ REDIS_URL: 'redis://:pw123@127.0.0.1:6379' });
+  const coded = resolveRedisEndpoint({ REDIS_URL: 'rediss://user:p%40ss@db.internal:6380/2' });
+  const example = resolveRedisEndpoint({ REDIS_URL: 'redis://:strong_redis_password@localhost:6379' });
+  const wrongScheme = resolveRedisEndpoint({ REDIS_URL: 'https://rest.upstash.io' });
+  const viaUpstashFields = resolveRedisEndpoint({
+    UPSTASH_REDIS_TCP_HOST: 'proxy.eu1.upstash.io',
+    UPSTASH_REDIS_TCP_PORT: '6379',
+    UPSTASH_REDIS_TOKEN: 'tok/with:colon',
+  });
+  const noneConfigured = resolveRedisEndpoint({});
+  const hostedOptions = hosted.options as Record<string, unknown> | undefined;
+  const queueResolutionOk =
+    hosted.configured &&
+    hosted.source === 'REDIS_URL' &&
+    hosted.label === 'proxy.eu1.upstash.io:6379 (tls)' &&
+    !hosted.label.includes('tok321') &&
+    hostedOptions?.tls !== undefined &&
+    hostedOptions?.maxRetriesPerRequest === null &&
+    local.configured &&
+    local.options?.tls === undefined &&
+    coded.options?.password === 'p@ss' &&
+    coded.options?.port === 6380 &&
+    coded.options?.db === 2 &&
+    !example.configured &&
+    !wrongScheme.configured &&
+    Boolean(wrongScheme.error) &&
+    viaUpstashFields.configured &&
+    viaUpstashFields.source === 'UPSTASH_TCP' &&
+    viaUpstashFields.options?.password === 'tok/with:colon' &&
+    !noneConfigured.configured &&
+    noneConfigured.source === 'NONE';
+  results.push({
+    id: 'test-redis-endpoint-resolution',
+    category: 'Reliability & Queue',
+    name: 'BullMQ Connects Only To A Real Redis Or Upstash TCP Endpoint',
+    passed: queueResolutionOk,
+    expected: 'rediss:// yields TLS options without leaking the token, rediss userinfo is percent-decoded, the .env.example placeholder and an https:// REST URL are refused, Upstash TCP fields work, and with nothing set the queue stays in-process',
+    actual: `hosted=${hosted.label}/${hosted.source}, plain_tls=${local.options?.tls === undefined ? 'absent' : 'present'}, decoded=${coded.options?.password}:${coded.options?.db}, example_configured=${example.configured}, https_rejected=${Boolean(wrongScheme.error)}, upstash_fields=${viaUpstashFields.source}, empty=${noneConfigured.source}`,
+    durationMs: Date.now() - t25Start,
+  });
 
   const passedCount = results.filter((r) => r.passed).length;
   const failedCount = results.length - passedCount;

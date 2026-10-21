@@ -33,6 +33,8 @@ export async function GET() {
         status: queueHealth.ok ? 'PASS' : 'FAIL',
         mode: queueHealth.mode,
         pendingJobs: queueHealth.pendingJobs,
+        activeWorkers: queueHealth.activeWorkers,
+        error: queueHealth.error ?? '',
       },
       aiProvider: {
         status: aiHealth.ok ? 'PASS' : 'FAIL',

@@ -205,7 +205,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-red-500/20 text-red-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">2</span>
-                    <span><strong>In-Memory Queue:</strong> BullMQ semantics are modelled in process; no Redis worker runs today.</span>
+                    <span><strong>Queue:</strong> BullMQ on Redis whenever REDIS_URL resolves, the same job handlers in-process when it does not.</span>
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-blue-500/20 text-blue-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">3</span>
@@ -356,7 +356,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
           <div className="space-y-2.5">
             {queuedJobs.length === 0 && (
               <p className="text-xs text-zinc-400 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-                Queue is empty — no jobs enqueued since this process started.
+                Queue is empty — no jobs recorded in the store yet.
               </p>
             )}
             {queuedJobs.slice(0, 4).map((qj) => (
@@ -392,7 +392,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
             </div>
             <div className="flex items-center gap-2">
               <RedisLogo className="w-4 h-4 text-red-400" />
-              <span>{health?.redisQueue.status === 'ACTIVE' ? 'Redis deduplication' : 'In-process deduplication'}</span>
+              <span>{health ? health.redisQueue.mode : 'Reading queue engine…'}</span>
             </div>
           </div>
         </div>

@@ -41,3 +41,22 @@ console; none of them replace the original pipeline.
   bearer token kept in `sessionStorage` only.
 - `prisma/migrations/20261021000000_commercial_and_road_safety/` — the PostgreSQL tables for the same
   domain. Prisma itself is not a dependency yet, so this SQL is not applied by the running build.
+
+## Background queue on Redis
+
+- `lib/queue/redis-connection.ts` — resolves the BullMQ endpoint from `REDIS_URL` (`redis://` or
+  `rediss://`) or the `UPSTASH_REDIS_TCP_*` fields. It rejects the value shipped in `.env.example`,
+  rejects an Upstash REST (`https://`) URL, percent-decodes credentials, and only ever hands out a
+  credential-free `host:port (tls)` label for logs and the dashboard.
+- `lib/queue/jobs.ts` — the job handlers both engines share: a Mifotra crawl, the media retention
+  sweep, and job alerts, which reports that no `JOB_ALERTS` opt-in store exists instead of returning a
+  made-up recipient count. An unknown job name completes with `NO_HANDLER` and count 0.
+- `lib/queue/redis-queue.ts` — one `IQueueService` over two engines. BullMQ owns jobs, attempts,
+  exponential backoff and completion retention when an endpoint resolves; otherwise the same handlers
+  run in this process. Every job is mirrored into the durable store, and a Redis enqueue that fails is
+  marked `REDIS_ENQUEUE_FAILED` rather than executed somewhere else. `QUEUE_INLINE_WORKER`,
+  `QUEUE_NAME`, `QUEUE_CONCURRENCY` and `QUEUE_SKIP_VERSION_CHECK` control the engine.
+- `scripts/worker.ts` + `npm run worker` — the standalone BullMQ worker with bounded SIGTERM shutdown,
+  for an always-on host instead of a serverless function.
+- Removed `lib/queue/worker.ts`, whose canned "processed" counts (142 alerts, 18 media tasks) were the
+  last simulated numbers in the queue path.

@@ -18,7 +18,7 @@ interface ReadinessPayload {
   checks: {
     configuration: { status: string; warnings: string[] };
     database: { status: string; provider: string; latencyMs: number | null };
-    queue: { status: string; mode: string; pendingJobs: number };
+    queue: { status: string; mode: string; pendingJobs: number; activeWorkers: number; error?: string };
     aiProvider: { status: string; provider: string; model: string };
     whatsappWebhook: { status: string; mode: string; verified: boolean };
     payments: {
@@ -62,7 +62,13 @@ const ENV_LABELS: Array<{ name: string; note: string }> = [
   { name: 'PAYMENT_AUTO_VERIFY', note: 'Set to "true" so a provider confirmation unlocks the service without an admin click' },
   { name: 'AGUKA_DATA_DIR', note: 'Where the durable store and receipt binaries live (defaults to ./.aguka-data)' },
   { name: 'DATABASE_URL', note: 'PostgreSQL target for the Prisma schema' },
-  { name: 'REDIS_URL', note: 'External queue and dedup store' },
+  { name: 'REDIS_URL', note: 'BullMQ queue backend — redis:// locally, rediss:// for a hosted TLS endpoint such as Upstash TCP' },
+  { name: 'UPSTASH_REDIS_TCP_HOST', note: 'Alternative to REDIS_URL: Upstash TCP proxy host (its REST endpoint cannot run BullMQ)' },
+  { name: 'UPSTASH_REDIS_TOKEN', note: 'Token for the Upstash TCP proxy when the URL cannot carry it' },
+  { name: 'QUEUE_NAME', note: 'BullMQ queue name (defaults to aguka-jobs)' },
+  { name: 'QUEUE_CONCURRENCY', note: 'Jobs one worker executes at a time' },
+  { name: 'QUEUE_INLINE_WORKER', note: '"false" on serverless so only `npm run worker` executes jobs' },
+  { name: 'QUEUE_SKIP_VERSION_CHECK', note: '"true" when the provider forbids the INFO command BullMQ probes with' },
   { name: 'ADMIN_JWT_SECRET', note: 'Signs admin dashboard sessions' },
   { name: 'ADMIN_DEFAULT_EMAIL', note: 'Admin login identity' },
   { name: 'ADMIN_DEFAULT_PASSWORD', note: 'Admin login secret' },
@@ -230,7 +236,9 @@ export function SettingsScreen() {
           <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">Queue</p>
           <p className="text-xs font-bold text-white mt-1">{readiness?.checks.queue.mode ?? 'Loading…'}</p>
           <p className="text-[11px] text-zinc-400 mt-0.5">
-            {readiness ? `${readiness.checks.queue.pendingJobs} pending job(s)` : 'Reading queue state'}
+            {readiness
+              ? `${readiness.checks.queue.pendingJobs} pending job(s) • ${readiness.checks.queue.activeWorkers} worker(s) in this process${readiness.checks.queue.error ? ` • ${readiness.checks.queue.error}` : ''}`
+              : 'Reading queue state'}
           </p>
         </div>
         <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">

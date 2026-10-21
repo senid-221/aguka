@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start",
     "test": "tsx scripts/run-backend-tests.ts",
+    "worker": "tsx scripts/worker.ts",
     "lint": "eslint .",
     "clean": "next clean"
   },
@@ -15,8 +16,10 @@
     "@google/genai": "^2.4.0",
     "@hookform/resolvers": "^5.2.1",
     "autoprefixer": "^10.4.21",
+    "bullmq": "^6.4.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "ioredis": "^6.0.0",
     "lucide-react": "^0.553.0",
     "motion": "^12.23.24",
     "next": "^15.4.9",

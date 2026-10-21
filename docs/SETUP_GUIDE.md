@@ -6,7 +6,8 @@
 ## 1. System Architecture Overview
 
 - **Ingress**: WhatsApp Mobile User ➔ Meta Cloud API Webhook ➔ Next.js Gateway
-- **Reliability & Queue**: in-process queue with BullMQ-style semantics; no Redis client is installed, so queued work does not survive a restart
+- **Reliability & Queue**: BullMQ on Redis whenever `REDIS_URL` resolves to a real endpoint; the same
+  job handlers run in this process when it does not, and `/api/health` reports which engine is live
 - **AI Orchestrator**: Bilingual Router with Kinyarwanda & English detection, Gemini model selection (`GEMINI_MODEL`, default `gemini-2.5-flash`), prompt-injection shielding, secret redaction, and two real tool calls (`search_verified_jobs`, `query_talent_marketplace`)
 - **Core Modules**:
   1. **Job Finder**: boards are registered (MIFOTRA, Job in Rwanda, remote) but no live crawler runs yet; listings appear only after a real crawl or a manual `POST /api/jobs` with a source URL. Zero invented listings.
@@ -121,7 +122,8 @@ entitlements, trial grants, payment orders, receipt proofs, road safety content 
 an atomic, versioned snapshot (`repository-snapshot.json`) under `AGUKA_DATA_DIR`, default
 `.aguka-data/`, written through a temp file and `renameSync`. Proofs are stored as binaries in
 `AGUKA_DATA_DIR/proofs`, never inside the snapshot and never under `public/`. This survives a restart;
-the queue and in-flight agent runs do not. Point `AGUKA_DATA_DIR` at a persistent volume, keep it out
+in-flight agent runs do not, and queue jobs survive it only once BullMQ has a Redis to live in. Point
+`AGUKA_DATA_DIR` at a persistent volume, keep it out
 of version control (`.gitignore` already excludes it), and back it up — it holds personal data, so a
 DPPA deletion request has to reach it.
 
@@ -142,6 +144,58 @@ On Windows, stop the running server before `prisma generate` — the dev server 
 DLL and generation fails. Installing Prisma is not enough: `lib/db/repository.ts` still has to be
 switched from the JSON store to Prisma calls, and `/api/ready` will keep reporting the file store until
 that happens.
+
+### Redis & BullMQ (opt-in)
+
+`bullmq` and `ioredis` are dependencies, but no connection is opened until `lib/queue/redis-connection.ts`
+resolves a real endpoint. Two ways to give it one:
+
+**A single URL** — `redis://` for a local server, `rediss://` (double s) for anything hosted, because
+providers only accept TLS:
+
+```bash
+REDIS_URL="rediss://default:<token>@<host>:6379"        # Upstash TCP proxy, Railway, Redis Cloud…
+REDIS_URL="redis://:<password>@127.0.0.1:6379"          # Memurai / WSL2 / VPS Redis
+```
+
+**Upstash fields** — use these when the token contains a `/` or `:` and cannot sit in a URL:
+
+```bash
+UPSTASH_REDIS_TCP_HOST="<your-proxy-host>.upstash.io"
+UPSTASH_REDIS_TOKEN="<token>"
+```
+
+Upstash needs its **TCP port enabled**: open the database in the console → *Settings* → *TCP port
+(Redis protocol)*, and copy the proxy host it shows. Its REST endpoint (`https://…upstash.io` plus
+`UPSTASH_REDIS_REST_TOKEN`) cannot run BullMQ, and `/api/ready` refuses an `https://` `REDIS_URL`
+rather than pretending to connect. Because BullMQ keeps polling Redis even when the queue is idle, a
+pay-as-you-go Upstash database bills continuously — move to a fixed plan before enabling it in
+production.
+
+Then restart and check the engine:
+
+```bash
+curl http://localhost:3000/api/health   # redisQueue.mode → "Redis BullMQ · <host>:6379 (tls) …"
+curl http://localhost:3000/api/ready    # checks.queue → PASS with pendingJobs and activeWorkers
+```
+
+Unset, `mode` stays `In-Process Resilient Queue` and jobs execute inside the web process; set but
+unreachable, `/api/ready` answers 503 with `… · UNREACHABLE` and failed enqueues are recorded as
+`REDIS_ENQUEUE_FAILED` instead of being silently dropped.
+
+**Who executes the jobs.** Outside production the web process attaches a worker automatically, so
+local development drains the queue by itself. On serverless hosting set
+`QUEUE_INLINE_WORKER=false` and run the worker on an always-on host:
+
+```bash
+npm run worker        # scripts/worker.ts — BullMQ worker with Ctrl+C / SIGTERM shutdown
+```
+
+Keep that worker pointed at a real database rather than the file store: with
+`AGUKA_DATA_DIR` snapshot JSON, the web server and the worker are two writers racing on one file.
+`QUEUE_CONCURRENCY` (default 5) sets how many jobs one worker runs at once, `QUEUE_NAME` (default
+`aguka-jobs`) is the BullMQ queue, and `QUEUE_SKIP_VERSION_CHECK=true` is for proxies that forbid the
+`INFO` command BullMQ probes the Redis version with.
 
 ---
 
@@ -165,6 +219,8 @@ Tests verified:
 - Marketplace matching driven only by stored records, with full explainability on every match
 - AI provider contract (Gemini only) and its honest failure mode with no key
 - Queue enqueue and processing lifecycle, configuration parsing, logger redaction
+- BullMQ endpoint resolution: TLS from `rediss://`, credentials kept out of the reported label,
+  percent-decoded userinfo, the shipped `.env.example` value and an Upstash REST URL both rejected
 - 24-hour trial granted once and never re-trialled for the same person
 - Trial expiry and usage caps blocking access, with the price stated first
 - First WhatsApp message receiving the dynamic menu and the pick being remembered
@@ -216,4 +272,7 @@ place.
 4. Menu order and visibility confirmed by sending a first message to the number.
 5. `MOMO_PAYEE_CODE` receives money; `PAYMENT_WEBHOOK_SECRET` shared with the provider; review queue exercised end to end (order → proof → verify → access → expiry → payment → re-access).
 6. Road safety citations re-checked against the current gazette and `REVIEW_DATE` updated.
-7. `/api/ready` and `/api/health` green, `npm test` at 24/24, and `AGUKA_DATA_DIR` on a backed-up volume.
+7. `/api/ready` and `/api/health` green, `npm test` at 26/26, and `AGUKA_DATA_DIR` on a backed-up volume.
+8. If scheduled jobs matter to you: `REDIS_URL` resolves (the health endpoint names the engine), the
+   worker runs somewhere always-on, and `QUEUE_INLINE_WORKER=false` on serverless so a frozen function
+   cannot hold a half-finished job.

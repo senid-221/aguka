@@ -4,6 +4,7 @@
  */
 
 import { GEMINI_MODEL } from '@/lib/gemini';
+import { resolveRedisEndpoint } from '@/lib/queue/redis-connection';
 
 export interface AppConfig {
   env: 'development' | 'production' | 'test';
@@ -28,6 +29,11 @@ export interface AppConfig {
   redis: {
     url: string;
     isConfigured: boolean;
+    /** Where the endpoint came from: REDIS_URL, the Upstash TCP fields, or nowhere. */
+    source: 'REDIS_URL' | 'UPSTASH_TCP' | 'NONE';
+    /** `host:port (tls)` without credentials. */
+    endpoint: string;
+    error: string;
   };
   security: {
     jwtSecret: string;
@@ -92,9 +98,12 @@ export function parseAndValidateConfig(env: NodeJS.ProcessEnv = process.env): Co
   const dbUrl = env.DATABASE_URL || '';
   const isDbConfigured = Boolean(dbUrl && !dbUrl.includes('replace_with'));
 
-  // Redis
+  // Redis — BullMQ connects only when a real endpoint resolves.
   const redisUrl = env.REDIS_URL || '';
-  const isRedisConfigured = Boolean(redisUrl && !redisUrl.includes('replace_with'));
+  const redisEndpoint = resolveRedisEndpoint(env);
+  if (redisEndpoint.error) {
+    warnings.push(`Queue: ${redisEndpoint.error} Jobs run in this process until it is fixed.`);
+  }
 
   // Security
   const jwtSecret = env.ADMIN_JWT_SECRET || '';
@@ -149,7 +158,10 @@ export function parseAndValidateConfig(env: NodeJS.ProcessEnv = process.env): Co
     },
     redis: {
       url: redisUrl,
-      isConfigured: isRedisConfigured,
+      isConfigured: redisEndpoint.configured,
+      source: redisEndpoint.source,
+      endpoint: redisEndpoint.label,
+      error: redisEndpoint.error ?? '',
     },
     security: {
       jwtSecret,

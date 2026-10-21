@@ -52,13 +52,18 @@ WhatsApp user → Meta Cloud API webhook → Next.js route handler
 - **Routing** — `lib/ai/bilingual-router.ts` detects Kinyarwanda vs English and selects the agent.
 - **Provider layer** — `lib/ai/provider-adapter.ts` calls Google Gemini through `@google/genai`;
   `lib/ai/prompt-security.ts` shields against prompt injection and redacts secrets from output.
-- **Queue** — `lib/queue/redis-queue.ts` keeps jobs, retries and scheduled tasks in process memory.
-  When `REDIS_URL` is set it reports a `Redis BullMQ` mode label, but no Redis client connects; a
-  real deployment should replace this with an actual BullMQ worker.
+- **Queue** — `lib/queue/redis-queue.ts` runs BullMQ against `REDIS_URL` (or the Upstash TCP fields
+  resolved by `lib/queue/redis-connection.ts`) and stores jobs, retries and backoff in Redis. With no
+  endpoint it executes the same handlers in this process, so local development still drains the queue
+  while `/api/health` says which engine is in charge. Job bodies are handled by `lib/queue/jobs.ts`;
+  an unregistered job name completes with a `NO_HANDLER` note instead of inventing work, and a Redis
+  enqueue that fails is recorded as failed rather than quietly run elsewhere. Run `npm run worker` on
+  an always-on host for the standalone worker; serverless hosts need `QUEUE_INLINE_WORKER=false`.
 - **Data** — `lib/db/repository.ts` starts empty: no users, conversations, jobs, profiles, orders or
   exam attempts exist until real traffic or an explicit API call creates them. `lib/db/store.ts`
   writes the operational records to an atomic, versioned JSON snapshot under `AGUKA_DATA_DIR` (default
-  `.aguka-data/`), so they survive a restart; the queue and in-flight agent runs do not. Webhook
+  `.aguka-data/`), so they survive a restart; the queue mirror is written there too, while actual job
+  execution lives in Redis once `REDIS_URL` is set. Webhook
   deduplication uses `isMessageAlreadyProcessed`. The normalised PostgreSQL models live in
   `prisma/schema.prisma` with migration SQL in `prisma/migrations/`.
 - **Limits** — `lib/security/rate-limiter.ts` implements a per-user sliding window and a daily AI
@@ -67,7 +72,8 @@ WhatsApp user → Meta Cloud API webhook → Next.js route handler
   [`docs/CHANGELOG_EXTENSIONS.md`](docs/CHANGELOG_EXTENSIONS.md). `lib/security/admin-auth.ts`
   issues HS256 tokens protecting every `/api/admin/*` route and `POST /api/admin/maintenance`.
 
-> The repository has no runtime dependency on Postgres, Redis or S3 clients. With a Gemini key and
+> The repository has no runtime dependency on Postgres or S3 clients, and `bullmq`/`ioredis` open no
+> connection until `REDIS_URL` resolves to a real endpoint. With a Gemini key and
 > Meta credentials it answers and delivers for real; without them every screen shows an honest empty
 > or not-configured state rather than sample data. To persist to PostgreSQL, add `prisma` and
 > `@prisma/client`, point `DATABASE_URL` at your database and apply `prisma/migrations/`.
@@ -109,7 +115,10 @@ All variables are documented in [`.env.example`](.env.example) and validated at 
 | `PAYMENT_WEBHOOK_SECRET` | Shared secret with the payment provider. Unset, `POST /api/payments/webhook` answers 503 and accepts nothing. |
 | `PAYMENT_AUTO_VERIFY` | `true` lets a correctly signed provider webhook unlock a service on its own. Requires the reconciliation endpoint above. |
 | `OPENAI_API_KEY`, `OPENAI_VISION_MODEL` | Optional receipt-screenshot text reading. Proofs are still hash- and metadata-checked without it. |
-| `DATABASE_URL`, `REDIS_URL` | Opt-in PostgreSQL and Redis backends. |
+| `REDIS_URL` | BullMQ queue backend. `rediss://` for a hosted TLS endpoint (Upstash needs its **TCP proxy**, not the REST URL); unset keeps jobs in-process. |
+| `UPSTASH_REDIS_TCP_HOST`, `UPSTASH_REDIS_TOKEN` | Alternative to `REDIS_URL` when the Upstash token cannot be embedded in a URL. |
+| `QUEUE_NAME`, `QUEUE_CONCURRENCY`, `QUEUE_INLINE_WORKER`, `QUEUE_SKIP_VERSION_CHECK` | Queue name, worker parallelism, whether the web process also executes jobs, and a workaround for proxies that forbid `INFO`. |
+| `DATABASE_URL` | Opt-in PostgreSQL backend for the Prisma schema; no client is installed yet. |
 | `MAX_MESSAGES_PER_MINUTE_PER_USER`, `MAX_DAILY_AI_TOKENS_PER_USER` | Rate and budget limits read by `UsageLimiter`; enforcement still needs wiring. |
 
 Prices, trial length, usage caps and which services appear in the WhatsApp menu are not environment
@@ -163,10 +172,11 @@ npm test
 npx tsx scripts/run-extension-tests.ts
 ```
 
-25 checks cover the webhook challenge, invalid-token rejection, HMAC signature verification, event
+26 checks cover the webhook challenge, invalid-token rejection, HMAC signature verification, event
 deduplication idempotency, Kinyarwanda/English detection, agent intent routing, prompt injection
 resistance, secret redaction, marketplace matching driven only by stored records, the AI provider
-contract, the queue lifecycle, and the new engines: trial granted once per person and never
+contract, the queue lifecycle and the BullMQ endpoint rules — TLS from `rediss://`, the shipped
+example value and an Upstash REST URL both refused — and the new engines: trial granted once per person and never
 re-trialled, expiry and usage caps blocking with the price stated first, the dynamic menu and the
 remembered pick, idempotent payment orders, duplicate receipt detection, unlock only on an
 identified confirmation, reconciliation leaving an unknown payment locked, unsigned webhook

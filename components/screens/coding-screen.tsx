@@ -144,8 +144,8 @@ export function CodingScreen() {
               <span className="text-[10px] text-red-400 font-semibold uppercase">2. Queue</span>
               <RedisLogo className="w-4 h-4 text-red-400" />
             </div>
-            <p className="text-xs font-bold text-white">In-Process Queue</p>
-            <p className="text-[10px] text-zinc-400">BullMQ/Redis is not installed; jobs live in memory only.</p>
+            <p className="text-xs font-bold text-white">BullMQ / In-Process Queue</p>
+            <p className="text-[10px] text-zinc-400">Jobs run on Redis through BullMQ when REDIS_URL resolves; otherwise the same handlers run in this process. /api/health reports which engine is live.</p>
           </div>
 
           <div className="p-3.5 rounded-xl bg-zinc-950 border border-blue-500/30 space-y-2">

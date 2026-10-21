@@ -22,6 +22,13 @@ const nextConfig: NextConfig = {
   output: 'standalone',
   transpilePackages: ['motion'],
   webpack: (config, {dev}) => {
+    // BullMQ statically imports its optional Valkey backend; the queue here is
+    // Redis, so keep the missing package from failing the build.
+    config.resolve.alias = {
+      ...config.resolve.alias,
+      '@valkey/valkey-glide': false,
+    };
+
     // HMR is disabled in AI Studio via DISABLE_HMR env var.
     // Do not modify—file watching is disabled to prevent flickering during agent edits.
     if (dev && process.env.DISABLE_HMR === 'true') {

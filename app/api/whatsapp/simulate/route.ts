@@ -48,7 +48,7 @@ export async function POST(request: NextRequest) {
         content: `image (${imageMimeType || 'image/jpeg'})`,
         mediaUrl: `simulated-media:${localMessageId}`,
       });
-      repo.enqueueJob('PROCESS_SIMULATED_PAYMENT_PROOF', { userId: user.id, conversationId: conversation.id });
+      const proofJob = repo.enqueueJob('PROCESS_SIMULATED_PAYMENT_PROOF', { userId: user.id, conversationId: conversation.id });
       outcome = await handleIncomingImage(
         user,
         conversation,
@@ -56,6 +56,7 @@ export async function POST(request: NextRequest) {
         messageText ? String(messageText) : `${localMessageId}.jpg`,
         String(imageMimeType || 'image/jpeg')
       );
+      repo.updateJobStatus(proofJob.id, 'COMPLETED');
     } else {
       userMsg = repo.addMessage(conversation.id, {
         waMessageId: localMessageId,
@@ -63,12 +64,13 @@ export async function POST(request: NextRequest) {
         type: 'TEXT',
         content: messageText,
       });
-      repo.enqueueJob('PROCESS_SIMULATED_WHATSAPP_MESSAGE', {
+      const messageJob = repo.enqueueJob('PROCESS_SIMULATED_WHATSAPP_MESSAGE', {
         userId: user.id,
         conversationId: conversation.id,
         messageText,
       });
       outcome = await handleIncomingText(user, conversation, String(messageText));
+      repo.updateJobStatus(messageJob.id, 'COMPLETED');
     }
 
     const assistantMsg = repo.addMessage(conversation.id, {

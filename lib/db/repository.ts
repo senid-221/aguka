@@ -38,6 +38,7 @@ import { GEMINI_MODEL } from '@/lib/gemini';
 import { newId } from '@/lib/util/ids';
 import { durableStore, withPersistence, type Persistable } from '@/lib/db/store';
 import { detectPrismaReadiness } from '@/lib/db/prisma-readiness';
+import { getQueueRuntimeSnapshot } from '@/lib/queue/status';
 
 // Boards the platform is configured to read. Health and listing counts stay
 // unknown until a real crawl populates them.
@@ -399,14 +400,14 @@ class AppRepository implements Persistable {
     return this.queuedJobs;
   }
 
-  enqueueJob(name: string, data: Record<string, unknown>): QueuedJob {
+  enqueueJob(name: string, data: Record<string, unknown>, maxAttempts = 3): QueuedJob {
     const job: QueuedJob = {
       id: `qjob-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       name,
       data,
       status: 'QUEUED',
       attempts: 0,
-      maxAttempts: 3,
+      maxAttempts,
       enqueuedAt: new Date().toISOString(),
     };
     this.queuedJobs.unshift(job);
@@ -421,6 +422,7 @@ class AppRepository implements Persistable {
     const job = this.queuedJobs.find((j) => j.id === id);
     if (job) {
       job.status = status;
+      if (status === 'PROCESSING') job.attempts++;
       if (status === 'COMPLETED' || status === 'FAILED') {
         job.processedAt = new Date().toISOString();
       }
@@ -914,6 +916,7 @@ class AppRepository implements Persistable {
 
     const persistence = durableStore.status;
     const prisma = detectPrismaReadiness();
+    const queue = getQueueRuntimeSnapshot();
 
     return {
       status: isWaConfigured && isGeminiConfigured && isSignatureEnforced ? 'OPTIMAL' : 'DEGRADED',
@@ -929,9 +932,11 @@ class AppRepository implements Persistable {
         latencyMs: null,
       },
       redisQueue: {
-        status: 'IN_MEMORY',
+        status: queue.engine === 'REDIS_BULLMQ' ? 'ACTIVE' : 'IN_MEMORY',
+        mode: queue.mode,
         queuedJobs: this.queuedJobs.filter((j) => j.status === 'QUEUED').length,
-        activeWorkers: 0,
+        activeWorkers: queue.activeWorkers,
+        lastError: queue.lastError,
       },
       whatsappApi: {
         configured: isWaConfigured,

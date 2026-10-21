@@ -291,9 +291,11 @@ export interface SystemHealth {
     latencyMs: number | null;
   };
   redisQueue: {
-    status: 'ACTIVE' | 'IN_MEMORY';
+    status: 'ACTIVE' | 'IN_MEMORY' | 'UNREACHABLE';
+    mode: string;
     queuedJobs: number;
     activeWorkers: number;
+    lastError?: string;
   };
   whatsappApi: {
     configured: boolean;
