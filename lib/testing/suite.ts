@@ -1,5 +1,5 @@
 import { verifyWebhookChallenge, verifyMetaSignature } from '@/lib/whatsapp/gateway';
-import { detectLanguage, classifyIntent } from '@/lib/ai/bilingual-router';
+import { detectLanguage, classifyIntent, requestsImageProduction } from '@/lib/ai/bilingual-router';
 import { sanitizeUserInput, redactSecrets } from '@/lib/ai/prompt-security';
 import { repo } from '@/lib/db/repository';
 import { parseAndValidateConfig } from '@/lib/config';
@@ -16,8 +16,8 @@ import {
   grantPaidAccess,
   identityKeyOf,
 } from '@/lib/services/entitlements';
-import { ensureCatalogSeeded, listMenuServices } from '@/lib/services/catalog';
-import { rowIdFor } from '@/lib/services/selection';
+import { ensureCatalogSeeded, getService, listMenuServices } from '@/lib/services/catalog';
+import { applySelection, rowIdFor } from '@/lib/services/selection';
 import {
   attachPaymentProof,
   createOrder,
@@ -735,6 +735,49 @@ export async function runPlatformTestSuiteAsync(): Promise<{
     expected: 'rediss:// yields TLS options without leaking the token, rediss userinfo is percent-decoded, the .env.example placeholder and an https:// REST URL are refused, Upstash TCP fields work, and with nothing set the queue stays in-process',
     actual: `hosted=${hosted.label}/${hosted.source}, plain_tls=${local.options?.tls === undefined ? 'absent' : 'present'}, decoded=${coded.options?.password}:${coded.options?.db}, example_configured=${example.configured}, https_rejected=${Boolean(wrongScheme.error)}, upstash_fields=${viaUpstashFields.source}, empty=${noneConfigured.source}`,
     durationMs: Date.now() - t25Start,
+  });
+
+  // Test 27: A request to produce or retouch an image is refused in code, never
+  // by letting a text model claim it edited a photo or leak its own error.
+  const t26Start = Date.now();
+  const photoUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 60).slice(-8)}`, 'Suite Photo User');
+  const photoConv = repo.getOrCreateConversation(photoUser.id);
+  applySelection(photoUser, photoConv, getService('PHOTO_EDITING')!, 'ENGLISH');
+  const refusalRw = await handleIncomingText(
+    repo.getUserById(photoUser.id)!,
+    photoConv,
+    'Kora ifoto yanjye ya pasiporo, ukureho inyuma'
+  );
+  const refusalEn = await handleIncomingText(
+    repo.getUserById(photoUser.id)!,
+    photoConv,
+    'Please edit my photo and remove the background'
+  );
+  const guidanceTurn = await handleIncomingText(
+    repo.getUserById(photoUser.id)!,
+    photoConv,
+    'What are the passport photo standards?'
+  );
+  const photoRefusalOk =
+    requestsImageProduction('Kora ifoto yanjye ya pasiporo') &&
+    requestsImageProduction('edit my photo and remove the background') &&
+    !requestsImageProduction('What are the passport photo standards?') &&
+    refusalRw.intent === 'IMAGE_PRODUCTION_UNAVAILABLE' &&
+    refusalRw.modelUsed === 'capability-gate' &&
+    refusalEn.intent === 'IMAGE_PRODUCTION_UNAVAILABLE' &&
+    refusalRw.replyText.includes('ifoto') &&
+    refusalEn.replyText.includes('does not generate') &&
+    !/404|not found|GEMINI|api key/i.test(`${refusalRw.replyText} ${refusalEn.replyText}`) &&
+    guidanceTurn.intent !== 'IMAGE_PRODUCTION_UNAVAILABLE';
+  results.push({
+    id: 'test-image-production-refusal',
+    category: 'AI Orchestrator',
+    name: 'Asking For A Generated Or Retouched Photo Gets A Bilingual Refusal Without A Model Call',
+    passed: photoRefusalOk,
+    expected:
+      'create/edit-photo wording is refused before entitlements and before any model call, in the language written, with no provider error text shown; a standards question is not refused',
+    actual: `rw=${refusalRw.intent}/${refusalRw.modelUsed}, en=${refusalEn.intent}, guidance=${guidanceTurn.intent}, leakedErrorText=${/404|not found|GEMINI|api key/i.test(`${refusalRw.replyText} ${refusalEn.replyText}`)}`,
+    durationMs: Date.now() - t26Start,
   });
 
   const passedCount = results.filter((r) => r.passed).length;

@@ -172,7 +172,7 @@ npm test
 npx tsx scripts/run-extension-tests.ts
 ```
 
-26 checks cover the webhook challenge, invalid-token rejection, HMAC signature verification, event
+27 checks cover the webhook challenge, invalid-token rejection, HMAC signature verification, event
 deduplication idempotency, Kinyarwanda/English detection, agent intent routing, prompt injection
 resistance, secret redaction, marketplace matching driven only by stored records, the AI provider
 contract, the queue lifecycle and the BullMQ endpoint rules — TLS from `rediss://`, the shipped
@@ -181,8 +181,10 @@ re-trialled, expiry and usage caps blocking with the price stated first, the dyn
 remembered pick, idempotent payment orders, duplicate receipt detection, unlock only on an
 identified confirmation, reconciliation leaving an unknown payment locked, unsigned webhook
 rejection, an already-paid user never being sold a second order, replies staying in the language the
-person last wrote in, server-side exam scoring with corrections, and users, orders, proofs and exam
-attempts surviving a restart. The same suite runs from the **Run Test Suite** button in the console topbar.
+person last wrote in, a request to generate or retouch a photo refused in code before any model call
+rather than answered with a provider error, server-side exam scoring with corrections, and users,
+orders, proofs and exam attempts surviving a restart. The same suite runs from the **Run Test Suite**
+button in the console topbar.
 
 ## Database
 

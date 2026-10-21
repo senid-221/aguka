@@ -5,6 +5,15 @@
  * Serverless platforms freeze functions between requests, so a BullMQ worker
  * started inside them would half-process jobs.
  */
+// The Next server loads .env for the web process; this script has to do it itself,
+// otherwise a REDIS_URL that works in the app is invisible here. Absence is normal on
+// hosts that inject real environment variables instead of a file.
+try {
+  process.loadEnvFile();
+} catch {
+  /* no .env */
+}
+
 process.env.AGUKA_DATA_DIR = process.env.AGUKA_DATA_DIR || '.aguka-data';
 
 async function runQueueWorker() {

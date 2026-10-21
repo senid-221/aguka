@@ -2,6 +2,7 @@ import { AgentType, LanguagePreference, Conversation, User } from '@/lib/types';
 import { repo } from '@/lib/db/repository';
 import { sanitizeUserInput, redactSecrets } from './prompt-security';
 import { getAIProvider } from './provider-adapter';
+import { logger } from '@/lib/logging/logger';
 import {
   consumeUsage,
   evaluateAccess,
@@ -242,6 +243,31 @@ const AI_UNAVAILABLE: Record<'KINYARWANDA' | 'ENGLISH', string> = {
 };
 
 /**
+ * Image Studio advises on photo standards; it never renders or retouches a file.
+ * Checked in code instead of trusting the system prompt, because a model asked to
+ * edit a photo either pretends it did or, when the image endpoint is misconfigured,
+ * the raw provider error gets texted back to a person on WhatsApp.
+ */
+const IMAGE_PRODUCTION_MARKERS = [
+  'kora ifoto', 'kora foto', 'koraimage', 'guhindura ifoto', 'kuraho inyuma', 'isura ryiza',
+  'edit photo', 'edit my photo', 'make a photo', 'make an image', 'make me a photo',
+  'generate image', 'generate an image', 'create a photo', 'create an image',
+  'remove background', 'change background', 'resize photo', 'crop photo', 'retouch', 'photoshop',
+];
+
+export function requestsImageProduction(text: string): boolean {
+  const t = text.toLowerCase();
+  return IMAGE_PRODUCTION_MARKERS.some((marker) => t.includes(marker));
+}
+
+const IMAGE_PRODUCTION_REFUSAL: Record<'KINYARWANDA' | 'ENGLISH', string> = {
+  KINYARWANDA:
+    'Gukora ifoto no guhindura iyari isanzwe ntibikorerwa kuri iyi serivisi — ntipfusha ubushobozi bwo gukura inyuma ku ifoto cyangwa kuyihindura. Nshobora kuguha amategeko y’ifoto ya pasiporo (35x45mm, inyuma y’umweru utagira ikindi) n’inama y’ifoto ya CV. Nyamuneka koresha porogaramu y’isanisha ifoto ku dosiye yawe.',
+  ENGLISH:
+    'This service does not generate or retouch image files, so I cannot create a photo, remove its background or edit it. What I can give you: the Rwanda passport photo standards (35x45mm, plain light background) and CV portrait guidance. For the file itself, use a photo editor on your phone or computer.',
+};
+
+/**
  * Orchestrates the AI Agent execution
  */
 export interface ExecuteAgentOptions {
@@ -292,7 +318,44 @@ export async function executeAgent(
   // Update conversation active agent
   repo.setConversationAgent(conversation.id, agentType);
 
-  // 2. Entitlement gate. Charging and trial expiry are enforced here, on the
+  // 2. Image production is refused here, before entitlements and before any model
+  //    call: a refusal must not spend a trial use, must not depend on what the
+  //    model decides to claim, and does not care which service was selected —
+  //    no agent in this build can produce an image file.
+  if (requestsImageProduction(sanitization.cleanText)) {
+    const latencyMs = Date.now() - startTime;
+    repo.recordAgentRun(
+      {
+        conversationId: conversation.id,
+        agentType,
+        intentDetected: 'IMAGE_PRODUCTION_UNAVAILABLE',
+        modelUsed: 'capability-gate',
+        tokensInput: 0,
+        tokensOutput: 0,
+        latencyMs,
+        status: 'COMPLETED',
+        toolCallsCount: 0,
+      },
+      []
+    );
+
+    return {
+      agentType,
+      intent: 'IMAGE_PRODUCTION_UNAVAILABLE',
+      detectedLanguage: lang,
+      replyText: IMAGE_PRODUCTION_REFUSAL[replyLang],
+      buttons: AGENT_BUTTONS.IMAGE_STUDIO.map((b) => ({
+        id: b.id,
+        title: replyLang === 'KINYARWANDA' ? b.rw : b.en,
+      })),
+      tokensUsed: 0,
+      latencyMs,
+      modelUsed: 'capability-gate',
+      toolCalls: [],
+    };
+  }
+
+  // 3. Entitlement gate. Charging and trial expiry are enforced here, on the
   //    server, before any model call — never by asking the model to behave.
   if (service) {
     const decision = evaluateAccess(user, service);
@@ -345,7 +408,7 @@ export async function executeAgent(
     }
   }
 
-  // 3. Road Safety runs its lessons, exams and scoring deterministically in the
+  // 4. Road Safety runs its lessons, exams and scoring deterministically in the
   //    backend, so it works with or without an AI provider.
   if (agentType === 'ROAD_SAFETY_ACADEMY') {
     const flow = handleRoadSafetyMessage(user, sanitization.cleanText, replyLang);
@@ -394,7 +457,7 @@ export async function executeAgent(
     }
   }
 
-  // 4. Collect facts that the model is allowed to repeat
+  // 5. Collect facts that the model is allowed to repeat
   const toolCalls: AgentExecutionResult['toolCalls'] = [];
   const contextParts: string[] = [];
 
@@ -464,7 +527,7 @@ export async function executeAgent(
     );
   }
 
-  // 5. Ask the configured provider; never answer from a scripted reply
+  // 6. Ask the configured provider; never answer from a scripted reply
   const provider = getAIProvider();
   let replyText = '';
   let modelUsed = 'not-configured';
@@ -499,7 +562,13 @@ export async function executeAgent(
       }
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      replyText = `${AI_UNAVAILABLE[replyLang]} (${errorMsg})`;
+      // A 404 for a wrong GEMINI_MODEL, a quota message or a TLS failure is an
+      // operator detail. Keep it in the log and the agent run, not in the reply
+      // sent to a person on WhatsApp.
+      logger.error('AI_GENERATION_FAILED', err instanceof Error ? err : new Error(errorMsg), {
+        metadata: { model: provider.model, agentType, conversationId: conversation.id },
+      });
+      replyText = AI_UNAVAILABLE[replyLang];
     }
   }
 

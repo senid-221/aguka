@@ -110,6 +110,17 @@ unlocks only on an identified confirmation of a receipt.
      phone number, and the delivery result is labelled `dispatched: false`.
    - Without `GEMINI_API_KEY` the agents reply with an "AI provider not configured" notice instead of
      a scripted answer.
+   - A reply of "could not reach the AI provider" is usually the model id, not the network. The server
+     logs `AI_GENERATION_FAILED` with the provider's own message and **Settings** shows the active
+     model. `404 NOT_FOUND: Model "…" not found` means `GEMINI_MODEL` names a model that key or its
+     project cannot use: list what the key can reach from
+     `https://generativelanguage.googleapis.com/v1beta/models`, then set `GEMINI_MODEL` to one of
+     those, or issue the key in a project with the Generative Language API enabled. The provider's raw
+     error text stays in the log — it is never sent to the person on WhatsApp.
+   - Asking the assistant to make or retouch a photo is answered by a code-level refusal in the
+     language written: nothing in this build produces an image file, so the request never reaches a
+     model, never spends a trial use, and cannot come back as a provider error. The WhatsApp menu
+     calls it **Photo Standards Guidance / Amabwiriza y'ifoto** for that reason.
 
 ---
 
@@ -218,6 +229,8 @@ Tests verified:
 - Prompt injection resistance & secret credential redaction
 - Marketplace matching driven only by stored records, with full explainability on every match
 - AI provider contract (Gemini only) and its honest failure mode with no key
+- A request to generate or retouch a photo refused in code before entitlements and before any model
+  call, in the language the person wrote, with no provider error text in the reply
 - Queue enqueue and processing lifecycle, configuration parsing, logger redaction
 - BullMQ endpoint resolution: TLS from `rediss://`, credentials kept out of the reported label,
   percent-decoded userinfo, the shipped `.env.example` value and an Upstash REST URL both rejected
@@ -272,7 +285,7 @@ place.
 4. Menu order and visibility confirmed by sending a first message to the number.
 5. `MOMO_PAYEE_CODE` receives money; `PAYMENT_WEBHOOK_SECRET` shared with the provider; review queue exercised end to end (order → proof → verify → access → expiry → payment → re-access).
 6. Road safety citations re-checked against the current gazette and `REVIEW_DATE` updated.
-7. `/api/ready` and `/api/health` green, `npm test` at 26/26, and `AGUKA_DATA_DIR` on a backed-up volume.
+7. `/api/ready` and `/api/health` green, `npm test` at 27/27, and `AGUKA_DATA_DIR` on a backed-up volume.
 8. If scheduled jobs matter to you: `REDIS_URL` resolves (the health endpoint names the engine), the
    worker runs somewhere always-on, and `QUEUE_INLINE_WORKER=false` on serverless so a frozen function
    cannot hold a half-finished job.

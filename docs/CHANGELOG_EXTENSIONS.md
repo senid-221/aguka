@@ -60,3 +60,22 @@ console; none of them replace the original pipeline.
   for an always-on host instead of a serverless function.
 - Removed `lib/queue/worker.ts`, whose canned "processed" counts (142 alerts, 18 media tasks) were the
   last simulated numbers in the queue path.
+
+## Image requests and provider errors
+
+- `lib/ai/bilingual-router.ts` — `requestsImageProduction()` recognises wording that asks for a photo
+  to be created, retouched, background-stripped, resized or cropped, and `executeAgent` answers it with
+  a bilingual refusal **before** the entitlement gate and **before** any model call. The refusal
+  consumes no trial use, records `IMAGE_PRODUCTION_UNAVAILABLE` with `modelUsed: capability-gate`, and
+  does not depend on the selected service, because no agent in this build produces an image file.
+- The same file stopped appending the provider's raw error to the WhatsApp reply. A wrong
+  `GEMINI_MODEL`, a key whose project cannot reach it, or a quota rejection used to be texted to the
+  person as `… (404 NOT_FOUND: Model "…" not found)`; the reply now stays the honest
+  "could not reach the AI provider" notice while the real reason is logged as `AI_GENERATION_FAILED`
+  with the model, agent and conversation.
+- `lib/services/catalog.ts` — the `PHOTO_EDITING` service is listed in the WhatsApp menu as *Photo
+  Standards Guidance / Amabwiriza y'ifoto* instead of *Photo Editing*, which promised work the service
+  does not do. Its code is unchanged so existing selections and orders keep resolving.
+- Test `test-image-production-refusal` runs both a Kinyarwanda and an English edit request through the
+  live inbound pipeline and asserts the refusal, the language, the absence of provider error text, and
+  that a standards question is *not* refused.

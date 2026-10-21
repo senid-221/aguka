@@ -50,8 +50,8 @@ const DEFAULT_CATALOG: CatalogEntry[] = [
   },
   {
     code: 'PHOTO_EDITING',
-    nameEn: 'Photo Editing',
-    nameRw: 'Kunoza ifoto',
+    nameEn: 'Photo Standards Guidance',
+    nameRw: "Amabwiriza y'ifoto",
     descriptionEn: 'Passport and CV photo guidance',
     descriptionRw: "Amabwiriza y'ifoto ya pasiporo",
     agentType: 'IMAGE_STUDIO',
