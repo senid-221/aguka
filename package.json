@@ -1,5 +1,6 @@
 {
-  "name": "ai-studio-applet",
+  "name": "aguka-ai",
+  "description": "Bilingual Kinyarwanda and English WhatsApp AI agent platform for Rwanda.",
   "version": "0.1.0",
   "private": true,
   "scripts": {
