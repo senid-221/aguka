@@ -91,7 +91,25 @@ export function parseAndValidateConfig(env: NodeJS.ProcessEnv = process.env): Co
   const isGeminiLive = Boolean(geminiApiKey && geminiApiKey !== 'MY_GEMINI_API_KEY');
 
   if (!isGeminiLive) {
-    warnings.push('GEMINI_API_KEY is not set or using placeholder; agents reply with an AI-not-configured notice.');
+    warnings.push(
+      'GEMINI_API_KEY is not set or using placeholder. Without it OpenAI answers first if it is configured, and with neither key the reply is an honest AI-not-configured notice.'
+    );
+  }
+
+  // Text provider chain: Gemini answers, OpenAI rescues.
+  const openAiTextKey = (env.OPENAI_API_KEY || '').trim();
+  const isOpenAiLive = Boolean(
+    openAiTextKey && !openAiTextKey.toLowerCase().includes('replace_with') && !openAiTextKey.toLowerCase().includes('your_')
+  );
+  if (isGeminiLive && !isOpenAiLive) {
+    warnings.push(
+      'Only one text provider is configured. A Gemini rate limit, timeout or blocked answer then has no rescue, and the person on WhatsApp is told the assistant could not get an answer. Set OPENAI_API_KEY to arm one.'
+    );
+  }
+  if (isOpenAiLive && !isGeminiLive) {
+    warnings.push(
+      'Only one text provider is configured. Every reply depends on OpenAI alone, with no rescue behind it. Set GEMINI_API_KEY to add one.'
+    );
   }
 
   // Database
@@ -130,7 +148,9 @@ export function parseAndValidateConfig(env: NodeJS.ProcessEnv = process.env): Co
     warnings.push('PAYMENT_WEBHOOK_SECRET is not set: POST /api/payments/webhook rejects all callbacks.');
   }
   if (!ocrConfigured) {
-    warnings.push('OPENAI_API_KEY is not set: receipt screenshots are still hash- and metadata-checked, but their text cannot be read.');
+    warnings.push(
+      'OPENAI_API_KEY is not set: receipt screenshots are still hash- and metadata-checked but their text cannot be read, and the reply chain has no rescue provider behind Gemini.'
+    );
   }
   if (autoVerifyEnabled && !providerEndpointConfigured) {
     warnings.push('PAYMENT_AUTO_VERIFY is on but no reconciliation endpoint exists, so auto-verification can never trigger.');
@@ -227,5 +247,10 @@ export function getEnvPresence(env: NodeJS.ProcessEnv = process.env): Record<str
     PAYMENT_WEBHOOK_SECRET: present('PAYMENT_WEBHOOK_SECRET'),
     PAYMENT_AUTO_VERIFY: present('PAYMENT_AUTO_VERIFY'),
     AGUKA_DATA_DIR: present('AGUKA_DATA_DIR'),
+    OPENAI_IMAGE_MODEL: present('OPENAI_IMAGE_MODEL'),
+    OPENAI_TEXT_MODEL: present('OPENAI_TEXT_MODEL'),
+    GEMINI_IMAGE_MODEL: present('GEMINI_IMAGE_MODEL'),
+    PASSPORT_PHOTO_WIDTH: present('PASSPORT_PHOTO_WIDTH'),
+    IMAGE_RETENTION_DAYS: present('IMAGE_RETENTION_DAYS'),
   };
 }

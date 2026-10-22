@@ -1,15 +1,28 @@
 import { AgentType, Conversation, LanguagePreference, User } from '@/lib/types';
 import { repo } from '@/lib/db/repository';
-import { AgentExecutionResult, detectLanguage, executeAgent } from '@/lib/ai/bilingual-router';
+import {
+  AgentExecutionResult,
+  buildStudioReply,
+  detectLanguage,
+  executeAgent,
+  IMAGE_STUDIO_FAILED,
+  IMAGE_STUDIO_OFF,
+  requestsImageProduction,
+} from '@/lib/ai/bilingual-router';
 import { ensureCatalogSeeded, getService } from '@/lib/services/catalog';
-import { evaluateAccess, isChargeable, type ReplyLanguage } from '@/lib/services/entitlements';
+import { buildAccessReply, consumeUsage, evaluateAccess, isChargeable, type ReplyLanguage } from '@/lib/services/entitlements';
 import { applySelection, buildServiceMenu, matchServiceFromReply, rowIdFor, ServiceMenu, wantsMenu } from '@/lib/services/selection';
 import { attachPaymentProof, createOrder, paymentInstructions } from '@/lib/payments/orders';
+import { resolveImageCapability } from '@/lib/images/provider';
+import { attachmentOf, runImageStudio, type ImageAttachment } from '@/lib/images/studio';
+import { logger } from '@/lib/logging/logger';
 
 export interface InboundOutcome {
   replyText: string;
   buttons?: Array<{ id: string; title: string }>;
   listMenu?: ServiceMenu;
+  /** A file the studio produced that still has to be uploaded and sent. */
+  image?: ImageAttachment;
   agentType: AgentType;
   intent: string;
   tokensUsed: number;
@@ -211,6 +224,7 @@ export async function handleIncomingText(
   return {
     replyText: agentResult.replyText,
     buttons: agentResult.buttons,
+    image: agentResult.image,
     agentType: agentResult.agentType,
     intent: agentResult.intent,
     tokensUsed: agentResult.tokensUsed,
@@ -250,17 +264,26 @@ function describeOrder(reference: string, status: string, risk: string | null, l
 }
 
 /**
- * A screenshot sent on WhatsApp is attached to the user's open order and routed
- * to review. The reply never claims the payment was accepted.
+ * An inbound photo is either a payment screenshot or the photo someone wants
+ * retouched. The caption decides: wording that asks for a picture goes to the
+ * studio with the uploaded bytes as the reference, anything else is treated as a
+ * receipt and queued for review. A reply never claims a payment was accepted.
  */
 export async function handleIncomingImage(
   user: User,
   conversation: Conversation,
   buffer: Buffer,
   fileName: string,
-  mimeType: string
+  mimeType: string,
+  caption?: string
 ): Promise<InboundOutcome> {
   const lang: ReplyLanguage = user.preferredLang === 'ENGLISH' ? 'ENGLISH' : 'KINYARWANDA';
+  const ask = String(caption || '').trim();
+  if (ask && requestsImageProduction(ask)) {
+    // The caption is the message the person just wrote, so it decides the reply
+    // language instead of a preference set by an earlier turn.
+    return retouchUploadedImage(user, conversation, buffer, mimeType, ask, replyLangOf(ask, user));
+  }
   const pick = (en: string, rw: string) => (lang === 'ENGLISH' ? en : rw);
   const open = repo
     .getPaymentOrdersForUser(user.id)
@@ -313,4 +336,103 @@ export async function handleIncomingImage(
       modelUsed: 'payments',
     };
   }
+}
+
+/**
+ * Retouches the photo the person just sent. The uploaded bytes stay in memory:
+ * they are handed to the provider as the reference and only the generated result
+ * is written to the private data directory.
+ */
+async function retouchUploadedImage(
+  user: User,
+  conversation: Conversation,
+  buffer: Buffer,
+  mimeType: string,
+  ask: string,
+  lang: ReplyLanguage
+): Promise<InboundOutcome> {
+  const started = Date.now();
+  const capability = resolveImageCapability();
+  const studioButtons = [{ id: 'btn_passport_specs', title: lang === 'KINYARWANDA' ? 'Amategeko ya pasiporo' : 'Passport Standards' }];
+
+  if (!capability.configured) {
+    return {
+      replyText: IMAGE_STUDIO_OFF[lang],
+      buttons: studioButtons,
+      agentType: 'IMAGE_STUDIO',
+      intent: 'IMAGE_STUDIO_NOT_CONFIGURED',
+      tokensUsed: 0,
+      modelUsed: 'capability-gate',
+    };
+  }
+
+  const serviceCode = activeServiceCode(user, conversation);
+  const service = serviceCode ? getService(serviceCode) : undefined;
+  if (service) {
+    const decision = evaluateAccess(user, service);
+    if (!decision.allowed) {
+      return {
+        replyText: buildAccessReply(service, decision, lang),
+        agentType: service.agentType,
+        intent: `ACCESS_${decision.denialReason ?? 'DENIED'}`,
+        tokensUsed: 0,
+        modelUsed: 'access-control',
+      };
+    }
+  }
+
+  const studio = await runImageStudio({
+    userId: user.id,
+    userName: user.fullName || 'User',
+    request: ask,
+    reference: { buffer, mimeType },
+  });
+  const latencyMs = Date.now() - started;
+
+  if (!studio.ok) {
+    logger.error('IMAGE_STUDIO_FAILED', new Error(studio.error), {
+      metadata: { provider: studio.provider, model: studio.model, userId: user.id, conversationId: conversation.id },
+    });
+    return {
+      replyText: IMAGE_STUDIO_FAILED[lang],
+      buttons: studioButtons,
+      agentType: 'IMAGE_STUDIO',
+      intent: 'IMAGE_STUDIO_FAILED',
+      tokensUsed: 0,
+      modelUsed: studio.model || capability.model,
+    };
+  }
+
+  if (service) consumeUsage(user, service.code);
+  repo.recordAgentRun(
+    {
+      conversationId: conversation.id,
+      agentType: 'IMAGE_STUDIO',
+      intentDetected: 'IMAGE_STUDIO_PRODUCED',
+      modelUsed: studio.model,
+      tokensInput: 0,
+      tokensOutput: 0,
+      latencyMs,
+      status: 'COMPLETED',
+      toolCallsCount: 1,
+    },
+    [
+      {
+        toolName: 'image_studio_render',
+        arguments: { provider: studio.provider, reference: 'inbound-photo', bytes: buffer.byteLength },
+        result: { taskId: studio.taskId, width: studio.width, height: studio.height, sizeBytes: studio.sizeBytes },
+        latencyMs,
+        redacted: true,
+      },
+    ]
+  );
+
+  return {
+    replyText: buildStudioReply(lang, studio.width, studio.height, studio.taskId, studio.expiresAt),
+    image: attachmentOf(studio),
+    agentType: 'IMAGE_STUDIO',
+    intent: 'IMAGE_STUDIO_PRODUCED',
+    tokensUsed: 0,
+    modelUsed: studio.model,
+  };
 }

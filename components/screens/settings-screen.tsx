@@ -19,8 +19,23 @@ interface ReadinessPayload {
     configuration: { status: string; warnings: string[] };
     database: { status: string; provider: string; latencyMs: number | null };
     queue: { status: string; mode: string; pendingJobs: number; activeWorkers: number; error?: string };
-    aiProvider: { status: string; provider: string; model: string };
+    aiProvider: {
+      status: string;
+      provider: string;
+      model: string;
+      order: Array<{ provider: 'gemini' | 'openai'; model: string }>;
+      rescueConfigured: boolean;
+      attemptsPerProvider: number;
+      budgetMs: number;
+    };
     whatsappWebhook: { status: string; mode: string; verified: boolean };
+    imageStudio: {
+      status: string;
+      provider: 'openai' | 'gemini' | 'none';
+      model: string | null;
+      output: string;
+      retentionDays: number;
+    };
     payments: {
       status: string;
       payeeName: string;
@@ -48,8 +63,13 @@ interface ReadinessPayload {
 }
 
 const ENV_LABELS: Array<{ name: string; note: string }> = [
-  { name: 'GEMINI_API_KEY', note: 'Required for any agent reply' },
-  { name: 'OPENAI_API_KEY', note: 'Reads text out of MoMo receipt screenshots (vision OCR)' },
+  { name: 'GEMINI_API_KEY', note: 'Primary text provider — answers almost every agent reply' },
+  { name: 'OPENAI_TEXT_MODEL', note: 'Rescue text model when Gemini is rate-limited or down (defaults to gpt-4o)' },
+  { name: 'OPENAI_API_KEY', note: 'Adds the OpenAI text rescue, reads text out of MoMo receipt screenshots (vision OCR) and renders studio photos' },
+  { name: 'OPENAI_IMAGE_MODEL', note: 'Optional studio model when using OpenAI (defaults to gpt-image-1)' },
+  { name: 'GEMINI_IMAGE_MODEL', note: 'Optional studio model when only a Google key is set (defaults to gemini-2.5-flash-image)' },
+  { name: 'PASSPORT_PHOTO_WIDTH', note: 'Pixel width of every studio output; height follows the 35x45mm ratio (default 700)' },
+  { name: 'IMAGE_RETENTION_DAYS', note: 'Days a generated photo is kept before the retention sweep deletes the file (default 30)' },
   { name: 'WHATSAPP_PHONE_NUMBER_ID', note: 'Meta number that sends replies' },
   { name: 'WHATSAPP_ACCESS_TOKEN', note: 'Cloud API bearer token' },
   { name: 'WHATSAPP_VERIFY_TOKEN', note: 'Must match Meta webhook setup' },
@@ -325,6 +345,72 @@ export function SettingsScreen() {
             }`}
           >
             {readiness?.checks.persistence.productionDatabase.applied ? 'PostgreSQL live' : 'file store is authoritative'}
+          </span>
+        </div>
+      </div>
+
+      {/* Text provider chain */}
+      <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-2">
+        <h2 className="text-sm font-bold text-white">Text Providers</h2>
+        <p className="text-xs text-zinc-400 leading-relaxed">
+          Gemini answers first. A rate limit, a timeout, a blocked or empty answer is retried{' '}
+          {readiness?.checks.aiProvider.attemptsPerProvider ?? 2} time(s) and then handed to the rescue
+          provider, so one outage does not become ‘Aguka AI could not reply’ for the person on
+          WhatsApp. Without a rescue key, the second provider does not exist and every Gemini blip
+          still fails.
+        </p>
+        <div className="flex flex-wrap gap-2 text-[10px] font-mono">
+          {(readiness?.checks.aiProvider.order.length
+            ? readiness.checks.aiProvider.order
+            : [{ provider: 'none', model: 'no key configured' }]
+          ).map((p, i) => (
+            <span
+              key={`${p.provider}-${p.model}`}
+              className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300"
+            >
+              {i === 0 ? 'answers' : 'rescue'}: {p.provider}:{p.model}
+            </span>
+          ))}
+          <span className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300">
+            budget: {readiness?.checks.aiProvider.budgetMs ?? 12000}ms
+          </span>
+          <span
+            className={`px-2 py-1 rounded border font-semibold ${
+              readiness?.checks.aiProvider.rescueConfigured
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {readiness?.checks.aiProvider.rescueConfigured ? 'Rescue armed' : 'No rescue provider'}
+          </span>
+        </div>
+      </div>
+
+      {/* Image Studio capability */}
+      <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-2">
+        <h2 className="text-sm font-bold text-white">Image Studio</h2>
+        <p className="text-xs text-zinc-400 leading-relaxed">
+          A request to make or retouch a photo is rendered by a real image provider and cropped in
+          code to {readiness?.checks.imageStudio.output ?? 'the passport ratio'}. With no key set, the
+          WhatsApp reply says the studio is unavailable instead of pretending a file was made.
+          Generated files live in the private data directory and are deleted after{' '}
+          {readiness?.checks.imageStudio.retentionDays ?? 30} days by the retention sweep.
+        </p>
+        <div className="flex flex-wrap gap-2 text-[10px] font-mono">
+          <span className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300">
+            provider: {readiness ? readiness.checks.imageStudio.provider : '…'}
+          </span>
+          <span className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300">
+            model: {readiness?.checks.imageStudio.model ?? 'not selected'}
+          </span>
+          <span
+            className={`px-2 py-1 rounded border font-semibold ${
+              readiness?.checks.imageStudio.status === 'PASS'
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {readiness?.checks.imageStudio.status === 'PASS' ? 'Studio renders photos' : 'Studio not configured'}
           </span>
         </div>
       </div>

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
-import { getAIProvider } from '@/lib/ai/provider-adapter';
+import { generateText, chainSummary } from '@/lib/ai/provider-adapter';
 import { LanguagePreference, QuizItem } from '@/lib/types';
+import { logger } from '@/lib/logging/logger';
 
 const TUTOR_SYSTEM_INSTRUCTION =
   'You are a tutor for Rwandan students. Explain the requested concept accurately and simply. ' +
@@ -57,11 +58,14 @@ export async function POST(request: NextRequest) {
     }
 
     const preferred: LanguagePreference = language === 'ENGLISH' ? 'ENGLISH' : 'KINYARWANDA';
-    const provider = getAIProvider();
+    const chain = chainSummary();
 
-    if (!provider) {
+    if (!chain.configured) {
       return NextResponse.json(
-        { error: 'GEMINI_API_KEY is not configured on this server, so no lesson can be generated.' },
+        {
+          error:
+            'No AI provider key is configured on this server (GEMINI_API_KEY, or OPENAI_API_KEY as the rescue), so no lesson can be generated.',
+        },
         { status: 503 }
       );
     }
@@ -81,14 +85,20 @@ export async function POST(request: NextRequest) {
     const sessionId = `study-${Date.now()}`;
 
     try {
-      const generated = await provider.generateResponse(prompt, TUTOR_SYSTEM_INSTRUCTION, { json: true });
+      const generated = await generateText(prompt, TUTOR_SYSTEM_INSTRUCTION, { json: true });
       const parsed = JSON.parse(generated.text) as Record<string, unknown>;
       notes = typeof parsed.notes === 'string' ? parsed.notes : generated.text;
       quizzes = toQuizzes(parsed.quizzes, sessionId);
     } catch (err: unknown) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error('AI_GENERATION_FAILED', err instanceof Error ? err : new Error(String(err)), {
+        metadata: { route: 'study', order: chain.order.map((p) => `${p.provider}:${p.model}`).join(' → ') },
+      });
       return NextResponse.json(
-        { error: `The tutor could not produce a lesson: ${errorMsg}` },
+        {
+          error: `No tutor answer arrived from ${chain.order
+            .map((p) => `${p.provider}:${p.model}`)
+            .join(' then ')}. The lesson was not stored.`,
+        },
         { status: 502 }
       );
     }

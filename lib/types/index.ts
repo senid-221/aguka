@@ -308,6 +308,23 @@ export interface SystemHealth {
     model: string;
     bilingualKinyarwandaSupport: boolean;
   };
+  textChain: {
+    configured: boolean;
+    /** Providers in answer order: the first is the primary, the rest are rescues. */
+    order: Array<{ provider: 'gemini' | 'openai'; model: string }>;
+    rescueConfigured: boolean;
+    attemptsPerProvider: number;
+    budgetMs: number;
+  };
+  imageStudio: {
+    configured: boolean;
+    provider: 'openai' | 'gemini' | 'none';
+    mode: 'PROVIDER_RENDERED' | 'NOT_CONFIGURED';
+    model: string | null;
+    /** The shape every produced file is cropped to, in pixels. */
+    output: string;
+    retentionDays: number;
+  };
   stats: {
     totalUsers: number;
     conversations: number;

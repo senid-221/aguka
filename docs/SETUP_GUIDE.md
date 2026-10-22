@@ -13,7 +13,7 @@
   1. **Job Finder**: boards are registered (MIFOTRA, Job in Rwanda, remote) but no live crawler runs yet; listings appear only after a real crawl or a manual `POST /api/jobs` with a source URL. Zero invented listings.
   2. **Career Assistant**: bilingual CV, cover letter and interview-prep text from the model; explicit application consent required
   3. **Coding Agent**: scaffolds, debugging and architecture explanations returned as text. There is no execution sandbox and submitted code is never run.
-  4. **Passport & Image Studio**: written guidance on the 35x45mm passport standard; no image editing runs in this service. A retention sweep flags expired media records.
+  4. **Passport & Image Studio**: written guidance on the 35x45mm passport standard, and — when `OPENAI_API_KEY` or `GEMINI_API_KEY` is configured — a real render cropped to 35:45 with `sharp`, stored privately under `AGUKA_DATA_DIR` and delivered as a WhatsApp image. Model ids are `OPENAI_IMAGE_MODEL` and `GEMINI_IMAGE_MODEL`. Without an image key the request is refused in code before any model call. A retention sweep deletes expired photo files.
   5. **Bilingual Study Tutor**: STEM and language explanations in Kinyarwanda and English, plus generated quizzes
   6. **Employment Marketplace**: worker profiles, vacancies and match scores computed from stored skills, location and experience
   7. **Road Safety Academy**: bilingual lessons, road signs, practice questions and mock exams scored server-side, with progress tracking and an admin curriculum editor
@@ -117,10 +117,74 @@ unlocks only on an identified confirmation of a receipt.
      `https://generativelanguage.googleapis.com/v1beta/models`, then set `GEMINI_MODEL` to one of
      those, or issue the key in a project with the Generative Language API enabled. The provider's raw
      error text stays in the log — it is never sent to the person on WhatsApp.
-   - Asking the assistant to make or retouch a photo is answered by a code-level refusal in the
-     language written: nothing in this build produces an image file, so the request never reaches a
-     model, never spends a trial use, and cannot come back as a provider error. The WhatsApp menu
-     calls it **Photo Standards Guidance / Amabwiriza y'ifoto** for that reason.
+   - Asking the assistant to make or retouch a photo goes to the **image studio** (section 5.1). With
+     no image key configured it is refused in code before the model call, in the language written, and
+     no trial use is spent; the reply still carries the passport standards.
+
+### 5.1 Image Studio: keys, cost and privacy
+
+`lib/images/provider.ts` picks the model, `lib/images/studio.ts` crops and stores the result.
+
+| Condition | What happens to a photo request |
+| --- | --- |
+| `OPENAI_API_KEY` set | Renders with `OPENAI_IMAGE_MODEL` (default `gpt-image-1`) — generation from a description, or an edit with the uploaded photo as the reference. |
+| No OpenAI key, `GEMINI_API_KEY` set | Renders with `GEMINI_IMAGE_MODEL` (default `gemini-2.5-flash-image`) through `generateContent`. |
+| Neither key | Refused before any call: `IMAGE_STUDIO_NOT_CONFIGURED`, usage untouched, and the person gets the written 35×45 mm standards instead. |
+
+- **Cost.** Every render is a paid image API call, unlike a text reply. `consumeUsage()` runs only
+  after a successful image, so a provider failure logs `IMAGE_STUDIO_FAILED` and is not billed to the
+  user's quota. Keep the studio off the free services you bill for until you have priced it.
+- **Geometry.** Output is cropped with `sharp` to exactly 35:45 at `PASSPORT_PHOTO_WIDTH` px
+  (default 700, so 700×900). Passport standards are printed size, not pixels — the JPEG is a correct
+  ratio a printer can scale, not a guarantee that a submission portal accepts it.
+- **Privacy.** Bytes go through `durableStore.saveBinary` into the private binary directory under
+  `AGUKA_DATA_DIR` — outside the web root, never in the JSON snapshot — and are read back only by the
+  token-gated `/api/admin/media/image` route or attached to the WhatsApp message. The uploaded photo
+  used as a retouch reference is **not** stored — the task records
+  `input:person-uploaded-photo-not-stored`. A description-only request is prompted as a synthetic
+  portrait, never a likeness of a real individual.
+- **Retention.** `IMAGE_RETENTION_DAYS` (default 30) is written onto the task; the sweep in
+  `lib/maintenance/retention.ts` deletes the file and rewrites the record as `purged:<key>`, so the
+  admin screen says the photo is gone instead of showing a broken thumbnail. Set it to the shortest
+  period your DPPA purposes note can defend.
+- **Delivery.** The rendered JPEG is uploaded to Meta (`POST /{phoneNumberId}/media`, 5 MB cap) and
+  sent as a WhatsApp `image` message. If the upload fails the person still gets the text answer with
+  a plain note that the file could not be attached, and the server logs `IMAGE_DELIVERY_FAILED`.
+
+### 5.2 Text providers: Gemini first, OpenAI as the rescue
+
+`lib/ai/provider-adapter.ts` owns every text reply — the WhatsApp assistant, the coding
+route and the study route all call `generateText()`. The chain is rebuilt per request from
+the keys that are actually set, so fixing the environment takes effect without a restart.
+
+| Condition | What happens to a reply |
+| --- | --- |
+| `GEMINI_API_KEY` + `OPENAI_API_KEY` | Gemini answers first. A 429, timeout, dropped connection, blocked candidate or empty answer is retried once on Gemini, then the same prompt goes to OpenAI (`OPENAI_TEXT_MODEL`, default `gpt-4o`). |
+| `GEMINI_API_KEY` only | Gemini answers, retried once. Config validation warns that there is no rescue: a bad minute from one provider is the whole outage. |
+| `OPENAI_API_KEY` only | OpenAI answers first and is retried once. |
+| Neither | No call is made. The person gets the not-configured notice naming both variables, `modelUsed` is `not-configured`, and no usage is charged. |
+
+- **Budget.** Two attempts per provider, a 12-second ceiling for the whole chain and a
+  20-second cap on any single HTTP call. That is deliberate: the `@google/genai` SDK retries
+  a 429 five times with up to a 60-second delay by default, which held the Meta webhook open
+  long past the host timeout and is why the service looked like it answered only every other
+  message. `lib/gemini.ts` sets `retryOptions: { attempts: 1 }` so retry belongs to the chain.
+- **Fail fast on the failures that will not heal.** A 401, 403, 404 or 451 — dead key, wrong
+  model id — goes to the rescue provider immediately instead of spending the retry budget. A
+  safety block or an empty candidate does the same: it is that provider's judgement of that
+  prompt, not a blip.
+- **What the person sees.** Nothing about the provider. A total outage is
+  `AI_UNAVAILABLE` in the language written: no answer, nothing counted against usage, try
+  again in a moment. The attempt lines (provider, model, outcome, status, first 160 characters
+  of the provider message, secrets redacted) are logged under `AI_GENERATION_FAILED` with the
+  chain order, and a rescue answer is logged as `AI_PROVIDER_FELLED_BACK` at warn level.
+- **Where to look.** `/api/health` and `/api/ready` report `textChain` — order,
+  `rescueConfigured`, `attemptsPerProvider`, `budgetMs` — and the admin Settings screen shows
+  the same as a Text Providers panel with the live chain (`gemini-2.5-flash → gpt-4o`) on the
+  dashboard. If that panel says *No rescue provider*, `OPENAI_API_KEY` is missing or is still
+  the `.env.example` placeholder, which is rejected on purpose.
+- **Cost.** Gemini carries the traffic; OpenAI is only billed for the replies Gemini could
+  not give, which is also the record of how often the primary is failing.
 
 ---
 
@@ -131,8 +195,9 @@ Two layers, reported separately by `/api/ready`:
 **Durable file store (active now).** `lib/db/store.ts` serializes users, service selections,
 entitlements, trial grants, payment orders, receipt proofs, road safety content and audit entries into
 an atomic, versioned snapshot (`repository-snapshot.json`) under `AGUKA_DATA_DIR`, default
-`.aguka-data/`, written through a temp file and `renameSync`. Proofs are stored as binaries in
-`AGUKA_DATA_DIR/proofs`, never inside the snapshot and never under `public/`. This survives a restart;
+`.aguka-data/`, written through a temp file and `renameSync`. Receipt proofs and studio renders are
+stored as binaries in the private `AGUKA_DATA_DIR/proofs` directory, never inside the snapshot and
+never under `public/`. This survives a restart;
 in-flight agent runs do not, and queue jobs survive it only once BullMQ has a Redis to live in. Point
 `AGUKA_DATA_DIR` at a persistent volume, keep it out
 of version control (`.gitignore` already excludes it), and back it up — it holds personal data, so a
@@ -228,9 +293,23 @@ Tests verified:
 - Specialized multi-agent intent routing
 - Prompt injection resistance & secret credential redaction
 - Marketplace matching driven only by stored records, with full explainability on every match
-- AI provider contract (Gemini only) and its honest failure mode with no key
-- A request to generate or retouch a photo refused in code before entitlements and before any model
-  call, in the language the person wrote, with no provider error text in the reply
+- AI provider contract (Gemini primary, no mock fallback) and its honest failure mode with no key
+- Text provider chain against injected providers: a rate limit retried once on the same provider, a
+  dead model id or a blocked answer handed to the rescue immediately without burning the budget, an
+  outage across both throwing with a redacted four-line attempt summary, the order Gemini → OpenAI,
+  a rescue only when a real key exists, and the retry budget kept inside what a user will wait
+- The rescue provider over a stubbed HTTP transport (nothing leaves the machine): a 429 retried once
+  then reported as an outage, a successful answer keeping its token count and sending the system
+  instruction plus the JSON format, and a server with no key at all refusing in both languages
+  without naming a credential, an endpoint or charging usage
+- Image studio with no provider key: photo request refused in code before entitlements and before any
+  model call, in the language the person wrote, with no provider error text in the reply, no usage
+  charged, and an uploaded photo plus a caption not filed as a payment proof
+- Image provider selection (OpenAI preferred, Gemini fallback, refusal with neither) and the output
+  contract: 35:45 geometry, configurable width, retention clamped to a defensible range
+- Retention sweep deleting the expired photo file, not just the record
+- WhatsApp image payload shape, caption cap, and the upload guards that refuse missing credentials or
+  zero-byte images
 - Queue enqueue and processing lifecycle, configuration parsing, logger redaction
 - BullMQ endpoint resolution: TLS from `rediss://`, credentials kept out of the reported label,
   percent-decoded userinfo, the shipped `.env.example` value and an Upstash REST URL both rejected
@@ -272,6 +351,10 @@ EXPOSE 3000
 CMD ["npm", "start"]
 ```
 
+`sharp` normally ships a prebuilt binary, so this works as-is. If the studio logs
+`IMAGE_CROP_FAILED` on an Alpine host, install the runtime library it links against:
+`RUN apk add --no-cache vips-dev`.
+
 Mount a persistent volume at the `AGUKA_DATA_DIR` path and pass the environment variables from
 `.env.example` through your platform's secret store. On Render or similar, set
 `MOMO_PAYEE_NAME` / `MOMO_PAYEE_CODE` before any paid service is enabled; leave
@@ -285,7 +368,16 @@ place.
 4. Menu order and visibility confirmed by sending a first message to the number.
 5. `MOMO_PAYEE_CODE` receives money; `PAYMENT_WEBHOOK_SECRET` shared with the provider; review queue exercised end to end (order → proof → verify → access → expiry → payment → re-access).
 6. Road safety citations re-checked against the current gazette and `REVIEW_DATE` updated.
-7. `/api/ready` and `/api/health` green, `npm test` at 27/27, and `AGUKA_DATA_DIR` on a backed-up volume.
+7. `/api/ready` and `/api/health` green, `npm test` at 33/33, and `AGUKA_DATA_DIR` on a backed-up volume.
 8. If scheduled jobs matter to you: `REDIS_URL` resolves (the health endpoint names the engine), the
    worker runs somewhere always-on, and `QUEUE_INLINE_WORKER=false` on serverless so a frozen function
    cannot hold a half-finished job.
+9. If the studio is enabled for a paid service: `/api/health` names the provider and model it will
+   call, `IMAGE_RETENTION_DAYS` is the shortest period your DPPA purposes note can defend, and you have
+   priced the per-render API cost into the service. A rendered photo is a real image of a real person
+   sitting on your volume — the sweep, the backup and the deletion request all have to reach it.
+10. Settings shows **Rescue armed** with the chain you expect (`gemini-2.5-flash → gpt-4o`). If it
+    says *No rescue provider*, set `OPENAI_API_KEY`: one provider means every 429 or slow minute from
+    that API is an outage for the person on WhatsApp. After a day of live traffic, grep the log for
+    `AI_PROVIDER_FELLED_BACK` — the rate at which the rescue answers is how often the primary is
+    failing, and a chain that never falls back is also worth checking.

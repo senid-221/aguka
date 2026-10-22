@@ -89,7 +89,8 @@ export function StudyScreen() {
             <span>AI Tutoring & Bilingual Concept Engine</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Lessons and concept checks are written by Gemini at request time. Nothing is pre-written:
+            Lessons and concept checks are written by the text chain — Gemini first, OpenAI as the
+            rescue — at request time. Nothing is pre-written:
             with no API key the tutor returns a configuration error instead of a canned lesson.
           </p>
         </div>

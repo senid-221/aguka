@@ -1,10 +1,23 @@
-import { verifyWebhookChallenge, verifyMetaSignature } from '@/lib/whatsapp/gateway';
+import { verifyWebhookChallenge, verifyMetaSignature, buildImageMessage, uploadWhatsAppMedia } from '@/lib/whatsapp/gateway';
 import { detectLanguage, classifyIntent, requestsImageProduction } from '@/lib/ai/bilingual-router';
 import { sanitizeUserInput, redactSecrets } from '@/lib/ai/prompt-security';
 import { repo } from '@/lib/db/repository';
 import { parseAndValidateConfig } from '@/lib/config';
 import { logger } from '@/lib/logging/logger';
-import { getAIProvider, GeminiAIProvider } from '@/lib/ai/provider-adapter';
+import {
+  getAIProvider,
+  GeminiAIProvider,
+  runTextChain,
+  generateText,
+  chainSummary,
+  openAITextModel,
+  classifyStatus,
+  classifyThrown,
+  AllTextProvidersFailed,
+  ProviderAttemptError,
+  type IAIProvider,
+  type AIProviderResponse,
+} from '@/lib/ai/provider-adapter';
 import { GEMINI_MODEL } from '@/lib/gemini';
 import { queueService } from '@/lib/queue/redis-queue';
 import { resolveRedisEndpoint } from '@/lib/queue/redis-connection';
@@ -27,7 +40,11 @@ import {
   verifyPayment,
 } from '@/lib/payments/orders';
 import { durableStore } from '@/lib/db/store';
-import { handleIncomingText } from '@/lib/whatsapp/inbound';
+import { handleIncomingImage, handleIncomingText } from '@/lib/whatsapp/inbound';
+import { resolveImageCapability } from '@/lib/images/provider';
+import { buildStudioPrompt } from '@/lib/images/studio';
+import { imageRetentionDays, passportHeightPx, passportWidthPx } from '@/lib/images/spec';
+import { runRetentionCleanup } from '@/lib/maintenance/retention';
 import { importContentPack } from '@/lib/road-safety/content-pack';
 import {
   extractAnswerIndexes,
@@ -49,6 +66,27 @@ export interface TestResultItem {
   expected: string;
   actual: string;
   durationMs: number;
+}
+
+/**
+ * Runs a check with environment variables replaced — `null` deletes one — then
+ * restores them. Without this, a developer's real .env would make the suite call a
+ * paid image API or upload to a live WhatsApp number: the suite stays offline.
+ */
+async function withEnv<T>(changes: Record<string, string | null>, fn: () => Promise<T>): Promise<T> {
+  const saved: Array<[string, string | undefined]> = Object.keys(changes).map((n) => [n, process.env[n]]);
+  for (const [name, value] of Object.entries(changes)) {
+    if (value === null) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 }
 
 export async function runPlatformTestSuiteAsync(): Promise<{
@@ -291,9 +329,10 @@ export async function runPlatformTestSuiteAsync(): Promise<{
   results.push({
     id: 'test-ai-provider-adapter',
     category: 'AI Orchestrator',
-    name: 'AI Provider Adapter Contract (Gemini only, no mock fallback)',
+    name: 'AI Provider Adapter Contract (Gemini primary, no mock fallback)',
     passed: contractAdhered && unavailableBehaviorOk,
-    expected: 'Gemini contract adhered; with no key getAIProvider() is null, healthCheck fails and generation throws',
+    expected:
+      'Gemini contract adhered; with no key getTextProviders() is empty, getAIProvider() is null, healthCheck fails and generation throws',
     actual: `contract=${contractAdhered}, model=${geminiProvider.model}, ${unavailableDetail}`,
     durationMs: Date.now() - t12Start,
   });
@@ -737,47 +776,465 @@ export async function runPlatformTestSuiteAsync(): Promise<{
     durationMs: Date.now() - t25Start,
   });
 
-  // Test 27: A request to produce or retouch an image is refused in code, never
-  // by letting a text model claim it edited a photo or leak its own error.
+  // Test 27: With no image provider configured, a request to make or retouch a
+  // photo is answered by the studio gate — in code, with no model call, no render,
+  // no stored file and no trial use spent. A standards question is not gated.
   const t26Start = Date.now();
   const photoUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 60).slice(-8)}`, 'Suite Photo User');
   const photoConv = repo.getOrCreateConversation(photoUser.id);
   applySelection(photoUser, photoConv, getService('PHOTO_EDITING')!, 'ENGLISH');
-  const refusalRw = await handleIncomingText(
-    repo.getUserById(photoUser.id)!,
-    photoConv,
-    'Kora ifoto yanjye ya pasiporo, ukureho inyuma'
-  );
-  const refusalEn = await handleIncomingText(
-    repo.getUserById(photoUser.id)!,
-    photoConv,
-    'Please edit my photo and remove the background'
-  );
-  const guidanceTurn = await handleIncomingText(
-    repo.getUserById(photoUser.id)!,
-    photoConv,
-    'What are the passport photo standards?'
-  );
-  const photoRefusalOk =
+  const tasksBefore = repo.getMediaTasks().length;
+  const studioGate = await withEnv({ OPENAI_API_KEY: null, GEMINI_API_KEY: null }, async () => {
+    const refusalRw = await handleIncomingText(
+      repo.getUserById(photoUser.id)!,
+      photoConv,
+      'Kora ifoto yanjye ya pasiporo, ukureho inyuma'
+    );
+    const refusalEn = await handleIncomingText(
+      repo.getUserById(photoUser.id)!,
+      photoConv,
+      'Please edit my photo and remove the background'
+    );
+    const guidanceTurn = await handleIncomingText(
+      repo.getUserById(photoUser.id)!,
+      photoConv,
+      'What are the passport photo standards?'
+    );
+    // A photo sent with retouching words is a studio request, not a receipt.
+    const uploadTurn = await handleIncomingImage(
+      repo.getUserById(photoUser.id)!,
+      photoConv,
+      Buffer.from('not-a-real-jpeg-but-a-buffer'),
+      'suite-photo.jpg',
+      'image/jpeg',
+      'kuraho inyuma yanjye'
+    );
+    return { refusalRw, refusalEn, guidanceTurn, uploadTurn };
+  });
+  const tasksAfter = repo.getMediaTasks().length;
+  const photoGateOk =
     requestsImageProduction('Kora ifoto yanjye ya pasiporo') &&
     requestsImageProduction('edit my photo and remove the background') &&
+    // Conjugated Kinyarwanda requests reach the gate, guidance questions do not.
+    requestsImageProduction('unkore ifoto ya pasiporo ndetse ukureho background') &&
+    requestsImageProduction('munkore ifoto ya pasiporo') &&
+    requestsImageProduction('unsanure ifoto yanjye ya kera') &&
+    // An article between the verb and the noun must not walk past the gate.
+    requestsImageProduction('please remove the background') &&
+    requestsImageProduction('delete the background from this picture') &&
+    requestsImageProduction('crop my photos to passport size') &&
+    !requestsImageProduction('nikora iki ku ifoto yanze?') &&
+    !requestsImageProduction('nshaka kumenya uko nkoresha ifoto yanjye') &&
     !requestsImageProduction('What are the passport photo standards?') &&
-    refusalRw.intent === 'IMAGE_PRODUCTION_UNAVAILABLE' &&
-    refusalRw.modelUsed === 'capability-gate' &&
-    refusalEn.intent === 'IMAGE_PRODUCTION_UNAVAILABLE' &&
-    refusalRw.replyText.includes('ifoto') &&
-    refusalEn.replyText.includes('does not generate') &&
-    !/404|not found|GEMINI|api key/i.test(`${refusalRw.replyText} ${refusalEn.replyText}`) &&
-    guidanceTurn.intent !== 'IMAGE_PRODUCTION_UNAVAILABLE';
+    !requestsImageProduction('how do I make images responsive in CSS?') &&
+    !requestsImageProduction('generate an array in javascript') &&
+    studioGate.refusalRw.intent === 'IMAGE_STUDIO_NOT_CONFIGURED' &&
+    studioGate.refusalRw.modelUsed === 'capability-gate' &&
+    studioGate.refusalEn.intent === 'IMAGE_STUDIO_NOT_CONFIGURED' &&
+    studioGate.refusalRw.replyText.includes('ifoto') &&
+    studioGate.refusalEn.replyText.includes('photo studio is not enabled') &&
+    !/404|not found|GEMINI|OPENAI|api key/i.test(
+      `${studioGate.refusalRw.replyText} ${studioGate.refusalEn.replyText}`
+    ) &&
+    studioGate.guidanceTurn.intent !== 'IMAGE_STUDIO_NOT_CONFIGURED' &&
+    studioGate.uploadTurn.intent === 'IMAGE_STUDIO_NOT_CONFIGURED' &&
+    // The Kinyarwanda caption answers in Kinyarwanda even on an English-preference user.
+    studioGate.uploadTurn.replyText.includes("Studio y'ifoto") &&
+    !studioGate.uploadTurn.image &&
+    tasksAfter === tasksBefore;
   results.push({
-    id: 'test-image-production-refusal',
+    id: 'test-image-studio-gate',
     category: 'AI Orchestrator',
-    name: 'Asking For A Generated Or Retouched Photo Gets A Bilingual Refusal Without A Model Call',
-    passed: photoRefusalOk,
+    name: 'A Photo Request Without An Image Provider Is Gated In Code Without A Render',
+    passed: photoGateOk,
     expected:
-      'create/edit-photo wording is refused before entitlements and before any model call, in the language written, with no provider error text shown; a standards question is not refused',
-    actual: `rw=${refusalRw.intent}/${refusalRw.modelUsed}, en=${refusalEn.intent}, guidance=${guidanceTurn.intent}, leakedErrorText=${/404|not found|GEMINI|api key/i.test(`${refusalRw.replyText} ${refusalEn.replyText}`)}`,
+      'create/edit-photo wording (including conjugated Kinyarwanda) and an uploaded photo with such a caption reach the studio gate in the language just written, spend no usage, create no media task and show no provider error text; a standards question is not gated',
+    actual: `rw=${studioGate.refusalRw.intent}/${studioGate.refusalRw.modelUsed}, en="${studioGate.refusalEn.replyText.slice(0, 24)}…", guidance=${studioGate.guidanceTurn.intent}, upload=${studioGate.uploadTurn.intent}, mediaTasks=${tasksBefore}→${tasksAfter}`,
     durationMs: Date.now() - t26Start,
+  });
+
+  // Test 28: The studio picks a real provider from the environment and rejects the
+  // example values shipped in .env.example, so an unconfigured server never renders.
+  const t27Start = Date.now();
+  const capNone = resolveImageCapability({});
+  const capOpenAi = resolveImageCapability({ OPENAI_API_KEY: 'sk-suite-real-key' });
+  const capGemini = resolveImageCapability({ GEMINI_API_KEY: 'AIza-suite-real-key' });
+  const capBoth = resolveImageCapability({ OPENAI_API_KEY: 'sk-suite-real-key', GEMINI_API_KEY: 'AIza-suite-real-key' });
+  const capOverride = resolveImageCapability({ OPENAI_API_KEY: 'sk-suite-real-key', OPENAI_IMAGE_MODEL: 'gpt-image-2' });
+  const capPlaceholders = [
+    resolveImageCapability({ OPENAI_API_KEY: 'your_api_key_here' }),
+    resolveImageCapability({ GEMINI_API_KEY: 'MY_GEMINI_API_KEY' }),
+    resolveImageCapability({ GEMINI_API_KEY: 'replace_with_your_gemini_api_key' }),
+    resolveImageCapability({ OPENAI_API_KEY: '  ' }),
+  ];
+  const capabilityOk =
+    !capNone.configured &&
+    capNone.provider === 'none' &&
+    !!capNone.error?.includes('OPENAI_API_KEY') &&
+    capOpenAi.configured &&
+    capOpenAi.provider === 'openai' &&
+    capOpenAi.model === 'gpt-image-1' &&
+    capGemini.configured &&
+    capGemini.provider === 'gemini' &&
+    capGemini.model === 'gemini-2.5-flash-image' &&
+    capBoth.provider === 'openai' &&
+    capOverride.model === 'gpt-image-2' &&
+    capPlaceholders.every((c) => !c.configured);
+  results.push({
+    id: 'test-image-provider-selection',
+    category: 'AI Orchestrator',
+    name: 'The Image Studio Uses A Real Key And Refuses Shipped Placeholders',
+    passed: capabilityOk,
+    expected:
+      'OpenAI is preferred over Gemini, the default models are gpt-image-1 and gemini-2.5-flash-image, OPENAI_IMAGE_MODEL overrides, and empty/placeholder keys report no provider with the variable to set',
+    actual: `none=${capNone.provider}/${Boolean(capNone.error)}, openai=${capOpenAi.model}, gemini=${capGemini.model}, both=${capBoth.provider}, override=${capOverride.model}, placeholders_refused=${capPlaceholders.filter((c) => !c.configured).length}/4`,
+    durationMs: Date.now() - t27Start,
+  });
+
+  // Test 29: The output contract is computed in code: 35x45mm geometry, a bounded
+  // retention window and a prompt that never asks for a real person's likeness.
+  const t28Start = Date.now();
+  const defaultWidth = passportWidthPx({});
+  const defaultHeight = passportHeightPx({});
+  const ratioError = Math.abs(defaultWidth / defaultHeight - 35 / 45);
+  const generatePrompt = buildStudioPrompt('make me a photo for my passport', false);
+  const editPrompt = buildStudioPrompt('kuraho inyuma', true);
+  const contractOk =
+    defaultWidth === 700 &&
+    defaultHeight === 900 &&
+    ratioError < 0.01 &&
+    passportHeightPx({ PASSPORT_PHOTO_WIDTH: '400' }) === 514 &&
+    imageRetentionDays({}) === 30 &&
+    imageRetentionDays({ IMAGE_RETENTION_DAYS: '7' }) === 7 &&
+    imageRetentionDays({ IMAGE_RETENTION_DAYS: '0' }) === 30 &&
+    imageRetentionDays({ IMAGE_RETENTION_DAYS: '999' }) === 30 &&
+    generatePrompt.includes('35mm wide by 45mm high') &&
+    generatePrompt.includes('never a likeness of a real individual') &&
+    generatePrompt.includes('make me a photo for my passport') &&
+    editPrompt.includes('Retouch the attached photo') &&
+    editPrompt.includes("Keep the person's identity") &&
+    editPrompt.includes('kuraho inyuma');
+  results.push({
+    id: 'test-image-output-contract',
+    category: 'AI Orchestrator',
+    name: 'Studio Output Keeps The 35x45mm Ratio And The Prompt Keeps Consent',
+    passed: contractOk,
+    expected:
+      '700x900 pixels by default with a 35:45 ratio, PASSPORT_PHOTO_WIDTH rescaled, IMAGE_RETENTION_DAYS clamped to 1-365, and the prompt states the standard without asking for a real individual likeness',
+    actual: `default=${defaultWidth}x${defaultHeight}, ratioError=${ratioError.toFixed(4)}, w400=${passportHeightPx({ PASSPORT_PHOTO_WIDTH: '400' })}, days=30/7/0→${imageRetentionDays({})}/${imageRetentionDays({ IMAGE_RETENTION_DAYS: '7' })}/${imageRetentionDays({ IMAGE_RETENTION_DAYS: '0' })}`,
+    durationMs: Date.now() - t28Start,
+  });
+
+  // Test 30: Retention really deletes the file. The task record survives as history
+  // so a person can be told their photo was removed, not merely that it expired.
+  const t29Start = Date.now();
+  const retainedUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 70).slice(-8)}`, 'Suite Retention User');
+  const retainedStored = durableStore.saveBinary(Buffer.from('aguka-suite-portrait-pixels'), 'image/jpeg');
+  const retainedTask = repo.createMediaTask({
+    userId: retainedUser.id,
+    userName: retainedUser.fullName || 'Suite Retention User',
+    operation: 'PASSPORT_CROP',
+    originalUrl: 'input:text-prompt',
+    retentionDays: 1,
+  });
+  repo.updateMediaTask(retainedTask.id, {
+    status: 'COMPLETED',
+    processedUrl: `stored:${retainedStored.key}`,
+    completedAt: new Date().toISOString(),
+  });
+  const fileBeforeSweep = durableStore.readBinary(retainedStored.key);
+  const sweep = runRetentionCleanup(Date.now() + 3 * 86_400_000);
+  const sweptTask = repo.getMediaTasks().find((task) => task.id === retainedTask.id);
+  const retentionOk =
+    fileBeforeSweep !== null &&
+    sweep.expiredIds.includes(retainedTask.id) &&
+    sweep.deletedFiles >= 1 &&
+    durableStore.readBinary(retainedStored.key) === null &&
+    sweptTask?.processedUrl === `purged:${retainedStored.key}`;
+  results.push({
+    id: 'test-media-retention-deletes-files',
+    category: 'Data & Storage',
+    name: 'The Retention Sweep Deletes The Stored Photo And Keeps The Record',
+    passed: retentionOk,
+    expected:
+      'a task past its retention window has its private file removed from the data directory, its processedUrl rewritten to purged:<key>, and the task row kept as history',
+    actual: `before=${fileBeforeSweep ? 'bytes' : 'missing'}, expired=${sweep.expiredIds.length}, deleted=${sweep.deletedFiles}, after=${durableStore.readBinary(retainedStored.key) ? 'still there' : 'gone'}, url=${sweptTask?.processedUrl?.slice(0, 12)}…`,
+    durationMs: Date.now() - t29Start,
+  });
+
+  // Test 31: Delivery. An image payload is built to Meta's shape, and the media
+  // upload refuses to run without real credentials instead of posting anywhere.
+  const t30Start = Date.now();
+  const longCaption = 'x'.repeat(2000);
+  const imagePayload = buildImageMessage('250788123456', 'media-suite-id', longCaption);
+  const uploadNoCreds = await withEnv(
+    { WHATSAPP_PHONE_NUMBER_ID: null, WHATSAPP_ACCESS_TOKEN: null },
+    () => uploadWhatsAppMedia(Buffer.from('suite-pixels'), 'image/jpeg')
+  );
+  const uploadExampleCreds = await withEnv(
+    { WHATSAPP_PHONE_NUMBER_ID: '109876543210987', WHATSAPP_ACCESS_TOKEN: 'replace_with_your_token' },
+    () => uploadWhatsAppMedia(Buffer.from('suite-pixels'), 'image/jpeg')
+  );
+  const uploadEmpty = await withEnv(
+    { WHATSAPP_PHONE_NUMBER_ID: '123', WHATSAPP_ACCESS_TOKEN: 'suite-real-looking-token' },
+    () => uploadWhatsAppMedia(Buffer.alloc(0), 'image/jpeg')
+  );
+  const deliveryOk =
+    imagePayload.type === 'image' &&
+    imagePayload.to === '250788123456' &&
+    imagePayload.image?.id === 'media-suite-id' &&
+    (imagePayload.image?.caption?.length ?? 0) === 1024 &&
+    !uploadNoCreds.ok &&
+    uploadNoCreds.mediaId === '' &&
+    /WHATSAPP_PHONE_NUMBER_ID/.test(uploadNoCreds.error || '') &&
+    !uploadExampleCreds.ok &&
+    /WHATSAPP_PHONE_NUMBER_ID/.test(uploadExampleCreds.error || '') &&
+    !uploadEmpty.ok &&
+    /no image bytes/i.test(uploadEmpty.error || '');
+  results.push({
+    id: 'test-image-delivery-payload',
+    category: 'WhatsApp Gateway',
+    name: 'A Generated Photo Sends As An Image Message And Never Uploads Without Credentials',
+    passed: deliveryOk,
+    expected:
+      'the Cloud API image payload carries the media id with a caption capped at 1024 characters, and the media endpoint is not called when the credentials are missing, are the .env.example placeholder, or there are no bytes',
+    actual: `type=${imagePayload.type}, caption=${imagePayload.image?.caption?.length}, missing=${uploadNoCreds.ok}/${uploadNoCreds.error ? 'explained' : 'silent'}, placeholder=${uploadExampleCreds.ok}, empty=${uploadEmpty.error?.slice(0, 24)}`,
+    durationMs: Date.now() - t30Start,
+  });
+
+  // Test 32: The text chain retries a blip, hands over to the rescue provider when
+  // a provider cannot answer this prompt at all, and never turns an outage into an
+  // invented reply. Injected providers only — this check makes no network call.
+  const t31Start = Date.now();
+
+  type ScriptStep = 'ok' | 'transient' | 'permanent' | 'empty' | 'blocked';
+  class ScriptedProvider implements IAIProvider {
+    calls = 0;
+    constructor(
+      readonly name: string,
+      readonly providerName: 'gemini' | 'openai',
+      readonly model: string,
+      private readonly script: ScriptStep[]
+    ) {}
+    async generateResponse(prompt: string): Promise<AIProviderResponse> {
+      const step = this.script[Math.min(this.calls, this.script.length - 1)];
+      this.calls++;
+      if (step === 'transient') throw new ProviderAttemptError('429 Too many requests. Please retry in 0.1s', 'transient', 429);
+      if (step === 'permanent') throw new ProviderAttemptError('404 NOT_FOUND: Model "stale-id" not found', 'permanent', 404);
+      if (step === 'blocked') throw new ProviderAttemptError('blocked by safety settings', 'blocked');
+      if (step === 'empty') throw new ProviderAttemptError('returned an empty candidate', 'empty');
+      return {
+        text: `${this.providerName} answered: ${prompt.slice(0, 12)}`,
+        tokensInput: 10,
+        tokensOutput: 5,
+        tokensUsed: 15,
+        latencyMs: 1,
+        model: this.model,
+        provider: this.providerName,
+      };
+    }
+    async healthCheck() {
+      return { ok: true, provider: this.name, model: this.model, latencyMs: 0 };
+    }
+  }
+
+  const retryThenAnswer = new ScriptedProvider('Gemini', 'gemini', 'gemini-2.5-flash', ['transient', 'ok']);
+  const firstRetry = await runTextChain([retryThenAnswer, new ScriptedProvider('OpenAI', 'openai', 'gpt-4o', ['ok'])], 'muraho');
+  const rescueAfterDeadModel = [
+    new ScriptedProvider('Gemini', 'gemini', 'stale-id', ['permanent']),
+    new ScriptedProvider('OpenAI', 'openai', 'gpt-4o', ['ok']),
+  ];
+  const second = await runTextChain(rescueAfterDeadModel, 'muraho');
+  const blockedRescue = await runTextChain(
+    [
+      new ScriptedProvider('Gemini', 'gemini', 'gemini-2.5-flash', ['blocked']),
+      new ScriptedProvider('OpenAI', 'openai', 'gpt-4o', ['ok']),
+    ],
+    'muraho'
+  );
+
+  let outageReply = '';
+  let outageAttempts: string[] = [];
+  try {
+    await runTextChain(
+      [
+        new ScriptedProvider('Gemini', 'gemini', 'gemini-2.5-flash', ['transient', 'transient']),
+        new ScriptedProvider('OpenAI', 'openai', 'gpt-4o', ['transient', 'transient']),
+      ],
+      'muraho'
+    );
+  } catch (err) {
+    if (err instanceof AllTextProvidersFailed) {
+      outageAttempts = err.attempts;
+      outageReply = 'unavailable';
+    }
+  }
+
+  // Chain shape is checked against an environment this suite controls, so a key
+  // that happens to live in the operator's shell cannot change the verdict.
+  const suiteProviderEnv = (overrides: Record<string, string>): NodeJS.ProcessEnv => {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const key of ['GEMINI_API_KEY', 'OPENAI_API_KEY', 'OPENAI_TEXT_MODEL']) delete env[key];
+    return Object.assign(env, overrides);
+  };
+
+  const singleKeyChain = chainSummary(suiteProviderEnv({ GEMINI_API_KEY: 'real-suite-key' }));
+  const bothKeyChain = chainSummary(
+    suiteProviderEnv({ GEMINI_API_KEY: 'real-suite-key', OPENAI_API_KEY: 'sk-suite-real-key' })
+  );
+  const placeholderChain = chainSummary(
+    suiteProviderEnv({ GEMINI_API_KEY: 'MY_GEMINI_API_KEY', OPENAI_API_KEY: 'replace_with_openai_key' })
+  );
+
+  const chainOk =
+    retryThenAnswer.calls === 2 &&
+    firstRetry.provider === 'gemini' &&
+    firstRetry.fellBack === false &&
+    rescueAfterDeadModel[0].calls === 1 &&
+    second.provider === 'openai' &&
+    second.fellBack === true &&
+    blockedRescue.provider === 'openai' &&
+    outageReply === 'unavailable' &&
+    outageAttempts.length === 4 &&
+    outageAttempts.every((line) => !/sk-suite-real-key|MY_GEMINI_API_KEY/.test(line)) &&
+    classifyStatus(429) === 'transient' &&
+    classifyStatus(503) === 'transient' &&
+    classifyStatus(404) === 'permanent' &&
+    classifyStatus(401) === 'permanent' &&
+    classifyThrown(new Error('fetch failed')).outcome === 'transient' &&
+    bothKeyChain.order.map((p) => p.provider).join(',') === 'gemini,openai' &&
+    bothKeyChain.rescueConfigured === true &&
+    singleKeyChain.rescueConfigured === false &&
+    placeholderChain.configured === false &&
+    openAITextModel(suiteProviderEnv({})) === 'gpt-4o' &&
+    openAITextModel(suiteProviderEnv({ OPENAI_TEXT_MODEL: 'gpt-4o-2024' })) === 'gpt-4o-2024' &&
+    chainSummary().attemptsPerProvider === 2 &&
+    chainSummary().budgetMs <= 15_000;
+
+  results.push({
+    id: 'test-text-provider-chain',
+    category: 'AI Orchestrator',
+    name: 'A Rate-Limited Reply Retries Then Falls Over To The Rescue Provider',
+    passed: chainOk,
+    expected:
+      'a transient failure is retried on the same provider, a wrong model id or a blocked answer goes to the rescue immediately without burning the retry budget, an outage across both providers throws with a redacted attempt summary, the chain order is Gemini then OpenAI with a rescue only when a real key exists, and the retry budget stays inside what a WhatsApp user will wait',
+    actual: `retry=${retryThenAnswer.calls}/${firstRetry.provider}, deadModel=${rescueAfterDeadModel[0].calls}call→${second.provider}(fellBack=${second.fellBack}), blocked=${blockedRescue.provider}, outage=${outageAttempts.length}attempts, order=${bothKeyChain.order
+      .map((p) => p.provider)
+      .join('>')}, rescue=${bothKeyChain.rescueConfigured}, singleRescue=${singleKeyChain.rescueConfigured}, placeholder=${placeholderChain.configured}, budget=${chainSummary().budgetMs}ms`,
+    durationMs: Date.now() - t31Start,
+  });
+
+  // Test 33: The OpenAI rescue is called through real HTTP code with a stubbed
+  // transport, and with no key at all the WhatsApp reply stays an honest
+  // not-configured notice that names the variables instead of inventing an answer.
+  const t32Start = Date.now();
+  const realFetch = globalThis.fetch;
+  let openAiCalls = 0;
+  interface ChatRequestBody {
+    model?: string;
+    messages?: Array<{ role: string; content: string }>;
+    response_format?: { type?: string };
+  }
+  let lastOpenAiBody: ChatRequestBody | null = null;
+
+  const stubOutage = (response: () => Response) => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('api.openai.com')) {
+        openAiCalls++;
+        lastOpenAiBody = JSON.parse(String(init?.body ?? '{}')) as ChatRequestBody;
+        return response();
+      }
+      return realFetch(input as never, init as never);
+    }) as typeof fetch;
+  };
+
+  const outageEnv = suiteProviderEnv({
+    GEMINI_API_KEY: '',
+    OPENAI_API_KEY: 'sk-suite-rescue-key',
+    OPENAI_TEXT_MODEL: 'gpt-4o',
+  });
+
+  let rescueOutageOk = false;
+  let rescueAnswerOk = false;
+  let outageDetail = '';
+  try {
+    stubOutage(() => new Response(JSON.stringify({ error: { message: 'Too many requests' } }), { status: 429 }));
+    try {
+      await generateText('Muraho', 'You are a tutor', undefined, outageEnv);
+    } catch (err) {
+      rescueOutageOk =
+        err instanceof AllTextProvidersFailed &&
+        err.attempts.length === 2 &&
+        err.attempts[0].includes('openai:gpt-4o') &&
+        err.attempts[0].includes('429');
+      outageDetail = err instanceof AllTextProvidersFailed ? err.attempts[0] : String(err);
+    }
+
+    openAiCalls = 0;
+    lastOpenAiBody = null;
+    stubOutage(
+      () =>
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '  Aguka AI rescue answer  ' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 20, completion_tokens: 9, total_tokens: 29 },
+          }),
+          { status: 200 }
+        )
+    );
+    const rescued = await generateText('Muraho cyane', 'You are a tutor', { json: true }, outageEnv);
+    const sentBody = lastOpenAiBody as ChatRequestBody | null;
+    rescueAnswerOk =
+      rescued.provider === 'openai' &&
+      rescued.model === 'gpt-4o' &&
+      rescued.text === 'Aguka AI rescue answer' &&
+      rescued.tokensUsed === 29 &&
+      openAiCalls === 1 &&
+      sentBody?.messages?.some((m) => m.role === 'system') === true &&
+      sentBody?.messages?.some((m) => m.role === 'user' && m.content.includes('Muraho cyane')) === true &&
+      sentBody?.response_format?.type === 'json_object';
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const usageCountFor = (userId: string) =>
+    repo.getEntitlementsForUser(userId).reduce((sum, e) => sum + e.usageCount, 0);
+
+  const noKeyTurn = await withEnv({ OPENAI_API_KEY: null, GEMINI_API_KEY: null }, async () => {
+    const noKeyUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 62).slice(-8)}`, 'Suite No-Key User');
+    const noKeyConv = repo.getOrCreateConversation(noKeyUser.id);
+    // Past the service menu, so this turn reaches the text chain like a normal question.
+    applySelection(noKeyUser, noKeyConv, getService('JOB_SEARCH')!, 'KINYARWANDA');
+    const outcome = await handleIncomingText(
+      repo.getUserById(noKeyUser.id)!,
+      noKeyConv,
+      'Ndashaka kumenya amategeko yakazi mu Rwanda'
+    );
+    return {
+      reply: outcome.replyText,
+      modelUsed: outcome.modelUsed,
+      usageAfter: usageCountFor(noKeyUser.id),
+      leaked: /sk-suite-rescue-key|real-suite-key|api\.openai\.com|generativelanguage/i.test(outcome.replyText),
+    };
+  });
+
+  const replyOk =
+    noKeyTurn.modelUsed === 'not-configured' &&
+    noKeyTurn.reply.includes('GEMINI_API_KEY') &&
+    noKeyTurn.reply.includes('OPENAI_API_KEY') &&
+    !noKeyTurn.leaked &&
+    noKeyTurn.usageAfter === 0;
+
+  results.push({
+    id: 'test-text-rescue-and-honest-refusal',
+    category: 'AI Orchestrator',
+    name: 'The Rescue Provider Is Called Over HTTP And A Keyless Server Refuses Honestly',
+    passed: rescueOutageOk && rescueAnswerOk && replyOk,
+    expected:
+      'a 429 from the rescue endpoint is retried once then reported as an outage, a successful rescue reply keeps the token usage and sends the system instruction plus the JSON format, and with no provider key the WhatsApp reply names both variables, leaks no credential or endpoint and charges no usage',
+    actual: `outage=${rescueOutageOk ? `2 attempts (${outageDetail.slice(0, 48)})` : 'wrong'}, rescue=${rescueAnswerOk ? 'answered with 29 tokens' : 'failed'}, noKey=${noKeyTurn.modelUsed}/${noKeyTurn.reply.slice(0, 32)}…, leaked=${noKeyTurn.leaked}, usage=${noKeyTurn.usageAfter}`,
+    durationMs: Date.now() - t32Start,
   });
 
   const passedCount = results.filter((r) => r.passed).length;

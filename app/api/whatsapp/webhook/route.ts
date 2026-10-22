@@ -5,11 +5,15 @@ import {
   parseWhatsAppWebhookPayload,
   sendWhatsAppMessage,
   downloadWhatsAppMedia,
+  uploadWhatsAppMedia,
   buildTextMessage,
   buildButtonMessage,
   buildListMessage,
+  buildImageMessage,
 } from '@/lib/whatsapp/gateway';
 import { repo } from '@/lib/db/repository';
+import { durableStore } from '@/lib/db/store';
+import { logger } from '@/lib/logging/logger';
 import { handleIncomingImage, handleIncomingText, InboundOutcome } from '@/lib/whatsapp/inbound';
 
 /**
@@ -104,7 +108,14 @@ export async function POST(request: NextRequest) {
             content: `image (${downloaded.mimeType})`,
             mediaUrl: `whatsapp-media:${msg.image.id}`,
           });
-          outcome = await handleIncomingImage(user, conversation, downloaded.buffer, `${msg.id}.jpg`, downloaded.mimeType);
+          outcome = await handleIncomingImage(
+            user,
+            conversation,
+            downloaded.buffer,
+            `${msg.id}.jpg`,
+            downloaded.mimeType,
+            msg.image.caption
+          );
         }
       } else {
         // Extract message text. A list/button reply carries the row id, which is
@@ -146,19 +157,43 @@ export async function POST(request: NextRequest) {
       // Save assistant response to conversation history
       repo.addMessage(conversation.id, {
         role: 'ASSISTANT',
-        type: 'TEXT',
+        type: outcome.image ? 'IMAGE' : 'TEXT',
         content: outcome.replyText,
         tokensUsed: outcome.tokensUsed,
+        ...(outcome.image ? { mediaUrl: `stored:${outcome.image.storageKey}` } : {}),
       });
 
-      // 6. Dispatch reply to user via WhatsApp Gateway
-      const payload = outcome.listMenu
-        ? buildListMessage(msg.from, outcome.listMenu.interactive)
-        : outcome.buttons && outcome.buttons.length > 0
-          ? buildButtonMessage(msg.from, outcome.replyText, outcome.buttons)
-          : buildTextMessage(msg.from, outcome.replyText);
+      // 6. Dispatch reply to user via WhatsApp Gateway. A studio result is a file,
+      //    so it is uploaded to Meta's media endpoint first and sent as an image
+      //    with the explanation as its caption. If the upload fails, the words
+      //    still go out and say the attachment did not — never a silent drop.
+      if (outcome.image) {
+        const pixels = durableStore.readBinary(outcome.image.storageKey);
+        const uploaded = pixels
+          ? await uploadWhatsAppMedia(pixels, outcome.image.mimeType)
+          : { ok: false, mediaId: '', error: 'the stored photo could not be read back' };
+        if (uploaded.ok) {
+          await sendWhatsAppMessage(buildImageMessage(msg.from, uploaded.mediaId, outcome.replyText));
+        } else {
+          logger.error('IMAGE_DELIVERY_FAILED', new Error(uploaded.error ?? 'unknown media upload failure'), {
+            metadata: { storageKey: outcome.image.storageKey, userId: user.id },
+          });
+          await sendWhatsAppMessage(
+            buildTextMessage(
+              msg.from,
+              `${outcome.replyText}\n(The file could not be attached: ${uploaded.error})`
+            )
+          );
+        }
+      } else {
+        const payload = outcome.listMenu
+          ? buildListMessage(msg.from, outcome.listMenu.interactive)
+          : outcome.buttons && outcome.buttons.length > 0
+            ? buildButtonMessage(msg.from, outcome.replyText, outcome.buttons)
+            : buildTextMessage(msg.from, outcome.replyText);
 
-      await sendWhatsAppMessage(payload);
+        await sendWhatsAppMessage(payload);
+      }
     }
 
     // Always acknowledge quickly to Meta with 200 OK

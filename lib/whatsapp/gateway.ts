@@ -24,6 +24,7 @@ export interface WhatsAppIncomingMessage {
     id: string;
     mime_type: string;
     sha256: string;
+    caption?: string;
     url?: string;
   };
   document?: {
@@ -38,10 +39,15 @@ export interface WhatsAppOutgoingMessage {
   messaging_product: 'whatsapp';
   recipient_type: 'individual';
   to: string;
-  type: 'text' | 'interactive';
+  type: 'text' | 'interactive' | 'image';
   text?: {
     preview_url?: boolean;
     body: string;
+  };
+  image?: {
+    id?: string;
+    link?: string;
+    caption?: string;
   };
   interactive?: {
     type: 'button' | 'list';
@@ -161,11 +167,12 @@ export function parseWhatsAppWebhookPayload(body: Record<string, unknown>): What
           } else if (type === 'interactive' && m.interactive) {
             parsed.interactive = m.interactive as WhatsAppIncomingMessage['interactive'];
           } else if (type === 'image' && m.image) {
-            const img = m.image as { id?: string; mime_type?: string; sha256?: string };
+            const img = m.image as { id?: string; mime_type?: string; sha256?: string; caption?: string };
             parsed.image = {
               id: String(img.id || ''),
               mime_type: String(img.mime_type || 'image/jpeg'),
               sha256: String(img.sha256 || ''),
+              caption: img.caption ? String(img.caption) : undefined,
             };
           } else if (type === 'document' && m.document) {
             const doc = m.document as { id?: string; filename?: string; mime_type?: string };
@@ -387,5 +394,70 @@ export function buildListMessage(
       footer: { text: list.footer.text },
       action: { button: list.action.button, sections: list.action.sections },
     },
+  };
+}
+
+/** Meta accepts at most 5 MB for image attachments on the media endpoint. */
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Uploads generated pixels to Meta's media endpoint and returns the media id
+ * used by an `image` message. Missing credentials fail explicitly instead of
+ * silently dropping the attachment.
+ */
+export async function uploadWhatsAppMedia(
+  buffer: Buffer,
+  mimeType: string
+): Promise<{ ok: boolean; mediaId: string; error: string | null }> {
+  const creds = liveCredentials();
+  if (!creds) {
+    return {
+      ok: false,
+      mediaId: '',
+      error: 'WhatsApp media upload needs WHATSAPP_PHONE_NUMBER_ID and WHATSAPP_ACCESS_TOKEN.',
+    };
+  }
+  if (buffer.byteLength === 0) {
+    return { ok: false, mediaId: '', error: 'There were no image bytes to upload.' };
+  }
+  if (buffer.byteLength > MAX_UPLOAD_BYTES) {
+    return { ok: false, mediaId: '', error: 'The image is larger than the 5 MB WhatsApp limit.' };
+  }
+
+  try {
+    const form = new FormData();
+    form.append('messaging_product', 'whatsapp');
+    form.append('type', mimeType || 'image/jpeg');
+    form.append('file', new Blob([new Uint8Array(buffer)], { type: mimeType || 'image/jpeg' }));
+
+    const res = await fetch(`https://graph.facebook.com/v21.0/${creds.phoneNumberId}/media`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${creds.accessToken}` },
+      body: form,
+    });
+    const data = (await res.json()) as { id?: string; error?: { message?: string } };
+    if (!res.ok || !data.id) {
+      return {
+        ok: false,
+        mediaId: '',
+        error: data.error?.message || `Media upload failed with status ${res.status}`,
+      };
+    }
+    return { ok: true, mediaId: data.id, error: null };
+  } catch (err: unknown) {
+    return { ok: false, mediaId: '', error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Captions are limited to 1024 characters by the Cloud API.
+ */
+export function buildImageMessage(to: string, mediaId: string, caption: string): WhatsAppOutgoingMessage {
+  return {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'image',
+    image: { id: mediaId, caption: caption.slice(0, 1024) },
   };
 }

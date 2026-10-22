@@ -99,7 +99,8 @@ export function CodingScreen() {
             <span>AI-Assisted Development Hub & System Mapping</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1 max-w-2xl">
-            Requests go to Gemini server-side and the answer is stored as a task. Nothing here executes
+            Requests go through the text chain server-side — Gemini first, OpenAI as the rescue — and
+            the answer is stored as a task with the model that replied. Nothing here executes
             code: there is no sandbox, so results are never described as tested or verified.
           </p>
         </div>
@@ -154,7 +155,7 @@ export function CodingScreen() {
               <Terminal className="w-4 h-4 text-blue-400" />
             </div>
             <p className="text-xs font-bold text-white">Bilingual Router</p>
-            <p className="text-[10px] text-zinc-400">Keyword routing plus one Gemini call, with secret redaction.</p>
+            <p className="text-[10px] text-zinc-400">Keyword routing plus the retry-and-failover chain, with secret redaction.</p>
           </div>
 
           <div className="p-3.5 rounded-xl bg-zinc-950 border border-dashed border-cyan-500/40 space-y-2">
@@ -213,7 +214,7 @@ export function CodingScreen() {
             className="px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
           >
             <Play className="w-3 h-3 fill-white" />
-            <span>{isExecuting ? 'Asking Gemini…' : 'Send request'}</span>
+            <span>{isExecuting ? 'Asking the AI chain…' : 'Send request'}</span>
           </button>
         </div>
 
@@ -294,7 +295,7 @@ export function CodingScreen() {
           <div className="p-3 border-b border-zinc-800 flex items-center justify-between bg-zinc-950/60">
             <div className="flex items-center gap-2 text-xs font-semibold text-zinc-200">
               <Terminal className="w-3.5 h-3.5 text-purple-400" />
-              <span>Gemini response (stored with the task)</span>
+              <span>Model response (stored with the task)</span>
             </div>
             <button
               onClick={handleCopy}

@@ -1,7 +1,7 @@
 import { AgentType, LanguagePreference, Conversation, User } from '@/lib/types';
 import { repo } from '@/lib/db/repository';
 import { sanitizeUserInput, redactSecrets } from './prompt-security';
-import { getAIProvider } from './provider-adapter';
+import { generateText, chainSummary, AllTextProvidersFailed } from './provider-adapter';
 import { logger } from '@/lib/logging/logger';
 import {
   consumeUsage,
@@ -12,6 +12,8 @@ import {
 import { getService } from '@/lib/services/catalog';
 import { handleRoadSafetyMessage } from '@/lib/road-safety/whatsapp-flow';
 import { publishedLessons, progressFor, formatProgress } from '@/lib/road-safety/academy';
+import { resolveImageCapability } from '@/lib/images/provider';
+import { attachmentOf, runImageStudio, type ImageAttachment } from '@/lib/images/studio';
 
 export interface AgentExecutionResult {
   agentType: AgentType;
@@ -19,6 +21,8 @@ export interface AgentExecutionResult {
   detectedLanguage: LanguagePreference;
   replyText: string;
   buttons?: Array<{ id: string; title: string }>;
+  /** Set when the image studio produced a file that still has to be delivered. */
+  image?: ImageAttachment;
   tokensUsed: number;
   latencyMs: number;
   modelUsed: string;
@@ -43,7 +47,8 @@ export interface AgentExecutionResult {
 const KINYARWANDA_STEMS = [
   'muraho', 'bite', 'amakuru', 'akazi', 'mifotra', 'kwandika', 'ibaruwa', 'ifoto', 'kwiga',
   'sobanurira', 'umurimo', 'umushahara', 'ngufashe', 'gufasha', 'ndifuza', 'shaka',
-  'cyangwa', 'hano', 'nyamuneka', 'ryanjye', 'muri', 'kandi',
+  'cyangwa', 'hano', 'nyamuneka', 'ryanjye', 'yanjye', 'muri', 'kandi',
+  'kuraho', 'kureho', 'sanisha', 'sanur',
   'amasomo', 'isomo', 'ikizamini', 'imyitozo', 'ibibazo', 'ikibazo',
   'ibimenyetso', 'ikimenyetso', 'umuhanda', 'ubwitonzi',
   'ishyur', 'igiciro', 'imerere', 'hitamo', 'guhindura',
@@ -188,7 +193,7 @@ const AGENT_SYSTEM_INSTRUCTIONS: Record<AgentType, string> = {
   CODING_AGENT:
     'You are a software engineering assistant. Help scaffold, debug and explain systems in text. No code execution sandbox exists in this product, so never claim code was run, tested or verified.',
   IMAGE_STUDIO:
-    'You advise on Rwandan passport photo standards (35x45mm, plain background) and CV portraits. Image editing does not run in this service, so never claim a photo was processed or its background removed.',
+    'You advise on Rwandan passport photo standards (35x45mm, plain background) and CV portraits. Requests to create or retouch an actual file are handled by the image studio elsewhere in this service, so never claim you produced, cropped or edited an image yourself.',
   STUDY_TUTOR:
     'You are a patient STEM and language tutor for Rwandan students. Explain the exact concept the user asked about, then end with one practice question. Use Kinyarwanda only when the user wrote in Kinyarwanda.',
   EMPLOYMENT_MARKETPLACE:
@@ -232,40 +237,100 @@ const AGENT_BUTTONS: Record<AgentType, Array<{ id: string; en: string; rw: strin
 
 const AI_NOT_CONFIGURED: Record<'KINYARWANDA' | 'ENGLISH', string> = {
   KINYARWANDA:
-    'Aguka AI ntishobora gusubiza ubu kuko GEMINI_API_KEY itarashyirwaho kuri iyi serveri. Shyiraho urufunguzo rwa Gemini hanyuma ongera umbaze.',
+    'Aguka AI ntishobora gusubiza ubu kuko nta rumufunguzo wa AI bashyizeho kuri iyi serveri (GEMINI_API_KEY cyangwa OPENAI_API_KEY). Bashyiraho rumwe hanyuma ongera umbaze.',
   ENGLISH:
-    'Aguka AI cannot reply right now because GEMINI_API_KEY is not configured on this server. Set a valid Gemini API key and send your message again.',
+    'Aguka AI cannot reply right now because no AI provider key is configured on this server (GEMINI_API_KEY, or OPENAI_API_KEY as the rescue). Set one and send your message again.',
 };
 
 const AI_UNAVAILABLE: Record<'KINYARWANDA' | 'ENGLISH', string> = {
-  KINYARWANDA: 'Aguka AI ntiyabashije gusubiza ubu. Nyamuneka ongera mu kanya nk’ako guhumbya.',
-  ENGLISH: 'Aguka AI could not reach the AI provider. Please try again in a moment.',
+  KINYARWANDA:
+    'Aguka AI ntiyabashije gusubiza ubu kuko ingendo zose z\'ibutabazi zananiranye. Nta kiguzi cyakoreshejwe — ongera mu kanya nk\'ako guhumbya.',
+  ENGLISH:
+    'Aguka AI could not get an answer from any AI provider just now, and nothing was counted against your usage. Please try again in a moment.',
 };
 
 /**
- * Image Studio advises on photo standards; it never renders or retouches a file.
- * Checked in code instead of trusting the system prompt, because a model asked to
- * edit a photo either pretends it did or, when the image endpoint is misconfigured,
- * the raw provider error gets texted back to a person on WhatsApp.
+ * Wording that asks for a picture to be made or retouched. Decided in code, not
+ * by trusting a system prompt: a text model asked to edit a photo either claims it
+ * did or, when the image endpoint is misconfigured, its raw provider error gets
+ * texted to a person on WhatsApp.
  */
 const IMAGE_PRODUCTION_MARKERS = [
   'kora ifoto', 'kora foto', 'koraimage', 'guhindura ifoto', 'kuraho inyuma', 'isura ryiza',
-  'edit photo', 'edit my photo', 'make a photo', 'make an image', 'make me a photo',
-  'generate image', 'generate an image', 'create a photo', 'create an image',
-  'remove background', 'change background', 'resize photo', 'crop photo', 'retouch', 'photoshop',
+  'edit photo', 'edit picture', 'make a photo', 'make an image', 'make me a photo',
+  'generate image', 'generate a photo', 'create a photo', 'create an image', 'create a picture',
+  'remove background', 'change background', 'delete background', 'erase background',
+  'resize photo', 'crop photo', 'retouch', 'photoshop',
+];
+
+/**
+ * A literal "edit photo" does not match "edit my photo" or "remove the background",
+ * and those are what people actually type. Each marker becomes a pattern whose
+ * word gaps accept articles, possessives and a plural, so the gate cannot be walked
+ * past by an article — an unrecognised edit request would otherwise reach the text
+ * model, or worse, an uploaded photo with such a caption would be filed as a payment
+ * receipt.
+ */
+const IMAGE_PRODUCTION_PATTERNS = IMAGE_PRODUCTION_MARKERS.map((marker) => {
+  const words = marker
+    .split(' ')
+    .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + 's?');
+  const gap = String.raw`(?:\s+(?:the|a|an|to|my|your|his|her|for|me|it|up)?){0,3}`;
+  return new RegExp(words.join(gap), 'i');
+});
+
+/**
+ * A picture token that means the person is talking about an image at all.
+ */
+const IMAGE_SUBJECT_TOKENS = ['ifoto', 'amafoto', 'foto', 'igishushanyo', 'photo', 'image', 'background'];
+
+/**
+ * Stems for "make / change / strip / repair". Kinyarwanda conjugates the verb into
+ * the request — "unkore ifoto", "ukureho background" — so a literal phrase list
+ * silently misses polite and object-prefixed forms and the request falls through to
+ * the text model. Bare "kora" is deliberately not a stem: "nikora iki ku ifoto"
+ * ("what do I do about this photo") is a guidance question. `koresh*` ("use") is
+ * removed first because "nkoresha" contains "nkore".
+ */
+const IMAGE_PRODUCTION_STEMS = [
+  'nkore', 'gukora', 'guhindura', 'hindura', 'hinduye', 'hindurira',
+  'kuraho', 'kureho', 'kurana', 'sanisha', 'sanur', 'isura',
 ];
 
 export function requestsImageProduction(text: string): boolean {
   const t = text.toLowerCase();
-  return IMAGE_PRODUCTION_MARKERS.some((marker) => t.includes(marker));
+  if (IMAGE_PRODUCTION_PATTERNS.some((pattern) => pattern.test(t))) return true;
+  const cleaned = t.replace(/koresh\w*/g, ' ');
+  if (!IMAGE_SUBJECT_TOKENS.some((token) => cleaned.includes(token))) return false;
+  return IMAGE_PRODUCTION_STEMS.some((stem) => cleaned.includes(stem));
 }
 
-const IMAGE_PRODUCTION_REFUSAL: Record<'KINYARWANDA' | 'ENGLISH', string> = {
+export const IMAGE_STUDIO_OFF: Record<'KINYARWANDA' | 'ENGLISH', string> = {
   KINYARWANDA:
-    'Gukora ifoto no guhindura iyari isanzwe ntibikorerwa kuri iyi serivisi — ntipfusha ubushobozi bwo gukura inyuma ku ifoto cyangwa kuyihindura. Nshobora kuguha amategeko y’ifoto ya pasiporo (35x45mm, inyuma y’umweru utagira ikindi) n’inama y’ifoto ya CV. Nyamuneka koresha porogaramu y’isanisha ifoto ku dosiye yawe.',
+    "Studio y'ifoto ntiremewe kuri iyi serveri, bityo ntabwo nakora ifoto cyangwa ngahindura iyari isanzwe ubu. Nshobora kuguha amategeko y'ifoto ya pasiporo (35x45mm, inyuma y'umweru utagira ikindi) n'inama y'ifoto ya CV. Nyamuneka koresha porogaramu y'isanisha ifoto ku dosiye yawe.",
   ENGLISH:
-    'This service does not generate or retouch image files, so I cannot create a photo, remove its background or edit it. What I can give you: the Rwanda passport photo standards (35x45mm, plain light background) and CV portrait guidance. For the file itself, use a photo editor on your phone or computer.',
+    'The photo studio is not enabled on this server, so I cannot create a photo, remove its background or edit one right now. What I can give you: the Rwanda passport photo standards (35x45mm, plain light background) and CV portrait guidance. For the file itself, use a photo editor on your phone or computer.',
 };
+
+export const IMAGE_STUDIO_FAILED: Record<'KINYARWANDA' | 'ENGLISH', string> = {
+  KINYARWANDA:
+    "Ntabwo nabashije gukora iyo foto ubu, kandi nta kiguzi cyakoreshejwe. Nyamuneka ongera mu kanya nk'ako guhumbya cyangwa uvuge neza uko wifuzaga ifoto.",
+  ENGLISH:
+    'The photo studio could not produce that image, and nothing was counted against your usage. Please try again in a moment, or describe the photo you wanted more specifically.',
+};
+
+export function buildStudioReply(
+  lang: 'KINYARWANDA' | 'ENGLISH',
+  width: number,
+  height: number,
+  taskId: string,
+  expiresAt: string
+): string {
+  const date = new Date(expiresAt).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  return lang === 'ENGLISH'
+    ? `Here is your photo, cropped to ${width}x${height} pixels in the 35x45mm passport ratio (task ${taskId}). The file is kept privately on this server until ${date}, then deleted. Not right? Send this photo back and say what to change.`
+    : `Ifoto yawe iranoze, ingano ya ${width}x${height} mu gipimo cya 35x45mm cya pasiporo (nimero ${taskId}). Ijyubatswe mu nganda z'ibanga kugeza ${date}, hanyuma igasibwa. Ntiyagenze neza? Unonishe iyo foto uvuge icyo uhindura.`;
+}
 
 /**
  * Orchestrates the AI Agent execution
@@ -318,45 +383,9 @@ export async function executeAgent(
   // Update conversation active agent
   repo.setConversationAgent(conversation.id, agentType);
 
-  // 2. Image production is refused here, before entitlements and before any model
-  //    call: a refusal must not spend a trial use, must not depend on what the
-  //    model decides to claim, and does not care which service was selected —
-  //    no agent in this build can produce an image file.
-  if (requestsImageProduction(sanitization.cleanText)) {
-    const latencyMs = Date.now() - startTime;
-    repo.recordAgentRun(
-      {
-        conversationId: conversation.id,
-        agentType,
-        intentDetected: 'IMAGE_PRODUCTION_UNAVAILABLE',
-        modelUsed: 'capability-gate',
-        tokensInput: 0,
-        tokensOutput: 0,
-        latencyMs,
-        status: 'COMPLETED',
-        toolCallsCount: 0,
-      },
-      []
-    );
-
-    return {
-      agentType,
-      intent: 'IMAGE_PRODUCTION_UNAVAILABLE',
-      detectedLanguage: lang,
-      replyText: IMAGE_PRODUCTION_REFUSAL[replyLang],
-      buttons: AGENT_BUTTONS.IMAGE_STUDIO.map((b) => ({
-        id: b.id,
-        title: replyLang === 'KINYARWANDA' ? b.rw : b.en,
-      })),
-      tokensUsed: 0,
-      latencyMs,
-      modelUsed: 'capability-gate',
-      toolCalls: [],
-    };
-  }
-
-  // 3. Entitlement gate. Charging and trial expiry are enforced here, on the
-  //    server, before any model call — never by asking the model to behave.
+  // 2. Entitlement gate. Charging and trial expiry are enforced here, on the
+  //    server, before any model call — never by asking the model to behave. It
+  //    comes before the image studio so a locked account cannot spend a render.
   if (service) {
     const decision = evaluateAccess(user, service);
     if (!decision.allowed) {
@@ -406,6 +435,138 @@ export async function executeAgent(
         toolCalls: [],
       };
     }
+  }
+
+  // 3. Image production. Only the studio can make a file, so the request is
+  //    handled here in code instead of being handed to the text model, which would
+  //    describe a photo it never rendered. Usage is consumed only when pixels
+  //    actually came back, and the provider's own error text stays in the log.
+  if (requestsImageProduction(sanitization.cleanText)) {
+    const capability = resolveImageCapability();
+    const studioButtons = AGENT_BUTTONS.IMAGE_STUDIO.map((b) => ({
+      id: b.id,
+      title: replyLang === 'KINYARWANDA' ? b.rw : b.en,
+    }));
+
+    if (!capability.configured) {
+      const latencyMs = Date.now() - startTime;
+      repo.recordAgentRun(
+        {
+          conversationId: conversation.id,
+          agentType,
+          intentDetected: 'IMAGE_STUDIO_NOT_CONFIGURED',
+          modelUsed: 'capability-gate',
+          tokensInput: 0,
+          tokensOutput: 0,
+          latencyMs,
+          status: 'COMPLETED',
+          toolCallsCount: 0,
+        },
+        []
+      );
+
+      return {
+        agentType,
+        intent: 'IMAGE_STUDIO_NOT_CONFIGURED',
+        detectedLanguage: lang,
+        replyText: IMAGE_STUDIO_OFF[replyLang],
+        buttons: studioButtons,
+        tokensUsed: 0,
+        latencyMs,
+        modelUsed: 'capability-gate',
+        toolCalls: [],
+      };
+    }
+
+    const renderStart = Date.now();
+    const studio = await runImageStudio({
+      userId: user.id,
+      userName: user.fullName || 'User',
+      request: sanitization.cleanText,
+    });
+    const latencyMs = Date.now() - startTime;
+
+    if (!studio.ok) {
+      logger.error('IMAGE_STUDIO_FAILED', new Error(studio.error), {
+        metadata: { provider: studio.provider, model: studio.model, userId: user.id, conversationId: conversation.id },
+      });
+      repo.recordAgentRun(
+        {
+          conversationId: conversation.id,
+          agentType: 'IMAGE_STUDIO',
+          intentDetected: 'IMAGE_STUDIO_FAILED',
+          modelUsed: studio.model || capability.model,
+          tokensInput: 0,
+          tokensOutput: 0,
+          latencyMs,
+          status: 'FAILED',
+          toolCallsCount: 1,
+        },
+        [
+          {
+            toolName: 'image_studio_render',
+            arguments: { provider: studio.provider, request: redactSecrets(sanitization.cleanText) },
+            result: { error: studio.error },
+            latencyMs: Date.now() - renderStart,
+            redacted: true,
+          },
+        ]
+      );
+
+      return {
+        agentType: 'IMAGE_STUDIO',
+        intent: 'IMAGE_STUDIO_FAILED',
+        detectedLanguage: lang,
+        replyText: IMAGE_STUDIO_FAILED[replyLang],
+        buttons: studioButtons,
+        tokensUsed: 0,
+        latencyMs,
+        modelUsed: studio.model || capability.model,
+        toolCalls: [],
+      };
+    }
+
+    if (service) consumeUsage(user, service.code);
+    repo.recordAgentRun(
+      {
+        conversationId: conversation.id,
+        agentType: 'IMAGE_STUDIO',
+        intentDetected: 'IMAGE_STUDIO_PRODUCED',
+        modelUsed: studio.model,
+        tokensInput: 0,
+        tokensOutput: 0,
+        latencyMs,
+        status: 'COMPLETED',
+        toolCallsCount: 1,
+      },
+      [
+        {
+          toolName: 'image_studio_render',
+          arguments: { provider: studio.provider, request: redactSecrets(sanitization.cleanText) },
+          result: {
+            taskId: studio.taskId,
+            width: studio.width,
+            height: studio.height,
+            sizeBytes: studio.sizeBytes,
+            expiresAt: studio.expiresAt,
+          },
+          latencyMs: Date.now() - renderStart,
+          redacted: true,
+        },
+      ]
+    );
+
+    return {
+      agentType: 'IMAGE_STUDIO',
+      intent: 'IMAGE_STUDIO_PRODUCED',
+      detectedLanguage: lang,
+      replyText: buildStudioReply(replyLang, studio.width, studio.height, studio.taskId, studio.expiresAt),
+      image: attachmentOf(studio),
+      tokensUsed: 0,
+      latencyMs,
+      modelUsed: studio.model,
+      toolCalls: [],
+    };
   }
 
   // 4. Road Safety runs its lessons, exams and scoring deterministically in the
@@ -527,8 +688,8 @@ export async function executeAgent(
     );
   }
 
-  // 6. Ask the configured provider; never answer from a scripted reply
-  const provider = getAIProvider();
+  // 6. Ask the provider chain; never answer from a scripted reply
+  const chain = chainSummary();
   let replyText = '';
   let modelUsed = 'not-configured';
   let tokensInput = 0;
@@ -536,10 +697,9 @@ export async function executeAgent(
   let tokensUsed = 0;
   let status: 'COMPLETED' | 'FAILED' = 'FAILED';
 
-  if (!provider) {
+  if (!chain.configured) {
     replyText = AI_NOT_CONFIGURED[replyLang];
   } else {
-    modelUsed = provider.model;
     const platformData = contextParts.length
       ? `\n\nPlatform data (the only facts you may cite):\n${contextParts.join('\n')}`
       : '';
@@ -549,25 +709,29 @@ export async function executeAgent(
       `User message: "${sanitization.cleanText}"${platformData}`;
 
     try {
-      const generated = await provider.generateResponse(prompt, AGENT_SYSTEM_INSTRUCTIONS[agentType]);
+      const generated = await generateText(prompt, AGENT_SYSTEM_INSTRUCTIONS[agentType]);
+      modelUsed = generated.fellBack ? `${generated.model} (rescue)` : generated.model;
       tokensInput = generated.tokensInput;
       tokensOutput = generated.tokensOutput;
       tokensUsed = generated.tokensUsed;
-
-      if (generated.text.trim().length > 0) {
-        replyText = generated.text;
-        status = 'COMPLETED';
-      } else {
-        replyText = AI_UNAVAILABLE[replyLang];
-      }
+      replyText = generated.text;
+      status = 'COMPLETED';
     } catch (err: unknown) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      // A 404 for a wrong GEMINI_MODEL, a quota message or a TLS failure is an
-      // operator detail. Keep it in the log and the agent run, not in the reply
-      // sent to a person on WhatsApp.
-      logger.error('AI_GENERATION_FAILED', err instanceof Error ? err : new Error(errorMsg), {
-        metadata: { model: provider.model, agentType, conversationId: conversation.id },
+      // A 404 for a wrong model id, a quota message or a TLS failure is an operator
+      // detail. Keep it in the log and the agent run, not in the reply sent to a
+      // person on WhatsApp. The chain already tried the rescue provider by now, so
+      // reaching this branch means nothing answered.
+      const attempts =
+        err instanceof AllTextProvidersFailed ? err.attempts : [(err instanceof Error ? err.message : String(err))];
+      logger.error('AI_GENERATION_FAILED', err instanceof Error ? err : new Error(attempts.join(' | ')), {
+        metadata: {
+          order: chain.order.map((p) => `${p.provider}:${p.model}`).join(' → '),
+          attempts,
+          agentType,
+          conversationId: conversation.id,
+        },
       });
+      modelUsed = `chain-failed:${chain.order.map((p) => p.model).join(',')}`;
       replyText = AI_UNAVAILABLE[replyLang];
     }
   }

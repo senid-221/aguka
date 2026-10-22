@@ -99,9 +99,17 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
     {
       label: 'Agent Runs & Tool Calls',
       value: statsCount ? `${statsCount.agentRuns} / ${statsCount.toolCalls}` : '—',
-      subtext: health ? health.geminiAi.model : 'Model not loaded',
+      subtext: health
+        ? health.textChain.order.map((p) => `${p.provider}:${p.model}`).join(' → ') || 'No provider key'
+        : 'Model not loaded',
       icon: <Bot className="w-5 h-5 text-amber-400" />,
-      change: health?.geminiAi.configured ? 'Gemini configured' : 'GEMINI_API_KEY missing',
+      change: health
+        ? !health.textChain.configured
+          ? 'GEMINI_API_KEY missing'
+          : health.textChain.rescueConfigured
+            ? 'Rescue provider armed'
+            : 'Single provider — no rescue'
+        : 'Health not loaded',
     },
   ];
 
@@ -209,7 +217,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-blue-500/20 text-blue-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">3</span>
-                    <span><strong>Bilingual Router:</strong> Keyword intent classification, then one Gemini call per reply.</span>
+                    <span><strong>Bilingual Router:</strong> Keyword intent classification, then the text chain: Gemini first, OpenAI as the rescue.</span>
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-cyan-500/20 text-cyan-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">4</span>
@@ -234,7 +242,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                 <div className="space-y-2 text-zinc-300">
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-purple-500/20 text-purple-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">1</span>
-                    <span><strong>Generated Drafts:</strong> Scaffolds, fixes and explanations come back as text from Gemini.</span>
+                    <span><strong>Generated Drafts:</strong> Scaffolds, fixes and explanations come back as text from the same chain — no code is ever executed.</span>
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-amber-500/20 text-amber-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">2</span>
@@ -388,7 +396,13 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
           <div className="pt-3 border-t border-zinc-800/80 flex items-center justify-between text-xs text-zinc-400">
             <div className="flex items-center gap-2">
               <PostgresLogo className="w-4 h-4 text-blue-400" />
-              <span>{health?.database.status === 'CONNECTED' ? 'PostgreSQL connected' : 'In-memory store (schema not applied)'}</span>
+              <span>
+                {health
+                  ? health.productionDatabase.applied
+                    ? 'PostgreSQL connected'
+                    : `${health.database.provider} — PostgreSQL schema not applied`
+                  : 'Reading persistence…'}
+              </span>
             </div>
             <div className="flex items-center gap-2">
               <RedisLogo className="w-4 h-4 text-red-400" />

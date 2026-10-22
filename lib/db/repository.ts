@@ -39,6 +39,9 @@ import { newId } from '@/lib/util/ids';
 import { durableStore, withPersistence, type Persistable } from '@/lib/db/store';
 import { detectPrismaReadiness } from '@/lib/db/prisma-readiness';
 import { getQueueRuntimeSnapshot } from '@/lib/queue/status';
+import { resolveImageCapability } from '@/lib/images/provider';
+import { imageRetentionDays, passportHeightPx, passportWidthPx } from '@/lib/images/spec';
+import { chainSummary } from '@/lib/ai/provider-adapter';
 
 // Boards the platform is configured to read. Health and listing counts stay
 // unknown until a real crawl populates them.
@@ -446,6 +449,13 @@ class AppRepository implements Persistable {
     };
     this.mediaTasks.unshift(newTask);
     return newTask;
+  }
+
+  updateMediaTask(id: string, patch: Partial<Pick<MediaTask, 'status' | 'processedUrl' | 'completedAt'>>): MediaTask | null {
+    const task = this.mediaTasks.find((t) => t.id === id);
+    if (!task) return null;
+    Object.assign(task, patch);
+    return task;
   }
 
   // --- Coding Tasks ---
@@ -949,6 +959,28 @@ class AppRepository implements Persistable {
         model: GEMINI_MODEL,
         bilingualKinyarwandaSupport: true,
       },
+      textChain: (() => {
+        const chain = chainSummary();
+        return {
+          configured: chain.configured,
+          order: chain.order,
+          /** False means one provider outage ends the reply — the rescue key is not set. */
+          rescueConfigured: chain.rescueConfigured,
+          attemptsPerProvider: chain.attemptsPerProvider,
+          budgetMs: chain.budgetMs,
+        };
+      })(),
+      imageStudio: (() => {
+        const capability = resolveImageCapability();
+        return {
+          configured: capability.configured,
+          provider: capability.provider,
+          mode: capability.configured ? ('PROVIDER_RENDERED' as const) : ('NOT_CONFIGURED' as const),
+          model: capability.configured ? capability.model : null,
+          output: `${passportWidthPx()}x${passportHeightPx()} JPEG (35x45mm)`,
+          retentionDays: imageRetentionDays(),
+        };
+      })(),
       stats: {
         totalUsers: this.users.length,
         conversations: this.conversations.length,

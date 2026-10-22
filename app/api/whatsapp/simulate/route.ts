@@ -4,6 +4,7 @@ import {
   buildButtonMessage,
   buildListMessage,
   buildTextMessage,
+  buildImageMessage,
   WhatsAppOutgoingMessage,
 } from '@/lib/whatsapp/gateway';
 import { handleIncomingImage, handleIncomingText, InboundOutcome } from '@/lib/whatsapp/inbound';
@@ -16,7 +17,7 @@ export const runtime = 'nodejs';
  */
 export async function POST(request: NextRequest) {
   try {
-    const { phoneNumber, name, messageText, imageBase64, imageMimeType } = await request.json();
+    const { phoneNumber, name, messageText, imageBase64, imageMimeType, imageCaption } = await request.json();
 
     if (!phoneNumber) {
       return NextResponse.json({ error: 'phoneNumber is required' }, { status: 400 });
@@ -41,11 +42,12 @@ export async function POST(request: NextRequest) {
 
     if (hasImage) {
       const buffer = Buffer.from(String(imageBase64), 'base64');
+      const caption = String(imageCaption ?? messageText ?? '').trim();
       userMsg = repo.addMessage(conversation.id, {
         waMessageId: localMessageId,
         role: 'USER',
         type: 'IMAGE',
-        content: `image (${imageMimeType || 'image/jpeg'})`,
+        content: caption || `image (${imageMimeType || 'image/jpeg'})`,
         mediaUrl: `simulated-media:${localMessageId}`,
       });
       const proofJob = repo.enqueueJob('PROCESS_SIMULATED_PAYMENT_PROOF', { userId: user.id, conversationId: conversation.id });
@@ -53,8 +55,9 @@ export async function POST(request: NextRequest) {
         user,
         conversation,
         buffer,
-        messageText ? String(messageText) : `${localMessageId}.jpg`,
-        String(imageMimeType || 'image/jpeg')
+        `${localMessageId}.jpg`,
+        String(imageMimeType || 'image/jpeg'),
+        caption
       );
       repo.updateJobStatus(proofJob.id, 'COMPLETED');
     } else {
@@ -75,16 +78,22 @@ export async function POST(request: NextRequest) {
 
     const assistantMsg = repo.addMessage(conversation.id, {
       role: 'ASSISTANT',
-      type: 'TEXT',
+      type: outcome.image ? 'IMAGE' : 'TEXT',
       content: outcome.replyText,
       tokensUsed: outcome.tokensUsed,
+      ...(outcome.image ? { mediaUrl: `stored:${outcome.image.storageKey}` } : {}),
     });
 
-    const outgoingPayload: WhatsAppOutgoingMessage = outcome.listMenu
-      ? buildListMessage(recipient, outcome.listMenu.interactive)
-      : outcome.buttons && outcome.buttons.length > 0
-        ? buildButtonMessage(recipient, outcome.replyText, outcome.buttons)
-        : buildTextMessage(recipient, outcome.replyText);
+    // A studio result would be uploaded to Meta's media endpoint and sent as an
+    // image message. The key is shown instead of the bytes: this endpoint never
+    // dispatches, and the file lives in the private data directory.
+    const outgoingPayload: WhatsAppOutgoingMessage = outcome.image
+      ? buildImageMessage(recipient, `simulated-media-id-${outcome.image.taskId}`, outcome.replyText)
+      : outcome.listMenu
+        ? buildListMessage(recipient, outcome.listMenu.interactive)
+        : outcome.buttons && outcome.buttons.length > 0
+          ? buildButtonMessage(recipient, outcome.replyText, outcome.buttons)
+          : buildTextMessage(recipient, outcome.replyText);
 
     return NextResponse.json({
       success: true,
@@ -94,6 +103,17 @@ export async function POST(request: NextRequest) {
       outcome,
       serviceCode: conversation.activeServiceCode ?? null,
       outgoingPayload,
+      image: outcome.image
+        ? {
+            taskId: outcome.image.taskId,
+            storageKey: outcome.image.storageKey,
+            mimeType: outcome.image.mimeType,
+            width: outcome.image.width,
+            height: outcome.image.height,
+            expiresAt: outcome.image.expiresAt,
+            uploaded: false,
+          }
+        : null,
       delivery: {
         dispatched: false,
         reason:

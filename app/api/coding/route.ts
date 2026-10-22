@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
-import { getAIProvider } from '@/lib/ai/provider-adapter';
+import { generateText, chainSummary } from '@/lib/ai/provider-adapter';
 import { detectLanguage } from '@/lib/ai/bilingual-router';
+import { logger } from '@/lib/logging/logger';
 
 const CODING_SYSTEM_INSTRUCTION =
   'You are a senior software engineer helping a builder in Rwanda. Return code and explanations in ' +
@@ -22,14 +23,15 @@ export async function POST(request: NextRequest) {
     }
 
     const resolvedTaskType = taskType || 'EXPLAIN';
-    const provider = getAIProvider();
+    const chain = chainSummary();
 
     let outputResult = '';
     let status: 'PENDING' | 'COMPLETED' | 'FAILED' = 'PENDING';
+    let answeredBy: string | null = null;
 
-    if (!provider) {
+    if (!chain.configured) {
       outputResult =
-        'GEMINI_API_KEY is not configured on this server, so no code was generated. Task stored as PENDING.';
+        'No AI provider key is configured on this server (GEMINI_API_KEY, or OPENAI_API_KEY as the rescue), so no code was generated. Task stored as PENDING.';
     } else {
       const taskGoal =
         resolvedTaskType === 'SCAFFOLD'
@@ -47,12 +49,19 @@ export async function POST(request: NextRequest) {
         (code ? `\n\nCode under review:\n${code}` : '');
 
       try {
-        const generated = await provider.generateResponse(prompt, CODING_SYSTEM_INSTRUCTION);
+        const generated = await generateText(prompt, CODING_SYSTEM_INSTRUCTION);
         outputResult = generated.text;
-        status = generated.text.trim().length > 0 ? 'COMPLETED' : 'FAILED';
+        answeredBy = `${generated.provider}:${generated.model}${generated.fellBack ? ' (rescue)' : ''}`;
+        status = 'COMPLETED';
       } catch (err: unknown) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        outputResult = `The AI provider could not answer: ${errorMsg}`;
+        // The provider's own error text stays in the log; the stored task carries the
+        // order that was tried so an operator can see it without pasting a secret.
+        logger.error('AI_GENERATION_FAILED', err instanceof Error ? err : new Error(String(err)), {
+          metadata: { route: 'coding', taskType: resolvedTaskType },
+        });
+        outputResult = `No text provider answered (${chainSummary().order
+          .map((p) => `${p.provider}:${p.model}`)
+          .join(' → ')}). Nothing was generated.`;
         status = 'FAILED';
       }
     }
@@ -71,7 +80,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       task: created,
-      aiProvider: provider ? provider.name : 'not-configured',
+      aiProvidersTried: chain.order.map((p) => `${p.provider}:${p.model}`),
+      answeredBy: answeredBy ?? 'no-provider-answered',
     });
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);

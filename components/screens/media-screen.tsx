@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Image as ImageIcon,
   CheckCircle2,
@@ -10,6 +10,17 @@ import {
   Upload,
 } from 'lucide-react';
 import { MediaTask } from '@/lib/types';
+import { adminBlobUrl } from '@/lib/client/admin-session';
+
+/** Studio inputs are described, never hosted: only real URLs render as images. */
+function isDisplayableUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value) || value.startsWith('blob:');
+}
+
+function storedKeyOf(task: MediaTask | null): string | null {
+  const stored = task?.processedUrl || '';
+  return stored.startsWith('stored:') ? stored.slice('stored:'.length) : null;
+}
 
 const OPERATIONS: Array<{ value: MediaTask['operation']; label: string }> = [
   { value: 'PASSPORT_CROP', label: 'Passport crop 35x45mm' },
@@ -32,6 +43,31 @@ export function MediaScreen() {
   const [operation, setOperation] = useState<MediaTask['operation']>('PASSPORT_CROP');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [formError, setFormError] = useState('');
+  const [preview, setPreview] = useState<Record<string, string>>({});
+  const [previewError, setPreviewError] = useState<{ taskId: string; message: string } | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const objectUrls = useRef<string[]>([]);
+
+  // Portraits are only ever fetched with the administrator bearer token, on
+  // request, so they never become public URLs and never leave the data directory.
+  useEffect(() => () => objectUrls.current.forEach((url) => URL.revokeObjectURL(url)), []);
+
+  const showStoredPhoto = useCallback(
+    async (taskId: string) => {
+      if (preview[taskId]) return;
+      setIsPreviewLoading(true);
+      setPreviewError(null);
+      const res = await adminBlobUrl(`/api/admin/media/image?taskId=${encodeURIComponent(taskId)}`);
+      setIsPreviewLoading(false);
+      if (res.url) {
+        objectUrls.current.push(res.url);
+        setPreview((prev) => ({ ...prev, [taskId]: res.url as string }));
+      } else {
+        setPreviewError({ taskId, message: res.error ?? 'The stored file could not be loaded.' });
+      }
+    },
+    [preview]
+  );
 
   const loadTasks = () => {
     fetch('/api/media')
@@ -89,9 +125,10 @@ export function MediaScreen() {
             <span>Photo Studio Queue</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1 max-w-2xl">
-            This screen records photo requests. No image editor is wired to this build yet, so crops,
-            background removal and biometric checks do not run — every request stays PENDING until an
-            editing service is connected.
+            Photo requests rendered by this server appear here. When an image provider is configured,
+            the studio produces the file, crops it to 35x45mm in code and keeps it in the private data
+            directory until the retention sweep deletes it. With no provider key, the person on WhatsApp
+            is told the studio is unavailable and no task is created.
           </p>
         </div>
 
@@ -183,11 +220,17 @@ export function MediaScreen() {
                   }`}
                 >
                   <div className="flex items-center gap-3">
-                    <img
-                      src={t.originalUrl}
-                      alt={t.userName}
-                      className="w-10 h-10 rounded-lg object-cover border border-zinc-700"
-                    />
+                    {isDisplayableUrl(t.originalUrl) ? (
+                      <img
+                        src={t.originalUrl}
+                        alt={t.userName}
+                        className="w-10 h-10 rounded-lg object-cover border border-zinc-700"
+                      />
+                    ) : (
+                      <div className="w-10 h-10 rounded-lg border border-zinc-700 bg-zinc-950 flex items-center justify-center">
+                        <ImageIcon className="w-4 h-4 text-zinc-600" />
+                      </div>
+                    )}
                     <div>
                       <p className="text-xs font-semibold text-zinc-200">{t.userName}</p>
                       <p className="text-[10px] text-emerald-400 font-mono mt-0.5">
@@ -231,45 +274,72 @@ export function MediaScreen() {
 
               <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800 text-center space-y-2">
                 <span className="text-[10px] text-zinc-400 font-medium uppercase tracking-wider block">
-                  Uploaded source image
+                  Source
                 </span>
-                <div className="w-40 h-48 mx-auto rounded-lg overflow-hidden border border-zinc-700 bg-zinc-900">
-                  <img
-                    src={selectedTask.originalUrl}
-                    alt="Original"
-                    className="w-full h-full object-cover"
-                  />
+                <div className="w-40 h-48 mx-auto rounded-lg overflow-hidden border border-zinc-700 bg-zinc-900 flex items-center justify-center">
+                  {isDisplayableUrl(selectedTask.originalUrl) ? (
+                    <img
+                      src={selectedTask.originalUrl}
+                      alt="Original"
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <ImageIcon className="w-6 h-6 text-zinc-600" />
+                  )}
                 </div>
                 <p className="text-[10px] text-zinc-500 break-all px-2">{selectedTask.originalUrl}</p>
               </div>
 
-              {selectedTask.processedUrl ? (
+              {storedKeyOf(selectedTask) ? (
                 <div className="p-3 rounded-lg bg-zinc-950 border border-emerald-500/30 text-center space-y-2">
                   <span className="text-[10px] text-emerald-400 font-medium uppercase tracking-wider block">
                     Edited output
                   </span>
-                  <div className="w-40 h-48 mx-auto rounded-lg overflow-hidden border-2 border-emerald-500 bg-white shadow-md">
-                    <img
-                      src={selectedTask.processedUrl}
-                      alt="Processed"
-                      className="w-full h-full object-cover"
-                    />
+                  <div className="w-40 h-48 mx-auto rounded-lg overflow-hidden border-2 border-emerald-500 bg-white shadow-md flex items-center justify-center">
+                    {preview[selectedTask.id] ? (
+                      <img
+                        src={preview[selectedTask.id]}
+                        alt="Processed"
+                        className="w-full h-full object-cover"
+                      />
+                    ) : previewError?.taskId === selectedTask.id ? (
+                      <span className="text-[10px] text-amber-400 px-3">{previewError.message}</span>
+                    ) : (
+                      <button
+                        onClick={() => void showStoredPhoto(selectedTask.id)}
+                        disabled={isPreviewLoading}
+                        className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-60 border border-zinc-700 text-[11px] font-semibold text-zinc-200 transition-colors"
+                      >
+                        {isPreviewLoading ? 'Loading…' : 'View photo'}
+                      </button>
+                    )}
                   </div>
+                  <p className="text-[10px] text-zinc-500 px-2">
+                    Stored privately under an opaque key and shown only to a signed-in administrator.
+                    Kept for {selectedTask.retentionDays} days.
+                  </p>
+                </div>
+              ) : (selectedTask.processedUrl || '').startsWith('purged:') ? (
+                <div className="p-4 rounded-lg bg-zinc-950 border border-zinc-800 text-xs text-zinc-400 flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-400" />
+                  <span>
+                    The file was deleted at the end of its {selectedTask.retentionDays}-day retention
+                    window. Only this task record remains.
+                  </span>
                 </div>
               ) : (
                 <div className="p-4 rounded-lg bg-zinc-950 border border-amber-500/20 text-xs text-amber-400 flex items-start gap-2">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>
-                    No edited output exists for this task. Passport compliance checks (35x45mm crop,
-                    plain background, face coverage) are not performed by this service — connect an
-                    image editing backend and mark the task COMPLETED when it returns a file.
+                    No edited output exists for this task. Requests made through WhatsApp produce a
+                    file only when an image provider key is configured on this server.
                   </span>
                 </div>
               )}
 
               <p className="text-[11px] text-zinc-500">
-                Retention: records reference the source URL for {selectedTask.retentionDays} days. Deletion
-                must be enforced by the media store that hosts the file.
+                Retention: the retention sweep deletes stored files after {selectedTask.retentionDays}{' '}
+                days. Records were created from real traffic on this server.
               </p>
             </>
           ) : (
