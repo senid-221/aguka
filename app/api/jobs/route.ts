@@ -5,6 +5,12 @@ import { crawlOneSource } from '@/lib/jobs/crawler';
 import { jobDiscoveryConfig } from '@/lib/config';
 
 export async function GET(request: NextRequest) {
+  // Learners reach listings through the WhatsApp agent tool, never here. This answer
+  // carries each board's crawl health and the last failure note, so it is dashboard-only.
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const { searchParams } = new URL(request.url);
   const keyword = searchParams.get('keyword') || undefined;
   const sourceCode = searchParams.get('sourceCode') || undefined;

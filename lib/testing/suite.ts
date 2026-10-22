@@ -46,19 +46,45 @@ import { buildStudioPrompt } from '@/lib/images/studio';
 import { imageRetentionDays, passportHeightPx, passportWidthPx } from '@/lib/images/spec';
 import { runRetentionCleanup } from '@/lib/maintenance/retention';
 import { importContentPack } from '@/lib/road-safety/content-pack';
+import { RNP_PDL, REVIEW_DATE } from '@/lib/road-safety/sources';
+import { generatableFacts } from '@/lib/road-safety/verified-facts';
 import {
+  attemptView,
+  displayedOptions,
   extractAnswerIndexes,
+  findPendingAttempt,
+  formatQuestionSheet,
   gradeAttempt,
   looksLikeAnswers,
+  planSession,
+  publishedLessons,
   publishedQuestions,
+  reportQuestionIssue,
+  saveAnswer,
+  sheetLabel,
   startAttempt,
+  storedIndexFor,
 } from '@/lib/road-safety/academy';
+import { buildSessionReport, formatSessionReport, nextStepLines } from '@/lib/road-safety/session-report';
+import { buildRoadSafetyTutorContext } from '@/lib/road-safety/tutor-context';
+import { handleRoadSafetyMessage } from '@/lib/road-safety/whatsapp-flow';
 import { NextRequest } from 'next/server';
 import { POST as paymentsWebhookPOST } from '@/app/api/payments/webhook/route';
+import { GET as usersRouteGET, POST as usersRoutePOST } from '@/app/api/users/route';
+import { GET as conversationsRouteGET } from '@/app/api/conversations/route';
+import { GET as jobsRouteGET, POST as jobsRoutePOST } from '@/app/api/jobs/route';
+import { GET as agentsRouteGET } from '@/app/api/agents/route';
+import { GET as mediaRouteGET, POST as mediaRoutePOST } from '@/app/api/media/route';
+import { GET as codingRouteGET, POST as codingRoutePOST } from '@/app/api/coding/route';
+import { GET as studyRouteGET, POST as studyRoutePOST } from '@/app/api/study/route';
+import { GET as marketplaceRouteGET, POST as marketplaceRoutePOST } from '@/app/api/marketplace/route';
+import { POST as simulateRoutePOST } from '@/app/api/whatsapp/simulate/route';
+import { GET as rsAdminRouteGET, POST as rsAdminRoutePOST } from '@/app/api/admin/road-safety/route';
+import { issueAdminToken } from '@/lib/security/admin-auth';
 import { crawlSource, type CrawlRunResult, type JobCrawlStore, type SourceCrawlResult } from '@/lib/jobs/crawler';
 import { startJobSourceSchedule } from '@/lib/jobs/schedule';
 import { normalizeJobListing } from '@/lib/jobs/normalizer';
-import type { JobListing, JobSource } from '@/lib/types';
+import type { JobListing, JobSource, RoadSafetyQuestion } from '@/lib/types';
 import type { RawJobItem } from '@/lib/jobs/types';
 import { readFileSync } from 'node:fs';
 import crypto from 'node:crypto';
@@ -632,9 +658,9 @@ export async function runPlatformTestSuiteAsync(): Promise<{
   const t22Start = Date.now();
   const packReport = importContentPack();
   const questionPool = publishedQuestions();
-  const started = questionPool.length > 0 ? startAttempt(userA, 'MOCK_EXAM', { count: 5 }) : null;
+  const started = questionPool.length > 0 ? await startAttempt(userA, 'MOCK_EXAM', { count: 5 }) : null;
   const gradedPerfect = started ? gradeAttempt(started.attempt, started.questions.map((q) => q.correctIndex)) : null;
-  const startedPractice = questionPool.length > 0 ? startAttempt(userB, 'PRACTICE', { count: 3 }) : null;
+  const startedPractice = questionPool.length > 0 ? await startAttempt(userB, 'PRACTICE', { count: 3 }) : null;
   const gradedWrong = startedPractice
     ? gradeAttempt(
         startedPractice.attempt,
@@ -1580,6 +1606,643 @@ Published on 12-10-2026 | Deadline 30-11-2026
       'a feed listing is stored with the employer split from the title, the salary, the board category and a tag-only excerpt, re-crawling refreshes instead of duplicating, a card page is read with its day-first deadline and an expired posting marked EXPIRED, a board with no public feed reports the reason and stores nothing until JOB_FEED_URL_<CODE> is set, an override aimed at a page reports that it is not a feed instead of passing as an empty board, a board that answers 500 stores nothing, the worker sweeps on start and again on the configured interval without overlapping itself or crawling at all when the interval is 0, and a row without a source URL is refused',
     actual: `feed=${firstRemoteCrawl.status}/${firstRemoteCrawl.stored} stored, recrawl=${secondRemoteCrawl.stored}/${secondRemoteCrawl.refreshed}, cards=${cardsCrawl.status}/${storedCards.length} with ${kit.source('JOB_IN_RWANDA').activeListingsCount} active, mifotra=${govCrawl.status} then ${govFeedCrawl.status}/${govFeedCrawl.stored} then page-override ${govPageCrawl.status}, down=${failedCrawl.status}/${failedCrawl.stored}, schedule=${scheduleRuns} sweeps on a ${timerDelayMs}ms timer with ${clearedTimers} cleared, requests=${crawlFetchCalls.length} served by the stub, ungrounded=${ungroundedThrew}`,
     durationMs: Date.now() - t33Start,
+  });
+
+  // Test 35: Every dashboard data route refuses everyone but an administrator.
+  // POST bodies here are deliberately invalid so a broken gate answers 400 without
+  // spending provider tokens, crawling a board, or touching a record.
+  const t35Start = Date.now();
+  const adminRequest = (url: string, headers: Record<string, string>, body?: Record<string, unknown>) =>
+    new NextRequest(url, {
+      headers,
+      ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
+    });
+
+  const guardedHandlers: Array<{ label: string; call: (h: Record<string, string>) => Promise<Response> }> = [
+    { label: 'GET /api/users', call: (h) => usersRouteGET(adminRequest('http://localhost/api/users', h)) },
+    { label: 'POST /api/users', call: (h) => usersRoutePOST(adminRequest('http://localhost/api/users', h, { action: 'NO_SUCH_ACTION' })) },
+    { label: 'GET /api/conversations', call: (h) => conversationsRouteGET(adminRequest('http://localhost/api/conversations', h)) },
+    { label: 'GET /api/jobs', call: (h) => jobsRouteGET(adminRequest('http://localhost/api/jobs', h)) },
+    { label: 'POST /api/jobs', call: (h) => jobsRoutePOST(adminRequest('http://localhost/api/jobs', h, { action: 'NO_SUCH_ACTION' })) },
+    { label: 'GET /api/agents', call: (h) => agentsRouteGET(adminRequest('http://localhost/api/agents', h)) },
+    { label: 'GET /api/media', call: (h) => mediaRouteGET(adminRequest('http://localhost/api/media', h)) },
+    { label: 'POST /api/media', call: (h) => mediaRoutePOST(adminRequest('http://localhost/api/media', h, { action: 'NO_SUCH_ACTION' })) },
+    { label: 'GET /api/coding', call: (h) => codingRouteGET(adminRequest('http://localhost/api/coding', h)) },
+    { label: 'POST /api/coding', call: (h) => codingRoutePOST(adminRequest('http://localhost/api/coding', h, {})) },
+    { label: 'GET /api/study', call: (h) => studyRouteGET(adminRequest('http://localhost/api/study', h)) },
+    { label: 'POST /api/study', call: (h) => studyRoutePOST(adminRequest('http://localhost/api/study', h, { action: 'NO_SUCH_ACTION' })) },
+    { label: 'GET /api/marketplace', call: (h) => marketplaceRouteGET(adminRequest('http://localhost/api/marketplace', h)) },
+    { label: 'POST /api/marketplace', call: (h) => marketplaceRoutePOST(adminRequest('http://localhost/api/marketplace', h, { action: 'NO_SUCH_ACTION' })) },
+    { label: 'POST /api/whatsapp/simulate', call: (h) => simulateRoutePOST(adminRequest('http://localhost/api/whatsapp/simulate', h, {})) },
+    { label: 'GET /api/admin/road-safety', call: (h) => rsAdminRouteGET(adminRequest('http://localhost/api/admin/road-safety', h)) },
+    { label: 'POST /api/admin/road-safety', call: (h) => rsAdminRoutePOST(adminRequest('http://localhost/api/admin/road-safety', h, { action: 'NO_SUCH_ACTION' })) },
+  ];
+
+  const wrongSecretToken = issueAdminToken('forger@localhost', 60, 'this-secret-is-not-the-servers');
+  const authRefusals: string[] = [];
+  for (const handler of guardedHandlers) {
+    const anonymous = await handler.call({});
+    const anonymousBody = (await anonymous.json().catch(() => null)) as { error?: string } | null;
+    if (anonymous.status !== 401) {
+      authRefusals.push(`${handler.label} answered ${anonymous.status} with no token`);
+    } else if (anonymousBody?.error !== 'Unauthorized') {
+      authRefusals.push(`${handler.label} said ${JSON.stringify(anonymousBody)}`);
+    }
+    const forged = await handler.call({ authorization: `Bearer ${wrongSecretToken}` });
+    if (forged.status !== 401) authRefusals.push(`${handler.label} accepted a token signed with the wrong secret (${forged.status})`);
+  }
+
+  const adminSecretConfigured = Boolean(process.env.ADMIN_JWT_SECRET);
+  let adminPositiveDetail = 'positive path not exercised because ADMIN_JWT_SECRET is not set';
+  if (adminSecretConfigured) {
+    const realToken = issueAdminToken('suite-admin@localhost');
+    const allowed = await usersRouteGET(adminRequest('http://localhost/api/users', { authorization: `Bearer ${realToken}` }));
+    const allowedBody = (await allowed.json().catch(() => null)) as { users?: unknown[] } | null;
+    if (allowed.status !== 200) authRefusals.push(`a genuine administrator token was refused (${allowed.status})`);
+    if (!Array.isArray(allowedBody?.users)) authRefusals.push('a genuine administrator token returned no user list');
+    adminPositiveDetail = `real session opened GET /api/users at ${allowed.status} with ${allowedBody?.users?.length ?? 0} row(s)`;
+  }
+
+  results.push({
+    id: 'test-dashboard-route-authorization',
+    category: 'Security & Privacy',
+    name: 'Data Routes Answer 401 To Anonymous And Forged Callers',
+    passed: authRefusals.length === 0,
+    expected:
+      'every route that reads or changes another person record is closed on the server: no token and a token signed with the wrong secret both answer 401 with the plain Unauthorized message, and only a session issued with ADMIN_JWT_SECRET opens the list',
+    actual: `${guardedHandlers.length} handlers x 2 refusals, sessions=${adminSecretConfigured ? 'configured' : 'disabled'}, ${adminPositiveDetail}, ${
+      authRefusals.length ? 'FAILED: ' + authRefusals.join('; ') : 'all closed'
+    }`,
+    durationMs: Date.now() - t35Start,
+  });
+
+  // Test 36: A learner is not sold the same paper twice. Questions they have already
+  // answered are held back, and when the verified bank genuinely runs out the reply says
+  // so instead of pretending the repeat is fresh practice.
+  const t36Start = Date.now();
+  const learnerRepeat = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 60).slice(-8)}`, 'Suite Repeat Learner');
+  const bankSize = publishedQuestions().length;
+  const setOne = await startAttempt(learnerRepeat, 'PRACTICE', { count: 4 });
+  const setOneWrong = setOne
+    ? gradeAttempt(setOne.attempt, setOne.questions.map((q) => (q.correctIndex + 1) % q.optionsEn.length))
+    : null;
+  const setTwo = await startAttempt(learnerRepeat, 'PRACTICE', { count: 4 });
+  const overlap =
+    setOne && setTwo ? setOne.questions.filter((q) => setTwo.questions.some((o) => o.id === q.id)).length : -1;
+  const drained = await startAttempt(learnerRepeat, 'PRACTICE', { count: bankSize });
+  const reuseDisclosed = drained?.note ? /subiwemo|repeat/i.test(drained.note) : false;
+  results.push({
+    id: 'test-road-safety-fresh-sets',
+    category: 'Road Safety Academy',
+    name: 'Practice Sets Avoid Answered Questions And Disclose Any Repeat',
+    passed:
+      bankSize >= 10 &&
+      setOneWrong !== null &&
+      setTwo !== null &&
+      drained !== null &&
+      overlap === 0 &&
+      reuseDisclosed,
+    expected:
+      'two papers of 4 share no question while the bank has unseen items, and a paper larger than the unseen remainder names how many items repeat',
+    actual: `bank=${bankSize}, overlap=${overlap}, drained=${drained ? drained.questions.length : 0}, note=${(drained?.note ?? 'none').slice(0, 60)}…`,
+    durationMs: Date.now() - t36Start,
+  });
+
+  // Test 37: Difficulty follows results rather than wording. A learner who answers
+  // everything correctly is pushed up; one who answers everything wrongly is eased down.
+  const t37Start = Date.now();
+  const learnerSharp = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 61).slice(-8)}`, 'Suite Sharp Learner');
+  const learnerStruggling = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 62).slice(-8)}`, 'Suite Struggling Learner');
+  const beforePlan = planSession(learnerSharp.id, 'PRACTICE');
+  for (let round = 0; round < 2; round++) {
+    const right = await startAttempt(learnerSharp, 'PRACTICE', { count: 4 });
+    if (right) gradeAttempt(right.attempt, right.questions.map((q) => q.correctIndex));
+    const wrong = await startAttempt(learnerStruggling, 'PRACTICE', { count: 4 });
+    if (wrong) gradeAttempt(wrong.attempt, wrong.questions.map((q) => (q.correctIndex + 1) % q.optionsEn.length));
+  }
+  const sharpPractice = planSession(learnerSharp.id, 'PRACTICE');
+  const sharpMock = planSession(learnerSharp.id, 'MOCK_EXAM');
+  const strugglingPlan = planSession(learnerStruggling.id, 'PRACTICE');
+  results.push({
+    id: 'test-road-safety-adaptive-difficulty',
+    category: 'Road Safety Academy',
+    name: 'Adaptive Difficulty Rises On Accuracy And Falls On Mistakes',
+    passed:
+      beforePlan.difficulty === 'EASY' &&
+      sharpPractice.difficulty === 'MEDIUM' &&
+      sharpMock.difficulty === 'HARD' &&
+      strugglingPlan.difficulty === 'EASY' &&
+      sharpPractice.rationale.length > 0 &&
+      strugglingPlan.targetModuleIds.length <= 2,
+    expected:
+      'a new learner starts EASY, an all-correct learner is raised to MEDIUM for practice and HARD for a mock, an all-wrong learner stays EASY, and the plan states why in plain text',
+    actual: `new=${beforePlan.difficulty}, sharpPractice=${sharpPractice.difficulty}, sharpMock=${sharpMock.difficulty}, struggling=${strugglingPlan.difficulty}, rationale=${sharpPractice.rationale.slice(0, 50)}…`,
+    durationMs: Date.now() - t37Start,
+  });
+
+  // Test 38: The clock belongs to the server. A pick is autosaved before grading, the
+  // deadline is written when the paper opens, and a paper that is never submitted is
+  // still closed from the picks already held — unanswered items score nothing.
+  const t38Start = Date.now();
+  const learnerTimeout = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 63).slice(-8)}`, 'Suite Timed-Out Learner');
+  const timedTemplate =
+    repo.getExamTemplates().find((t) => t.nameEn === 'Suite timed simulation') ??
+    repo.createExamTemplate({
+      nameEn: 'Suite timed simulation',
+      nameRw: "Ikizamini cy'igerageza gifite isaha",
+      moduleId: null,
+      questionCount: 5,
+      passPercent: 60,
+      timeLimitMinutes: 30,
+      strictMode: true,
+      officialBasis: RNP_PDL,
+      status: 'PUBLISHED',
+    });
+  const timed = timedTemplate ? await startAttempt(learnerTimeout, 'MOCK_EXAM', { examTemplateId: timedTemplate.id, count: 3 }) : null;
+  const correctDisplayPosition = (attemptId: string, question: RoadSafetyQuestion): number => {
+    for (let d = 0; d < question.optionsEn.length; d++) {
+      if (storedIndexFor(attemptId, question, d) === question.correctIndex) return d;
+    }
+    return -1;
+  };
+  const autosaved =
+    timed && timed.questions[0] && timedTemplate
+      ? saveAnswer(timed.attempt, 0, correctDisplayPosition(timed.attempt.id, timed.questions[0]))
+      : null;
+  const liveBeforeExpiry = timed ? attemptView(timed.attempt, 'ENGLISH') : null;
+  if (timed) timed.attempt.deadlineAt = new Date(Date.now() - 5_000).toISOString();
+  const reopenedAfterExpiry = findPendingAttempt(learnerTimeout.id);
+  const closedByServer = timed ? repo.getExamAttemptById(timed.attempt.id) : undefined;
+  results.push({
+    id: 'test-road-safety-server-timer',
+    category: 'Road Safety Academy',
+    name: 'Timed Paper Autosaves Picks And Auto-Submits When The Clock Runs Out',
+    passed:
+      timedTemplate.timeLimitMinutes === 30 &&
+      timedTemplate.strictMode === true &&
+      timed !== null &&
+      autosaved !== null &&
+      autosaved.savedAnswers[0] === (timed?.questions[0]?.correctIndex ?? -99) &&
+      (liveBeforeExpiry?.remainingSeconds ?? 0) > 1500 &&
+      (liveBeforeExpiry?.answeredCount ?? 0) === 1 &&
+      reopenedAfterExpiry === undefined &&
+      closedByServer?.submittedAt != null &&
+      (closedByServer?.correctCount ?? 0) === 1 &&
+      closedByServer?.answers[1]?.selectedIndex === null,
+    expected:
+      'a timed paper gets a server deadline, one autosaved pick is stored as the bank index it maps to, and once the deadline passes no open attempt remains and the paper is graded 1 correct with the untouched items unanswered',
+    actual: `template=${timedTemplate?.nameEn ?? 'none'}, remaining=${liveBeforeExpiry?.remainingSeconds ?? 'n/a'}, picked=${autosaved?.savedAnswers[0] ?? 'n/a'} vs stored ${timed?.questions[0]?.correctIndex ?? 'n/a'}, stillOpen=${reopenedAfterExpiry ? 'yes' : 'no'}, score=${closedByServer?.scorePercent ?? 'n/a'}% (${closedByServer?.correctCount ?? 'n/a'}/${closedByServer?.totalQuestions ?? 'n/a'})`,
+    durationMs: Date.now() - t38Start,
+  });
+
+  // Test 39: A strict paper keeps the answer key on the server. Nothing in the live view
+  // tells the learner what they got right until the paper is actually submitted.
+  const t39Start = Date.now();
+  const learnerStrict = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 64).slice(-8)}`, 'Suite Strict Learner');
+  const strictStarted = timedTemplate ? await startAttempt(learnerStrict, 'MOCK_EXAM', { examTemplateId: timedTemplate.id, count: 4 }) : null;
+  const sealed = strictStarted ? attemptView(strictStarted.attempt, 'ENGLISH') : null;
+  const sealedFlags = strictStarted
+    ? { strict: strictStarted.attempt.strict, revealed: strictStarted.attempt.answersRevealed }
+    : null;
+  const gradedStrict = strictStarted ? gradeAttempt(strictStarted.attempt, strictStarted.questions.map((q) => q.correctIndex)) : null;
+  const opened = gradedStrict ? attemptView(gradedStrict, 'ENGLISH') : null;
+  results.push({
+    id: 'test-road-safety-strict-mode',
+    category: 'Road Safety Academy',
+    name: 'Strict Exam Hides The Key Until Submission',
+    passed:
+      strictStarted !== null &&
+      sealedFlags !== null &&
+      sealedFlags.strict === true &&
+      sealedFlags.revealed === false &&
+      sealed !== null &&
+      sealed.scorePercent === null &&
+      sealed.correctCount === null &&
+      sealed.passed === null &&
+      sealed.answers.length === 0 &&
+      sealed.questions.length === 4 &&
+      opened !== null &&
+      opened.scorePercent === 100 &&
+      opened.answers.length === 4,
+    expected:
+      'a mock opened from a strict template carries strict=true, shows the questions and the timer but no score, no verdict and no answer objects, and all of it appears after grading',
+    actual: `strict=${sealedFlags?.strict ?? 'n/a'}, revealedBeforeSubmit=${sealedFlags?.revealed ?? 'n/a'}, sealedScore=${String(sealed?.scorePercent)}, sealedAnswers=${sealed?.answers.length ?? 'n/a'}, sealedQuestions=${sealed?.questions.length ?? 'n/a'}, afterScore=${opened?.scorePercent ?? 'n/a'}, afterAnswers=${opened?.answers.length ?? 'n/a'}`,
+    durationMs: Date.now() - t39Start,
+  });
+
+  // Test 40: Shuffling options never moves the correct answer, and no paper is allowed to
+  // read like the official government exam.
+  const t40Start = Date.now();
+  const englishSheet = drained ? formatQuestionSheet(drained.questions, drained.attempt, 'ENGLISH') : '';
+  const kinyarwandaSheet = drained ? formatQuestionSheet(drained.questions, drained.attempt, 'KINYARWANDA') : '';
+  const timedSheet = timed ? formatQuestionSheet(timed.questions, timed.attempt, 'ENGLISH') : '';
+  const shuffledQuestions = drained?.questions ?? [];
+  const shuffleKeepsKey = shuffledQuestions.every((q) => {
+    const shown = displayedOptions(q, drained?.attempt.id ?? '', 'ENGLISH');
+    const positions = shown
+      .map((_, d) => d)
+      .filter((d) => storedIndexFor(drained?.attempt.id ?? '', q, d) === q.correctIndex);
+    return (
+      positions.length === 1 &&
+      shown[positions[0]] === q.optionsEn[q.correctIndex] &&
+      shown.length === q.optionsEn.length
+    );
+  });
+  const noFalseOfficialClaim =
+    /not an official government examination/.test(englishSheet) &&
+    /iki si ikizamini/.test(kinyarwandaSheet) &&
+    /pass mark follows/.test(timedSheet) &&
+    /our own practice settings/.test(timedSheet) &&
+    !/official PDL/i.test(timedSheet);
+  results.push({
+    id: 'test-road-safety-shuffle-and-labelling',
+    category: 'Road Safety Academy',
+    name: 'Option Shuffling Keeps The Key Correct And Papers Are Labelled Simulations',
+    passed:
+      shuffledQuestions.length >= 4 &&
+      shuffleKeepsKey &&
+      drained?.attempt.id !== undefined &&
+      noFalseOfficialClaim,
+    expected:
+      'every shuffled sheet shows the same option count with exactly one position that maps back to the stored correct index, and both language sheets carry the simulation disclaimer while a cited paper separates the legal pass mark from our own settings',
+    actual: `questions=${shuffledQuestions.length}, keyKept=${shuffleKeepsKey ? 'yes' : 'no'}, disclaimers=${noFalseOfficialClaim ? 'present' : 'missing'}`,
+    durationMs: Date.now() - t40Start,
+  });
+
+  // Test 41: The WhatsApp path is the same engine. A learner who chats "practice" and then
+  // sends sheet positions is graded on the server, and the correction names the letter they
+  // actually saw rather than the index hidden in the bank.
+  const t41Start = Date.now();
+  const learnerChat = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 65).slice(-8)}`, 'Suite Chat Learner');
+  const chatStart = await handleRoadSafetyMessage(learnerChat, 'practice', 'ENGLISH');
+  const chatAttempt = findPendingAttempt(learnerChat.id);
+  const chatAnswers = chatAttempt ? chatAttempt.questionIds.map((_, i) => i + 1).join(',') : '';
+  const chatGrade = chatAttempt ? await handleRoadSafetyMessage(learnerChat, chatAnswers, 'ENGLISH') : null;
+  const chatQuestion = chatAttempt ? repo.getRoadSafetyQuestionById(chatAttempt.questionIds[0]) : undefined;
+  const chatGraded = chatAttempt ? repo.getExamAttemptById(chatAttempt.id) : undefined;
+  const typedFirstOption =
+    chatQuestion && chatAttempt && chatGraded
+      ? displayedOptions(chatQuestion, chatAttempt.id, 'ENGLISH')[0]
+      : '';
+  const serverStoredPick =
+    chatQuestion && chatAttempt ? storedIndexFor(chatAttempt.id, chatQuestion, 0) : null;
+  results.push({
+    id: 'test-road-safety-whatsapp-exam-path',
+    category: 'Road Safety Academy',
+    name: 'WhatsApp Practice Uses The Server Engine And Maps Typed Letters',
+    passed:
+      chatStart?.intent === 'START_PRACTICE' &&
+      chatStart.replyText.includes('Practice simulation') &&
+      chatAttempt !== undefined &&
+      chatGrade?.intent === 'GRADE_ATTEMPT' &&
+      /^Score: \d+% \(\d+\/\d+\)/.test(chatGrade?.replyText ?? '') &&
+      chatGrade.replyText.includes('you chose: A') &&
+      chatGraded?.answers[0]?.selectedIndex === serverStoredPick &&
+      chatGraded?.answers[0]?.givenAnswerEn === typedFirstOption,
+    expected:
+      'a chat session starts a real server attempt, the graded reply carries a Score line and the simulation label, and the answer recorded is the bank index the typed sheet position maps to',
+    actual: `start=${chatStart?.intent ?? 'n/a'}, grade=${chatGrade?.intent ?? 'n/a'}, head=${(chatGrade?.replyText ?? '').slice(0, 24)}…, picked=${chatGraded?.answers[0]?.selectedIndex ?? 'n/a'} vs mapped ${serverStoredPick ?? 'n/a'}`,
+    durationMs: Date.now() - t41Start,
+  });
+
+  // Test 42: The six-part report is a calculation over stored rows. It cannot exist before
+  // the paper is graded, its numbers must match the attempt, and every lesson it recommends
+  // must be the lesson the learner gets if they type that number.
+  const t42Start = Date.now();
+  const learnerReport = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 66).slice(-8)}`, 'Suite Report Learner');
+  const reportPaper = await startAttempt(learnerReport, 'PRACTICE', { count: 6 });
+  const prematureReport = reportPaper ? buildSessionReport(reportPaper.attempt) : null;
+  const gradedReport = reportPaper
+    ? gradeAttempt(
+        reportPaper.attempt,
+        reportPaper.questions.map((q, i) => (i % 2 === 0 ? q.correctIndex : (q.correctIndex + 1) % q.optionsEn.length))
+      )
+    : null;
+  const report = gradedReport ? buildSessionReport(gradedReport) : null;
+  const englishReport = report ? formatSessionReport(report, 'ENGLISH') : '';
+  const rwandaReport = report ? formatSessionReport(report, 'KINYARWANDA') : '';
+  const lessonNumbers = report
+    ? report.recommendedLessons.every((r) => publishedLessons()[r.number - 1]?.id === r.lessonId)
+    : false;
+  // A module where the learner got 2 of 3 right is legitimately in both topic lists, so
+  // coverage is counted once per module id, never once per list.
+  const answeredAcrossTopics = report
+    ? Array.from(new Map(report.topicsCorrect.concat(report.topicsToImprove).map((t) => [t.moduleId, t])).values()).reduce(
+        (sum, t) => sum + t.answered,
+        0
+      )
+    : -1;
+  const improveTopicsAgree = report
+    ? report.topicsToImprove.every((t) => t.answered - t.correct > 0) &&
+      report.topicsCorrect.every((t) => t.correct > 0) &&
+      report.explanations.length === gradedReport!.totalQuestions - gradedReport!.correctCount
+    : false;
+  results.push({
+    id: 'test-road-safety-session-report',
+    category: 'Road Safety Academy',
+    name: 'Post-Session Report Has Six Parts Grounded In The Graded Paper',
+    passed:
+      reportPaper !== null &&
+      gradedReport !== null &&
+      report !== null &&
+      prematureReport === null &&
+      report.scorePercent === gradedReport.scorePercent &&
+      report.correctCount === gradedReport.correctCount &&
+      answeredAcrossTopics === gradedReport.totalQuestions &&
+      improveTopicsAgree &&
+      lessonNumbers &&
+      report.explanations.every((e) => e.correctAnswer.length > 0) &&
+      report.nextSession.kind === (report.scorePercent < 50 ? 'LEARN' : report.kind === 'PRACTICE' ? 'MOCK_EXAM' : 'PRACTICE') &&
+      ['1. SCORE', '2. TOPICS YOU ANSWERED CORRECTLY', '3. TOPICS TO IMPROVE', '4. WHY THE MISSED ONES ARE WRONG', '5. LESSONS AND PRACTICE FOR YOU', '6. SUGGESTED NEXT SESSION'].every((h) =>
+        englishReport.includes(h)
+      ) &&
+      rwandaReport.includes('1. AMANOTA') &&
+      rwandaReport.includes('6. IKIKORWA GIKURIKIRAHO') &&
+      nextStepLines(report, 'ENGLISH').includes('Next: send'),
+    expected:
+      'buildSessionReport returns null for an open paper, then six numbered sections whose score, topic tallies, explanation count and lesson numbers all reconcile with the graded attempt and the published lesson list',
+    actual: `premature=${prematureReport === null ? 'null' : 'BUILT'}, score=${report?.scorePercent ?? 'n/a'}/${gradedReport?.scorePercent ?? 'n/a'}, topicsAnswered=${answeredAcrossTopics}/${gradedReport?.totalQuestions ?? 'n/a'}, explanations=${report?.explanations.length ?? 'n/a'}, improve=${report?.topicsToImprove.length ?? 'n/a'}, lessonNumbers=${lessonNumbers}, next=${report?.nextSession.kind ?? 'n/a'}, sections=${englishReport.split('\n\n').length}`,
+    durationMs: Date.now() - t42Start,
+  });
+
+  // Test 43: A learner reporting a wrong answer pulls that item out of the papers. The
+  // safe direction of error is a gap in coverage, not a rule nobody checked still being taught.
+  const t43Start = Date.now();
+  const learnerReporter = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 67).slice(-8)}`, 'Suite Reporter');
+  const reportedPaper = await startAttempt(learnerReporter, 'PRACTICE', { count: 3 });
+  const reportedQuestion = reportedPaper?.questions[1];
+  const wasPublished = reportedQuestion ? publishedQuestions().some((q) => q.id === reportedQuestion.id) : false;
+  const withdrawal = reportedQuestion
+    ? reportQuestionIssue({
+        questionId: reportedQuestion.id,
+        userId: learnerReporter.id,
+        channel: 'API',
+        note: 'The fine amount in the explanation does not match the source I read.',
+      })
+    : null;
+  // Read the result into plain values now: the repository returns live rows, and the
+  // restore at the end of this test would otherwise rewrite what we just observed.
+  const observedWithdrawal = withdrawal ? { withdrawn: withdrawal.withdrawn, status: withdrawal.question.status } : null;
+  const stillServed = reportedQuestion ? publishedQuestions().some((q) => q.id === reportedQuestion.id) : true;
+  const inQueue = reportedQuestion ? repo.getReviewQueue().some((q) => q.id === reportedQuestion.id) : false;
+  const storedReport = reportedQuestion ? repo.getRoadSafetyQuestionById(reportedQuestion.id)?.issueReports[0] : undefined;
+  const nextPaper = await startAttempt(learnerReporter, 'PRACTICE', { count: 3 });
+  const avoidedByNextPaper = reportedQuestion ? !nextPaper?.questions.some((q) => q.id === reportedQuestion.id) : false;
+  if (reportedQuestion) repo.updateRoadSafetyQuestion(reportedQuestion.id, { status: 'PUBLISHED' });
+  results.push({
+    id: 'test-road-safety-inaccuracy-reporting',
+    category: 'Road Safety Academy',
+    name: 'A Reported Question Leaves The Papers And Enters The Review Queue',
+    passed:
+      reportedPaper !== null &&
+      reportedQuestion !== undefined &&
+      wasPublished &&
+      observedWithdrawal !== null &&
+      observedWithdrawal.withdrawn === true &&
+      observedWithdrawal.status === 'NEEDS_REVIEW' &&
+      !stillServed &&
+      inQueue &&
+      Boolean(storedReport?.note.startsWith('The fine amount')) &&
+      storedReport?.userId === learnerReporter.id &&
+      storedReport?.channel === 'API' &&
+      avoidedByNextPaper,
+    expected:
+      'reporting question 2 of a learner own paper marks it NEEDS_REVIEW, records who reported it and what they said, removes it from the published pool and from every later paper, and lists it in the admin review queue',
+    actual: `publishedBefore=${wasPublished}, withdrawn=${observedWithdrawal?.withdrawn ?? 'n/a'}, status=${observedWithdrawal?.status ?? 'n/a'}, stillServed=${stillServed}, inQueue=${inQueue}, report=${storedReport?.channel ?? 'none'}/${(storedReport?.note ?? '').slice(0, 20)}…, avoided=${avoidedByNextPaper}`,
+    durationMs: Date.now() - t43Start,
+  });
+
+  // Test 44: The conversational tutor is handed the learner's own record, not a generic
+  // traffic-law essay, and is told plainly when there is nothing to teach from.
+  const t44Start = Date.now();
+  const learnerTutor = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 68).slice(-8)}`, 'Suite Tutor Learner');
+  const emptyGrounding = buildRoadSafetyTutorContext(learnerTutor.id).join('\n');
+  const tutorPaper = await startAttempt(learnerTutor, 'PRACTICE', { count: 4 });
+  const tutorGraded = tutorPaper
+    ? gradeAttempt(tutorPaper.attempt, tutorPaper.questions.map((q) => (q.correctIndex + 1) % q.optionsEn.length))
+    : null;
+  const grounded = buildRoadSafetyTutorContext(learnerTutor.id).join('\n');
+  const firstQuestion = tutorPaper?.questions[0];
+  const firstPick = tutorGraded?.answers[0];
+  const labelTyped = firstQuestion && tutorGraded ? sheetLabel(tutorGraded.id, firstQuestion, firstPick?.selectedIndex ?? null) : '';
+  const textTyped = firstPick?.givenAnswerEn ?? '';
+  const groundingClauses = {
+    emptySaysNothing: /no finished paper on record|no paper is open/i.test(emptyGrounding),
+    namesThePaper: grounded.includes('most recent finished paper'),
+    namesThePick: !!(textTyped && grounded.includes(`${labelTyped} — ${textTyped}`)),
+    namesTheQuestion: !!firstQuestion && grounded.includes(firstQuestion.questionEn),
+    carriesLegalReview: grounded.includes('legal review:'),
+    carriesWeakTopics: grounded.includes('Where this learner has gone wrong'),
+    carriesSigns: grounded.includes('road-sign register: EMPTY') || /- [A-Z0-9][A-Z0-9_-]* \| /.test(grounded),
+    staysBounded: grounded.length < 60_000,
+  };
+  results.push({
+    id: 'test-road-safety-grounded-tutor',
+    category: 'Road Safety Academy',
+    name: 'Tutor Grounding Carries The Sign Register And The Learner Own Paper',
+    passed: tutorPaper !== null && tutorGraded !== null && Object.values(groundingClauses).every(Boolean),
+    expected:
+      'a learner with no history is grounded with an explicit nothing-on-record line, and after a graded paper the grounding names their questions, the letter they actually typed, the correct option, the legal review status and the source URL',
+    actual: `unmet=${
+      Object.entries(groundingClauses)
+        .filter(([, met]) => !met)
+        .map(([name]) => name)
+        .join(',') || 'none'
+    }, typed=${labelTyped} ${textTyped}, items=${(grounded.match(/learner answered:/g) ?? []).length}, chars=${grounded.length}`,
+    durationMs: Date.now() - t44Start,
+  });
+
+  // Test 45: The academy controls. Settings are clamped rather than trusted, an item the
+  // verification gate would not publish cannot be published by pressing a button, a
+  // rejection needs a written reason, and a batch request with no provider says so out loud
+  // instead of inventing traffic law.
+  const t45Start = Date.now();
+  const rsAdminUrl = 'http://localhost/api/admin/road-safety';
+  const rsAdminBearer: Record<string, string> = process.env.ADMIN_JWT_SECRET
+    ? { authorization: `Bearer ${issueAdminToken('suite-admin@localhost')}` }
+    : {};
+  const rsPost = (payload: Record<string, unknown>) => rsAdminRoutePOST(adminRequest(rsAdminUrl, rsAdminBearer, payload));
+
+  const settingsBefore = repo.getRoadSafetySettings();
+  const fixtureModule = repo.getRoadSafetyModules().find((m) => m.status === 'PUBLISHED') ?? repo.getRoadSafetyModules()[0];
+  const fixture = fixtureModule
+    ? repo.createRoadSafetyQuestion({
+        moduleId: fixtureModule.id,
+        lessonId: null,
+        signId: null,
+        questionEn: 'Suite control fixture: which option carries the verified rule?',
+        questionRw: 'Ikigereranyo: ni iki gisubizo kuzuye?',
+        optionsEn: ['The checked option', 'The unchecked option'],
+        optionsRw: ['Icyemejwe', 'Itagemewe'],
+        correctIndex: 0,
+        correctIndexes: null,
+        explanationEn: 'Fixture explanation, not taught to any learner.',
+        explanationRw: 'Ibisobanuro byigereranyo.',
+        difficulty: 'EASY',
+        citations: [],
+        legalVerifiedAt: null,
+        status: 'NEEDS_REVIEW',
+        factIds: [],
+        source: 'ADMIN_AUTHORED',
+        generation: null,
+        reviewReasons: ['Suite fixture: nothing has verified it.'],
+        issueReports: [],
+        fingerprint: 'suite-control-fixture',
+      })
+    : null;
+
+  const approveDenied = fixture ? await rsPost({ action: 'REVIEW_APPROVE', id: fixture.id }) : null;
+  const heldAfterDenial = fixture ? repo.getRoadSafetyQuestionById(fixture.id)?.status === 'NEEDS_REVIEW' : false;
+
+  const fixtureFact = generatableFacts()[0];
+  if (fixture && fixtureFact) {
+    repo.updateRoadSafetyQuestion(fixture.id, {
+      citations: [fixtureFact.citation],
+      legalVerifiedAt: `${REVIEW_DATE}T00:00:00.000Z`,
+      factIds: [fixtureFact.id],
+    });
+  }
+  const approveOk = fixture ? await rsPost({ action: 'REVIEW_APPROVE', id: fixture.id, note: 'Checked against the cited article.' }) : null;
+  const publishedAfterApprove = fixture ? repo.getRoadSafetyQuestionById(fixture.id)?.status : '';
+  const clearedFromQueue = fixture ? !repo.getReviewQueue().some((q) => q.id === fixture.id) : false;
+
+  // A learner report puts a published item back in the queue; rejecting it must be written
+  // down, and an archived item must actually leave the queue instead of haunting it.
+  const reportedFixture = fixture
+    ? reportQuestionIssue({ questionId: fixture.id, userId: 'suite-admin-control', channel: 'ADMIN', note: 'Suite control: the rule quoted is stale.' })
+    : null;
+  const reportedSnapshot = reportedFixture ? { withdrawn: reportedFixture.withdrawn, status: reportedFixture.question.status } : null;
+  const rejectWithoutReason = fixture ? await rsPost({ action: 'REVIEW_REJECT', id: fixture.id }) : null;
+  const rejectWithReason = fixture ? await rsPost({ action: 'REVIEW_REJECT', id: fixture.id, note: 'Replaced by a wording that cites the 2026 law.' }) : null;
+  const statusAfterReject = fixture ? repo.getRoadSafetyQuestionById(fixture.id)?.status : '';
+  const rejectLeavesQueue = fixture ? !repo.getReviewQueue().some((q) => q.id === fixture.id) : false;
+
+  const saveSettingsOk = await rsPost({
+    action: 'SAVE_SETTINGS',
+    contentRefreshDays: 3000,
+    generation: { perSessionMax: 99, allowMultiAnswer: true },
+    exam: { mockMinutes: 999 },
+  });
+  const clampedSettings = repo.getRoadSafetySettings();
+  await rsPost({
+    action: 'SAVE_SETTINGS',
+    contentRefreshDays: settingsBefore.contentRefreshDays,
+    verificationRequiredToPublish: settingsBefore.verificationRequiredToPublish,
+    languages: settingsBefore.languages,
+    generation: settingsBefore.generation,
+    exam: settingsBefore.exam,
+  });
+
+  // No provider keys for this call: the batch must report the outage, not fill the paper.
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const openAiKey = process.env.OPENAI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  const batchResponse = await rsPost({ action: 'GENERATE_BATCH', count: 2, difficulty: 'EASY' });
+  if (geminiKey !== undefined) process.env.GEMINI_API_KEY = geminiKey;
+  if (openAiKey !== undefined) process.env.OPENAI_API_KEY = openAiKey;
+  const batchBody = (await batchResponse.json().catch(() => null)) as {
+    blocked?: string;
+    published?: number;
+    heldForReview?: number;
+    note?: string;
+  } | null;
+  const batchRun = repo.getQuestionGenerationRuns(10).find((r) => r.kind === 'ADMIN_BATCH');
+
+  const adminView = await rsAdminRouteGET(adminRequest(rsAdminUrl, rsAdminBearer));
+  const adminViewBody = (await adminView.json().catch(() => null)) as {
+    settings?: { approvedSources?: unknown[]; generation?: Record<string, unknown>; exam?: Record<string, unknown> };
+    reviewQueue?: unknown[];
+    verifiedFacts?: Array<{ id?: string; moduleCode?: string; statementEn?: string; citation?: { url?: string } }>;
+    generationRuns?: unknown[];
+    generation?: {
+      enabled?: boolean;
+      verifiedRules?: number;
+      documentedGaps?: number;
+      tokensToday?: number;
+      dailyTokenBudget?: number;
+      reviewQueue?: number;
+    };
+    reviewOverdue?: { thresholdDays?: number; questions?: number; lessons?: number; signs?: number };
+    stats?: Record<string, number>;
+  } | null;
+  // The academy screen renders these fields directly; a missing one is a blank or crashing
+  // tab rather than a visible error, so the contract is asserted here.
+  const factsForPicker = adminViewBody?.verifiedFacts ?? [];
+  const viewContract = {
+    reviewQueue: Array.isArray(adminViewBody?.reviewQueue),
+    factPicker:
+      factsForPicker.length > 0 &&
+      factsForPicker.every((f) => Boolean(f.id && f.moduleCode && f.statementEn && f.citation?.url)),
+    runsTable: Array.isArray(adminViewBody?.generationRuns),
+    sourceLedger: Array.isArray(adminViewBody?.settings?.approvedSources),
+    nestedSettings:
+      typeof adminViewBody?.settings?.generation?.perSessionMax === 'number' &&
+      typeof adminViewBody?.settings?.exam?.mockMinutes === 'number',
+    healthStrip:
+      typeof adminViewBody?.generation?.enabled === 'boolean' &&
+      typeof adminViewBody?.generation?.verifiedRules === 'number' &&
+      typeof adminViewBody?.generation?.documentedGaps === 'number' &&
+      typeof adminViewBody?.generation?.tokensToday === 'number' &&
+      typeof adminViewBody?.generation?.dailyTokenBudget === 'number' &&
+      typeof adminViewBody?.generation?.reviewQueue === 'number',
+    overdueCounts:
+      adminViewBody?.reviewOverdue?.thresholdDays === settingsBefore.contentRefreshDays &&
+      typeof adminViewBody?.reviewOverdue?.questions === 'number' &&
+      typeof adminViewBody?.reviewOverdue?.lessons === 'number' &&
+      typeof adminViewBody?.reviewOverdue?.signs === 'number',
+    statTiles:
+      typeof adminViewBody?.stats?.learnerReports === 'number' &&
+      typeof adminViewBody?.stats?.providerFailures === 'number' &&
+      typeof adminViewBody?.stats?.generatedQuestions === 'number' &&
+      typeof adminViewBody?.stats?.generatedPublished === 'number',
+  };
+
+  if (fixture) repo.deleteRoadSafetyQuestion(fixture.id);
+
+  results.push({
+    id: 'test-road-safety-admin-controls',
+    category: 'Road Safety Academy',
+    name: 'Academy Controls Gate Publication, Clamp Settings And Report Generation Truthfully',
+    passed:
+      Boolean(process.env.ADMIN_JWT_SECRET) &&
+      fixture !== null &&
+      fixtureFact !== undefined &&
+      approveDenied?.status === 400 &&
+      heldAfterDenial &&
+      approveOk?.status === 200 &&
+      publishedAfterApprove === 'PUBLISHED' &&
+      clearedFromQueue &&
+      reportedSnapshot?.withdrawn === true &&
+      rejectWithoutReason?.status === 400 &&
+      rejectWithReason?.status === 200 &&
+      statusAfterReject === 'ARCHIVED' &&
+      rejectLeavesQueue &&
+      saveSettingsOk.status === 200 &&
+      clampedSettings.contentRefreshDays === 730 &&
+      clampedSettings.generation.perSessionMax === 20 &&
+      clampedSettings.exam.mockMinutes === 240 &&
+      batchBody?.blocked === 'NO_PROVIDER' &&
+      batchBody?.published === 0 &&
+      (batchRun?.error ?? '').startsWith('NO_PROVIDER') &&
+      adminView.status === 200 &&
+      Object.values(viewContract).every(Boolean),
+    expected:
+      'an administrator session can read the queue and controls; approving an item with no source, no review date and no registry link is refused before the row is written and only succeeds once those exist; a rejection needs a written reason and takes the item out of the queue; out-of-range settings are clamped to the allowed band; a batch with no provider is recorded as blocked with nothing published; and the admin read answers with every field the academy screen renders',
+    actual: `approveUnverified=${approveDenied?.status ?? 'n/a'}/held=${heldAfterDenial}, approveVerified=${approveOk?.status ?? 'n/a'}/${publishedAfterApprove}, outOfQueue=${clearedFromQueue}, reported=${
+      reportedSnapshot?.withdrawn ?? 'n/a'
+    }, reject=${rejectWithoutReason?.status ?? 'n/a'}->${rejectWithReason?.status ?? 'n/a'}/${statusAfterReject}, leavesQueue=${rejectLeavesQueue}, clamped=${
+      clampedSettings.contentRefreshDays
+    }/${clampedSettings.generation.perSessionMax}/${clampedSettings.exam.mockMinutes}, batch=${
+      batchBody?.blocked ?? 'n/a'
+    } published=${batchBody?.published ?? 'n/a'} run=${(batchRun?.error ?? 'none').slice(0, 12)}, view=${
+      adminView.status
+    } facts=${factsForPicker.length} missing=${
+      Object.entries(viewContract)
+        .filter(([, met]) => !met)
+        .map(([name]) => name)
+        .join(',') || 'none'}`,
+    durationMs: Date.now() - t45Start,
   });
 
   const passedCount = results.filter((r) => r.passed).length;

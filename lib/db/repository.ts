@@ -33,6 +33,9 @@ import {
   ExamAttempt,
   LessonProgress,
   RoadSafetyProgress,
+  QuestionGenerationRun,
+  RoadSafetySettings,
+  RoadSafetySettingsPatch,
 } from '@/lib/types';
 import { GEMINI_MODEL } from '@/lib/gemini';
 import { newId } from '@/lib/util/ids';
@@ -42,6 +45,12 @@ import { getQueueRuntimeSnapshot } from '@/lib/queue/status';
 import { resolveImageCapability } from '@/lib/images/provider';
 import { imageRetentionDays, passportHeightPx, passportWidthPx } from '@/lib/images/spec';
 import { chainSummary } from '@/lib/ai/provider-adapter';
+import { questionFingerprint } from '@/lib/road-safety/text-analysis';
+import {
+  DEFAULT_ROAD_SAFETY_SETTINGS,
+  approvedSourceLedger,
+  normalizeRoadSafetySettings,
+} from '@/lib/road-safety/settings';
 
 // Boards the platform is configured to read. Health, last-crawled time and
 // listing counts are written only by a crawl that actually reached the board.
@@ -77,6 +86,72 @@ const KNOWN_JOB_SOURCES: JobSource[] = [
     activeListingsCount: 0,
   },
 ];
+
+/**
+ * A question row may be written by the content pack, the admin editor or the generator.
+ * The verification fields are optional here and filled in below, so no caller can store a
+ * question without a fingerprint or an origin.
+ */
+type RoadSafetyQuestionInput = Omit<
+  RoadSafetyQuestion,
+  'id' | 'createdAt' | 'updatedAt' | 'fingerprint' | 'source' | 'generation' | 'reviewReasons' | 'issueReports' | 'factIds' | 'correctIndexes'
+> &
+  Partial<
+    Pick<
+      RoadSafetyQuestion,
+      'fingerprint' | 'source' | 'generation' | 'reviewReasons' | 'issueReports' | 'factIds' | 'correctIndexes'
+    >
+  >;
+
+/**
+ * Rows written by an earlier version of this program are restored with the fields they
+ * predate. SCHEMA_VERSION stays at 1 so an existing deployment keeps its data; new
+ * required fields must be backfilled here instead.
+ */
+function withQuestionDefaults(row: RoadSafetyQuestion): RoadSafetyQuestion {
+  return {
+    ...row,
+    correctIndexes: Array.isArray(row.correctIndexes) && row.correctIndexes.length ? row.correctIndexes : null,
+    factIds: Array.isArray(row.factIds) ? row.factIds : [],
+    source: row.source ?? 'CURATED_PACK',
+    generation: row.generation ?? null,
+    reviewReasons: Array.isArray(row.reviewReasons) ? row.reviewReasons : [],
+    issueReports: Array.isArray(row.issueReports) ? row.issueReports : [],
+    fingerprint: row.fingerprint || questionFingerprint(row),
+    signId: row.signId ?? null,
+  };
+}
+
+function withAttemptDefaults(row: ExamAttempt): ExamAttempt {
+  const answers = (Array.isArray(row.answers) ? row.answers : []).map((a) => ({
+    ...a,
+    timeSpentSeconds: a.timeSpentSeconds ?? null,
+  }));
+  const saved = Array.isArray(row.savedAnswers)
+    ? row.savedAnswers
+    : answers.length
+      ? answers.map((a) => a.selectedIndex ?? null)
+      : (row.questionIds ?? []).map(() => null);
+
+  return {
+    ...row,
+    kind: row.kind === 'MOCK_EXAM' || row.kind === 'LEARN' ? row.kind : 'PRACTICE',
+    answers,
+    savedAnswers: saved,
+    answerSeconds: Array.isArray(row.answerSeconds)
+      ? row.answerSeconds.map((n) => (Number.isFinite(Number(n)) ? Math.max(0, Math.round(Number(n))) : 0))
+      : (row.questionIds ?? []).map(() => 0),
+    timeLimitSeconds: row.timeLimitSeconds ?? null,
+    deadlineAt: row.deadlineAt ?? null,
+    strict: row.strict === true,
+    answersRevealed: row.answersRevealed !== false,
+    lastActivityAt: row.lastActivityAt || row.submittedAt || row.startedAt,
+  };
+}
+
+function withExamDefaults(row: ExamTemplate): ExamTemplate {
+  return { ...row, strictMode: row.strictMode === true, officialBasis: row.officialBasis ?? null };
+}
 
 // Singleton in-memory state store that persists across server requests
 class AppRepository implements Persistable {
@@ -115,6 +190,8 @@ class AppRepository implements Persistable {
   private rsExams: ExamTemplate[] = [];
   private rsAttempts: ExamAttempt[] = [];
   private rsLessonProgress: LessonProgress[] = [];
+  private rsGenerationRuns: QuestionGenerationRun[] = [];
+  private rsSettings: RoadSafetySettings = DEFAULT_ROAD_SAFETY_SETTINGS;
   private auditLog: AuditEntry[] = [];
 
   // --- Users ---
@@ -784,9 +861,24 @@ class AppRepository implements Persistable {
     return this.rsQuestions.find((q) => q.id === id);
   }
 
-  createRoadSafetyQuestion(input: Omit<RoadSafetyQuestion, 'id' | 'createdAt' | 'updatedAt'>): RoadSafetyQuestion {
+  createRoadSafetyQuestion(input: RoadSafetyQuestionInput): RoadSafetyQuestion {
     const now = new Date().toISOString();
-    const created: RoadSafetyQuestion = { ...input, id: newId('q'), createdAt: now, updatedAt: now };
+    const created: RoadSafetyQuestion = {
+      ...input,
+      lessonId: input.lessonId ?? null,
+      signId: input.signId ?? null,
+      correctIndexes:
+        Array.isArray(input.correctIndexes) && input.correctIndexes.length > 1 ? input.correctIndexes : null,
+      factIds: input.factIds ?? [],
+      source: input.source ?? 'ADMIN_AUTHORED',
+      generation: input.generation ?? null,
+      reviewReasons: input.reviewReasons ?? [],
+      issueReports: input.issueReports ?? [],
+      fingerprint: input.fingerprint || questionFingerprint(input),
+      id: newId('q'),
+      createdAt: now,
+      updatedAt: now,
+    };
     this.rsQuestions.push(created);
     return created;
   }
@@ -844,10 +936,35 @@ class AppRepository implements Persistable {
   /** Writes the graded result back onto the pending attempt instead of cloning it. */
   recordExamResult(
     attemptId: string,
-    patch: Partial<Pick<ExamAttempt, 'answers' | 'correctCount' | 'scorePercent' | 'passed' | 'submittedAt' | 'durationSeconds'>>
+    patch: Partial<
+      Pick<
+        ExamAttempt,
+        | 'answers'
+        | 'savedAnswers'
+        | 'answerSeconds'
+        | 'correctCount'
+        | 'scorePercent'
+        | 'passed'
+        | 'submittedAt'
+        | 'durationSeconds'
+        | 'answersRevealed'
+        | 'lastActivityAt'
+      >
+    >
   ): ExamAttempt {
     const attempt = this.getExamAttemptById(attemptId);
     if (!attempt) throw new Error(`Exam attempt ${attemptId} no longer exists`);
+    Object.assign(attempt, patch);
+    return attempt;
+  }
+
+  /** Autosave path: only the in-flight fields, never the graded outcome. */
+  updateExamAttempt(
+    id: string,
+    patch: Partial<Pick<ExamAttempt, 'savedAnswers' | 'answerSeconds' | 'lastActivityAt'>>
+  ): ExamAttempt | undefined {
+    const attempt = this.getExamAttemptById(id);
+    if (!attempt || attempt.submittedAt) return attempt;
     Object.assign(attempt, patch);
     return attempt;
   }
@@ -862,6 +979,50 @@ class AppRepository implements Persistable {
     const created: LessonProgress = { userId, lessonId, completedAt: new Date().toISOString() };
     this.rsLessonProgress.push(created);
     return created;
+  }
+
+  // --- Academy settings, generation runs and review queue ---
+  getRoadSafetySettings(): RoadSafetySettings {
+    return this.rsSettings;
+  }
+
+  /**
+   * Applies a partial patch and re-derives every field against the defaults, so a stored
+   * snapshot can never leave a protection unset by omission.
+   */
+  updateRoadSafetySettings(patch: RoadSafetySettingsPatch, updatedBy: string): RoadSafetySettings {
+    this.rsSettings = normalizeRoadSafetySettings({
+      ...this.rsSettings,
+      ...patch,
+      generation: { ...this.rsSettings.generation, ...(patch.generation ?? {}) },
+      exam: { ...this.rsSettings.exam, ...(patch.exam ?? {}) },
+      updatedAt: new Date().toISOString(),
+      updatedBy: updatedBy || 'ADMIN',
+    });
+    return this.rsSettings;
+  }
+
+  getQuestionGenerationRuns(limit = 60): QuestionGenerationRun[] {
+    return this.rsGenerationRuns.slice(0, limit);
+  }
+
+  recordGenerationRun(input: Omit<QuestionGenerationRun, 'id'>): QuestionGenerationRun {
+    const created: QuestionGenerationRun = { ...input, id: newId('gen') };
+    this.rsGenerationRuns.unshift(created);
+    if (this.rsGenerationRuns.length > 1000) this.rsGenerationRuns.length = 1000;
+    return created;
+  }
+
+  updateGenerationRun(id: string, patch: Partial<QuestionGenerationRun>): QuestionGenerationRun | undefined {
+    const row = this.rsGenerationRuns.find((r) => r.id === id);
+    if (!row) return undefined;
+    Object.assign(row, patch, { id: row.id });
+    return row;
+  }
+
+  /** Items a person must look at: held by the gate, or carrying a report nobody has answered. */
+  getReviewQueue(): RoadSafetyQuestion[] {
+    return this.rsQuestions.filter((q) => q.status === 'NEEDS_REVIEW' || q.issueReports.some((r) => !r.resolvedAt));
   }
 
   // --- Audit trail ---
@@ -907,6 +1068,8 @@ class AppRepository implements Persistable {
       rsExams: this.rsExams,
       rsAttempts: this.rsAttempts,
       rsLessonProgress: this.rsLessonProgress,
+      rsGenerationRuns: this.rsGenerationRuns,
+      rsSettings: this.rsSettings,
       auditLog: this.auditLog,
     };
   }
@@ -954,10 +1117,12 @@ class AppRepository implements Persistable {
     this.rsModules = arr<RoadSafetyModule>('rsModules', this.rsModules);
     this.rsLessons = arr<RoadSafetyLesson>('rsLessons', this.rsLessons);
     this.rsSigns = arr<RoadSign>('rsSigns', this.rsSigns);
-    this.rsQuestions = arr<RoadSafetyQuestion>('rsQuestions', this.rsQuestions);
-    this.rsExams = arr<ExamTemplate>('rsExams', this.rsExams);
-    this.rsAttempts = arr<ExamAttempt>('rsAttempts', this.rsAttempts);
+    this.rsQuestions = arr<RoadSafetyQuestion>('rsQuestions', this.rsQuestions).map(withQuestionDefaults);
+    this.rsExams = arr<ExamTemplate>('rsExams', this.rsExams).map(withExamDefaults);
+    this.rsAttempts = arr<ExamAttempt>('rsAttempts', this.rsAttempts).map(withAttemptDefaults);
     this.rsLessonProgress = arr<LessonProgress>('rsLessonProgress', this.rsLessonProgress);
+    this.rsGenerationRuns = arr<QuestionGenerationRun>('rsGenerationRuns', this.rsGenerationRuns);
+    this.rsSettings = normalizeRoadSafetySettings(state.rsSettings ?? this.rsSettings);
     this.auditLog = arr<AuditEntry>('auditLog', this.auditLog);
   }
 
@@ -1075,6 +1240,8 @@ class AppRepository implements Persistable {
   }
 
   getRoadSafetyStats() {
+    const generated = this.rsQuestions.filter((q) => q.source === 'AI_GENERATED');
+    const runs = this.rsGenerationRuns;
     return {
       modules: this.rsModules.length,
       lessons: this.rsLessons.length,
@@ -1086,6 +1253,16 @@ class AppRepository implements Persistable {
       exams: this.rsExams.length,
       attempts: this.rsAttempts.length,
       passedAttempts: this.rsAttempts.filter((a) => a.passed).length,
+      /** Held by the gate, or carrying a learner report nobody has answered yet. */
+      reviewQueue: this.getReviewQueue().length,
+      generatedQuestions: generated.length,
+      generatedPublished: generated.filter((q) => q.status === 'PUBLISHED').length,
+      learnerReports: this.rsQuestions.reduce((n, q) => n + q.issueReports.length, 0),
+      openReports: this.rsQuestions.reduce((n, q) => n + q.issueReports.filter((r) => !r.resolvedAt).length, 0),
+      generationRuns: runs.length,
+      tokensLastRun: runs[0]?.tokensUsed ?? 0,
+      providerFailures: runs.filter((r) => r.error !== null).length,
+      sourceLedger: approvedSourceLedger(),
     };
   }
 }

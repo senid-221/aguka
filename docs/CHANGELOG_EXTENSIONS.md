@@ -304,3 +304,117 @@ exists to say — that this board cannot be read — had been replaced by a gree
 - Action for the deployment: clear `JOB_FEED_URL_MIFOTRA` on the host (or set it to a real feed if the
   ministry publishes one). Until then Jobs shows MIFOTRA refusing, which is the truth, rather than the
   old misleading green state the pre-fix build would have produced.
+
+## Personal data routes closed to everyone but an administrator
+
+The audit that opened the production programme found the console's data feeds wide open. Live probes
+against the deployed build answered `200` for `GET /api/users`, `/api/conversations`, `/api/media`,
+`/api/coding`, `/api/jobs` and `/api/agents` with no token at all, and `POST /api/users` would run
+`EXPORT_DATA` or `DELETE_DATA` for any `userId` handed to it. Authorization had been treated as a UI
+concern — the screens were hidden behind a sidebar entry, the routes underneath were not.
+
+- `app/api/users`, `app/api/conversations`, `app/api/media`, `app/api/marketplace`, `app/api/jobs`,
+  `app/api/agents`, `app/api/tests`, `app/api/coding`, `app/api/study`,
+  `app/api/whatsapp/simulate` — every verb on each now starts with `requireAdmin(request)` and answers
+  `401 {"error":"Unauthorized"}` before reading the store, parsing a body, or reaching a provider. The
+  rule applied is the one the data forces: a route that returns or changes another person's profile,
+  conversation, receipt, portrait or lesson is an administrator endpoint. `POST /api/coding` and
+  `POST /api/study` also spend provider tokens and file the result against a `userId` from the request,
+  and `POST /api/whatsapp/simulate` creates a real user record from any phone number it is given.
+- Still public, deliberately: `/api/health` and `/api/ready` (configuration facts for a deployment
+  probe), `/api/services` and `/api/road-safety/*` (the catalogue and the learner's own exam attempt,
+  which checks ownership and entitlement server-side), `/api/payments/order`, `/api/payments/proof`
+  (a payer submits a receipt against their own number; an admin session is the alternative, not the
+  requirement), and both Meta webhooks, which authenticate by signature and token instead of session.
+- `lib/client/admin-session.ts` was already attaching the bearer token for the Jobs screen. The
+  remaining console screens — users and consent, conversations, coding, study, media, marketplace,
+  agents, overview and the test-suite modal — now go through `adminFetch` too, so the token travels
+  with each request and a `401` clears the stale session everywhere at once. Each screen shows the
+  `AdminGate` sign-in card, and a refusal states what was refused instead of looking like an empty store.
+- `test-dashboard-route-authorization` is the suite's 35th check. It calls all fifteen guarded handlers
+  twice — no token, then a token signed with a different secret — and asserts `401` with the plain
+  `Unauthorized` body both times. When `ADMIN_JWT_SECRET` is present it also issues a genuine session and
+  requires `GET /api/users` to answer `200`, so the gate is proven open and shut, not merely shut. The
+  `POST` bodies it sends are intentionally invalid: if a guard ever regresses, the route answers `400`
+  before it can spend a token, crawl a board, or write a record.
+- Verified locally over HTTP, not only in-process: all ten routes returned `401 {"error":"Unauthorized"}`
+  to an anonymous `GET`, all seven write routes returned `401` to an anonymous `POST`, and
+  `/api/health`, `/api/services` and `/api/road-safety/catalog` stayed reachable. The suite passes 35/35
+  with and without an admin secret, `tsc --noEmit` and `eslint` are clean, and `next build` succeeds.
+- Not yet proven from this machine: the signed-in dashboard in a real browser, because that needs the
+  deployment's admin credentials. Open the console, sign in on any gated screen, and confirm each list
+  loads. `/api/tests` is now gated, so the suite is reachable only from the signed-in modal.
+
+## Road Safety Academy: an exam engine that cannot invent the law
+
+The academy used to answer a learner with whatever the bank already held, which meant "Mpa ikizamini
+gishya" produced the same questions in a different order and the model was never asked for anything.
+Building the requested exam engine risked the opposite failure: a language model confidently inventing
+a speed limit, a fine, or the meaning of a sign. The module is therefore built around a registry and a
+gate, not around a prompt.
+
+- `lib/road-safety/verified-facts.ts` holds every rule the academy is willing to teach, one row per
+  rule, each with the instrument and article it came from, its `legalBasis`, a numeric value and unit
+  where the rule has one, and its citation. Rules that were searched for and not found are kept with
+  `generationAllowed: false` — the gap is documented, and no question may be built on it. The source
+  ledger (`lib/road-safety/settings.ts`) records what each reference permits: quizblog.rw is stored as
+  `DISCOVERY_REFERENCE_ONLY` with `automatedAccess: NOT_PERMITTED`, because inspected on 2026-10-22 it
+  serves the same single-page shell on every path including `/robots.txt`, states no crawl policy, and
+  exposes no readable question text without running its own JavaScript. Nothing was harvested from it
+  and no wording was copied; it told us which topics and formats learners expect, and the law itself
+  comes from the gazette copies.
+- `lib/road-safety/generator.ts` asks the text chain for questions built from named registry rows only,
+  and `lib/road-safety/verification.ts` decides publication. The answer must match the rule's number
+  and unit, the item must cite a source, carry a `legalVerifiedAt` date and link to a registry row, and
+  it must survive fingerprint and token-set duplicate checks against the whole bank. Anything else is
+  stored `NEEDS_REVIEW` with the reason written on it. `publicationBlockers()` is the same function the
+  administrator's approve button calls, so a human cannot publish what the machine refused, and the
+  check runs **before** the row is written — an earlier version refused after saving, which would have
+  left the item published while reporting a refusal.
+- Learner-facing: `LEARN`, `PRACTICE` and `MOCK_EXAM` on `POST /api/road-safety/exam`, with the clock
+  (`deadlineAt`), autosaved answers, auto-submission and grading all server-side; option order is
+  shuffled per attempt with a key derived from `sha256(attemptId|questionId)`, so the correct answer
+  stays correct while the letter changes; difficulty moves with the learner's own accuracy and response
+  time; a fresh set avoids what that learner already answered; `REPORT` returns the six-part post-paper
+  report and `REPORT_ISSUE` files an inaccuracy report that pulls the item out of papers and into the
+  review queue. `lib/road-safety/tutor-context.ts` grounds the conversational agent in the learner's
+  own last finished paper, their weak topics, the cited rule and the sign register, so "Kuki igisubizo
+  cyanjye kitari cyo?" is answered about the question they actually missed — and says so plainly when
+  there is no paper on record. All history is keyed by `userId`.
+- Every paper, reply and screen labels the test a practice simulation. The instruments give the theory
+  test 60 marks and a 60 % pass mark; none states a duration, so `exam.mockMinutes` is an Aguka setting
+  and no template claims the official examination's format, length or pass mark.
+- Console: the Road Safety screen gained **Review queue** (hold reasons, unresolved learner reports,
+  publish / reject-with-written-reason / correct) and **Controls & monitoring** (refresh interval,
+  languages, generation limits and token budget, paper sizes, the approved-source ledger with
+  permission / robots / automated-access / reuse columns, a grounded batch runner, and a generation-run
+  table showing provider, model, tokens, latency and the failure reason). The question editor now links
+  an item to registry rules and stamps its legal review date, which is what makes an administrator
+  authoring a question able to publish it at all. `contentRefreshDays` is a live rule, not decoration:
+  published content past it is counted as overdue.
+- Persistence: `prisma/schema.prisma` gained the academy's real shape and
+  `prisma/migrations/20261022000000_road_safety_exam_engine/migration.sql` is the additive SQL for it,
+  checked against `prisma migrate diff` output. **It has not been applied**: no PostgreSQL was
+  reachable from this machine, so the file-backed store under `AGUKA_DATA_DIR` remains what the running
+  app reads. Run `npx prisma migrate deploy` and `npx prisma migrate status` on the host before
+  trusting the live tables. `npx prisma` on PATH resolves to the 8.0.0 release candidate, whose command
+  surface differs — use the pinned `npx --yes prisma@6.19.3`.
+- Tests: the suite is at 45. New checks cover the registry and the gate, generation that cannot publish
+  what it cannot defend, adaptive difficulty, fresh sets with duplicate detection, the timer with
+  autosave and auto-submit, strict papers withholding the key until submission, the six-part report,
+  tutor grounding, learner reports draining the queue, and the admin controls — approve-before-grounding
+  refused, reject-without-reason refused, out-of-range settings clamped, and a batch with no provider
+  recorded as `NO_PROVIDER` with nothing published. `test-road-safety-admin-controls` asserts the whole
+  admin read shape the two new tabs render from. `GET`/`POST /api/admin/road-safety` were added to the
+  authorization check, which had never covered the curriculum-writing route. The batch test deletes and
+  restores `GEMINI_API_KEY`/`OPENAI_API_KEY` around the call, so it stays hermetic on a machine that has
+  keys and on one that has none.
+- Not proven from this machine, and not claimed: a provider has never been paid to generate an academy
+  question here, so the happy path of real generated wording is unverified end to end; the two new tabs
+  have not been driven in a signed-in browser (form-filling needs an interactive approval this run
+  could not get), so their layout is verified by `tsc`, by the route contract in test 45, and by a clean
+  Next.js compile of the screen, not by an eye on the page; there is still no administrator path to
+  upload a photographed sign, so `RoadSign.imageKey` stays empty and no sign-identification question can
+  be published; French is not implemented, because no suitable configured provider path exists yet; and
+  the learner exam route still identifies the learner from the `userId`/phone in the request body, which
+  is an ownership check, not authentication.

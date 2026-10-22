@@ -526,7 +526,12 @@ export interface PaymentProof {
 // Road Safety Academy
 // ---------------------------------------------------------------------------
 
-export type PublishStatus = 'DRAFT' | 'PUBLISHED' | 'ARCHIVED';
+/**
+ * NEEDS_REVIEW is the fail-closed state: material that could not be tied to a
+ * verified rule, or that a learner flagged as wrong, sits here and is never
+ * served to a learner.
+ */
+export type PublishStatus = 'DRAFT' | 'PUBLISHED' | 'NEEDS_REVIEW' | 'ARCHIVED';
 
 export interface SourceCitation {
   title: string;
@@ -534,6 +539,85 @@ export interface SourceCitation {
   url: string;
   accessedOn: string;
   quote?: string;
+}
+
+/**
+ * Where a statement comes from. A general safe-driving tip must never be phrased
+ * as a legal duty, so every fact carries its own basis and the generator is held
+ * to it.
+ */
+export type LegalBasis =
+  | 'OFFICIAL_REQUIREMENT'
+  | 'ADMINISTRATIVE_INSTRUCTION'
+  | 'SAFETY_RECOMMENDATION'
+  | 'NOT_ESTABLISHED';
+
+export type VerifiedFactKind =
+  | 'SPEED_LIMIT'
+  | 'BAC_LIMIT'
+  | 'PRIORITY_RULE'
+  | 'MARKING'
+  | 'SIGN_MEANING'
+  | 'LICENCE_CATEGORY'
+  | 'LICENCE_RULE'
+  | 'TEST_RULE'
+  | 'EQUIPMENT'
+  | 'INSPECTION'
+  | 'PENALTY'
+  | 'RESTRICTION'
+  | 'OPEN_QUESTION';
+
+/**
+ * One atomic, cited rule. This registry is the only ground truth the question
+ * generator is allowed to write from: a number, a penalty or a sign meaning that
+ * is not in here cannot appear as a correct answer.
+ */
+export interface VerifiedFact {
+  id: string;
+  kind: VerifiedFactKind;
+  /** RoadSafetyModule.code the fact belongs to, so generated questions land in a real topic. */
+  moduleCode: string;
+  statementEn: string;
+  statementRw: string;
+  legalBasis: LegalBasis;
+  citation: SourceCitation;
+  /** Article of the instrument, kept separate so an explanation can name it. */
+  article: string | null;
+  /** Numeric anchor of the rule, if it has one. The gate checks answers against it. */
+  value: number | null;
+  unit: string | null;
+  /** Wrong values that are legitimately distractors for this rule (other real limits). */
+  distractorValues: number[];
+  /** False for the rules that were searched for and not found — they must not be tested as law. */
+  generationAllowed: boolean;
+  reviewStatus: 'VERIFIED' | 'NEEDS_REVIEW';
+}
+
+export type QuestionSource = 'CURATED_PACK' | 'AI_GENERATED' | 'ADMIN_AUTHORED';
+
+export interface QuestionGenerationMeta {
+  provider: string;
+  model: string;
+  runId: string;
+  generatedAt: string;
+  /** Verified fact ids the prompt was built from. */
+  factIds: string[];
+  tokensUsed: number;
+}
+
+export interface IssueReport {
+  reportedAt: string;
+  userId: string | null;
+  channel: 'WHATSAPP' | 'API' | 'ADMIN';
+  note: string;
+  /**
+   * Set when an administrator has looked at the report. Without it the item would sit in
+   * the review queue forever after being corrected, and a queue that never drains stops
+   * being a signal.
+   */
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  resolution?: string | null;
 }
 
 export interface RoadSafetyModule {
@@ -585,6 +669,12 @@ export interface RoadSign {
   meaningRw: string;
   shape: string;
   colourConvention: string;
+  /**
+   * Durable key of a real sign image uploaded by an administrator. Sign-identification
+   * questions are only published when this exists — an AI-drawn approximation of an
+   * official sign would teach the wrong thing. Absent on curriculum-pack rows.
+   */
+  imageKey?: string | null;
   citations: SourceCitation[];
   legalVerifiedAt: string | null;
   status: PublishStatus;
@@ -603,12 +693,28 @@ export interface RoadSafetyQuestion {
   optionsEn: string[];
   optionsRw: string[];
   correctIndex: number;
+  /**
+   * Set for a multiple-answer paper. The WhatsApp comma protocol answers one
+   * option per question, so generated multi-answer items stay unpublished unless
+   * an exam format explicitly allows them.
+   */
+  correctIndexes: number[] | null;
   explanationEn: string;
   explanationRw: string;
   difficulty: QuestionDifficulty;
   citations: SourceCitation[];
   legalVerifiedAt: string | null;
   status: PublishStatus;
+  /** Verified fact ids this item tests. Revision targeting works through these. */
+  factIds: string[];
+  source: QuestionSource;
+  generation: QuestionGenerationMeta | null;
+  /** Why the gate held this item back; empty once an administrator clears it. */
+  reviewReasons: string[];
+  issueReports: IssueReport[];
+  /** Normalised-text hash used by the duplicate detector. */
+  fingerprint: string;
+  signId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -621,6 +727,17 @@ export interface ExamTemplate {
   questionCount: number;
   passPercent: number;
   timeLimitMinutes: number | null;
+  /**
+   * Server-enforced examination behaviour: no answer key before submission, no
+   * resuming after the deadline. Practice papers leave this false.
+   */
+  strictMode: boolean;
+  /**
+   * A citation only when the count, duration or pass mark comes from an
+   * authoritative source. Null means these are administrator-chosen simulation
+   * settings, and the learner is told so.
+   */
+  officialBasis: SourceCitation | null;
   status: PublishStatus;
   createdAt: string;
   updatedAt: string;
@@ -634,17 +751,26 @@ export interface ExamAnswer {
   correctAnswerEn: string;
   explanationEn: string;
   explanationRw: string;
+  /** Wall-clock seconds the learner took on this item, measured on the server. */
+  timeSpentSeconds: number | null;
 }
 
 export interface ExamAttempt {
   id: string;
   userId: string;
-  kind: 'PRACTICE' | 'MOCK_EXAM';
+  kind: 'PRACTICE' | 'MOCK_EXAM' | 'LEARN';
   examTemplateId: string | null;
   moduleId: string | null;
   language: 'ENGLISH' | 'KINYARWANDA';
   questionIds: string[];
   answers: ExamAnswer[];
+  /** Autosaved raw picks, index-aligned to questionIds. Null means unanswered. */
+  savedAnswers: (number | null)[];
+  /**
+   * Seconds spent on each item, index-aligned to questionIds, accumulated by the server
+   * from the gap between one autosave and the next. Never the client's clock.
+   */
+  answerSeconds: number[];
   totalQuestions: number;
   correctCount: number;
   scorePercent: number;
@@ -653,6 +779,13 @@ export interface ExamAttempt {
   startedAt: string;
   submittedAt: string | null;
   durationSeconds: number | null;
+  /** Server-owned deadline. The timer is never the caller's clock. */
+  timeLimitSeconds: number | null;
+  deadlineAt: string | null;
+  strict: boolean;
+  /** Hidden until submission in strict mode, so the answer key cannot be read early. */
+  answersRevealed: boolean;
+  lastActivityAt: string;
 }
 
 export interface LessonProgress {
@@ -670,7 +803,101 @@ export interface RoadSafetyProgress {
   totalAnswered: number;
   totalCorrect: number;
   bestExamPercent: number;
+  /** Seconds per answered question, averaged over the learner's whole history. */
+  averageAnswerSeconds: number | null;
+  weakestModuleCode: string | null;
+  strongestModuleCode: string | null;
   lastActivityAt: string | null;
+}
+
+export type SourcePermission =
+  | 'OFFICIAL_INSTRUMENT'
+  | 'GOVERNMENT_SERVICE_PAGE'
+  | 'DISCOVERY_REFERENCE_ONLY'
+  | 'LICENCE_REQUIRED';
+
+export type AutomatedAccess = 'PERMITTED' | 'NOT_PERMITTED' | 'UNSTATED';
+
+/**
+ * An approved place to look for curriculum. The permission fields are recorded
+ * from an actual inspection, so a future crawler cannot quietly decide that a
+ * site allowed scraping.
+ */
+export interface ApprovedSource {
+  id: string;
+  name: string;
+  url: string;
+  publisher: string;
+  permission: SourcePermission;
+  robots: 'ALLOWED' | 'DISALLOWED' | 'ABSENT' | 'NOT_INSPECTED';
+  automatedAccess: AutomatedAccess;
+  /** Whether content from here may be copied into the question bank. */
+  contentReuse: 'COPY_PERMITTED' | 'STRUCTURE_ONLY' | 'NO_ACCESS';
+  lastInspectedAt: string;
+  notes: string;
+}
+
+export interface RoadSafetyGenerationSettings {
+  enabled: boolean;
+  /** Fresh items asked for per practice/mock session. */
+  perSessionMax: number;
+  /** Cap per learner per day, so one phone number cannot drain the provider quota. */
+  perUserPerDay: number;
+  /** When false, generated items always wait in the review queue. */
+  autoPublishVerified: boolean;
+  dailyTokenBudget: number;
+  allowMultiAnswer: boolean;
+  allowSignIdentification: boolean;
+}
+
+export interface RoadSafetyExamSettings {
+  practiceCount: number;
+  learnCount: number;
+  mockCount: number;
+  mockMinutes: number;
+  /** Kept separate from the mock pass mark: practice never reports pass/fail. */
+  strictModeByDefault: boolean;
+}
+
+export interface RoadSafetySettings {
+  updatedAt: string;
+  updatedBy: string;
+  contentRefreshDays: number;
+  /** Oldest accepted legalVerifiedAt before a lesson is treated as stale. */
+  verificationRequiredToPublish: boolean;
+  languages: Array<'ENGLISH' | 'KINYARWANDA'>;
+  generation: RoadSafetyGenerationSettings;
+  exam: RoadSafetyExamSettings;
+  approvedSources: ApprovedSource[];
+}
+
+/**
+ * What an administrator may send. The nested groups are partial because the repository
+ * merges them over the stored values and re-derives every field against the defaults.
+ */
+export type RoadSafetySettingsPatch = Partial<Omit<RoadSafetySettings, 'generation' | 'exam'>> & {
+  generation?: Partial<RoadSafetyGenerationSettings>;
+  exam?: Partial<RoadSafetyExamSettings>;
+};
+
+export interface QuestionGenerationRun {
+  id: string;
+  startedAt: string;
+  userId: string | null;
+  kind: 'PRACTICE' | 'MOCK_EXAM' | 'LEARN' | 'ADMIN_BATCH';
+  requested: number;
+  /** Verified fact ids the prompt was assembled from. */
+  factIds: string[];
+  provider: string | null;
+  model: string | null;
+  candidates: number;
+  published: number;
+  heldForReview: number;
+  tokensUsed: number;
+  latencyMs: number;
+  /** Provider chain trace, for the operator only. */
+  attempts: string[];
+  error: string | null;
 }
 
 // ---------------------------------------------------------------------------

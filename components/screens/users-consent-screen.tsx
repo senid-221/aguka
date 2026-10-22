@@ -14,59 +14,51 @@ import {
 } from 'lucide-react';
 import { User as UserType } from '@/lib/types';
 import { RwandaFlagIcon } from '@/components/icons/logos';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
 
 export function UsersConsentScreen() {
+  const session = useAdminSession();
   const [users, setUsers] = useState<UserType[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
   const [selectedUser, setSelectedUser] = useState<UserType | null>(null);
   const [exportJson, setExportJson] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const loadUsers = () => {
-    setIsLoading(true);
-    fetch('/api/users')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!data) return;
-        setUsers(data.users || []);
-        if (data.users?.length > 0) {
-          setSelectedUser((prev) => prev || data.users[0]);
+    adminFetch<{ users?: UserType[] }>('/api/users')
+      .then((res) => {
+        if (!res.ok || !res.data) {
+          if (res.error) setNotice(res.error);
+          return;
         }
-      })
-      .catch((err) => console.error('Error fetching users:', err))
-      .finally(() => setIsLoading(false));
-  };
-
-  useEffect(() => {
-    let isMounted = true;
-    fetch('/api/users')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!isMounted || !data) return;
-        setUsers(data.users || []);
-        if (data.users?.length > 0) {
-          setSelectedUser((prev) => prev || data.users[0]);
+        setNotice(null);
+        setUsers(res.data.users || []);
+        if (res.data.users?.length) {
+          setSelectedUser((prev) => prev || res.data!.users![0]);
         }
       })
       .catch((err) => console.error('Error fetching users:', err));
+  };
 
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+  useEffect(() => {
+    if (session.authed) loadUsers();
+  }, [session.authed]);
 
   const handleExportData = async (userId: string) => {
     try {
-      const res = await fetch('/api/users', {
+      const res = await adminFetch<Record<string, unknown>>('/api/users', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'EXPORT_DATA', userId }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        setExportJson(JSON.stringify(data, null, 2));
+      if (res.ok && res.data) {
+        setNotice(null);
+        setExportJson(JSON.stringify(res.data, null, 2));
+      } else {
+        setNotice(res.error || 'The export was refused.');
       }
     } catch (err) {
       console.error('Data export failed:', err);
+      setNotice('Data export failed.');
     }
   };
 
@@ -75,9 +67,8 @@ export function UsersConsentScreen() {
       return;
     }
     try {
-      const res = await fetch('/api/users', {
+      const res = await adminFetch('/api/users', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'DELETE_DATA', userId }),
       });
       if (res.ok) {
@@ -85,24 +76,30 @@ export function UsersConsentScreen() {
         loadUsers();
         setSelectedUser(null);
         setExportJson(null);
+      } else {
+        setNotice(res.error || 'The erasure request was refused.');
       }
     } catch (err) {
       console.error('Data deletion failed:', err);
+      setNotice('Data deletion failed.');
     }
   };
 
   const handleToggleBlock = async (userId: string) => {
     try {
-      const res = await fetch('/api/users', {
+      const res = await adminFetch('/api/users', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'TOGGLE_BLOCK', userId }),
       });
       if (res.ok) {
+        setNotice(null);
         loadUsers();
+      } else {
+        setNotice(res.error || 'The block change was refused.');
       }
     } catch (err) {
       console.error('Block toggle failed:', err);
+      setNotice('Block toggle failed.');
     }
   };
 
@@ -128,6 +125,9 @@ export function UsersConsentScreen() {
         </div>
       </div>
 
+      <AdminGate session={session} scope="Every record here is someone's personal data: their profile, their whole conversation history, or the erasure of both." />
+
+      {!session.authed ? null : (
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Column: User Directory */}
         <div className="lg:col-span-5 bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden flex flex-col">
@@ -285,6 +285,14 @@ export function UsersConsentScreen() {
           )}
         </div>
       </div>
+      )}
+
+      {notice && (
+        <div className="flex items-center gap-2 text-xs text-amber-400">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          <span>{notice}</span>
+        </div>
+      )}
     </div>
   );
 }

@@ -16,6 +16,17 @@ import {
   ImageIcon,
 } from 'lucide-react';
 import { WhatsAppLogo } from '@/components/icons/logos';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
+
+interface SimulateResponse {
+  outcome?: SimOutcome;
+  outgoingPayload?: Record<string, unknown>;
+  serviceCode?: string | null;
+  delivery?: { dispatched: boolean; reason: string };
+  error?: string;
+  [key: string]: unknown;
+}
 
 let msgSequence = 1000;
 function getNextMessageId(prefix: string): string {
@@ -74,6 +85,7 @@ interface ChatMessage {
 }
 
 export function SimulatorScreen() {
+  const session = useAdminSession();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
 
   const [inputVal, setInputVal] = useState('');
@@ -125,13 +137,13 @@ export function SimulatorScreen() {
     return trimmed.startsWith('+') ? trimmed : `+${trimmed}`;
   };
 
-  async function postSimulate(body: Record<string, unknown>) {
-    const res = await fetch('/api/whatsapp/simulate', {
+  async function postSimulate(body: Record<string, unknown>): Promise<SimulateResponse> {
+    const res = await adminFetch<SimulateResponse>('/api/whatsapp/simulate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    return res.json();
+    if (!res.ok) return { error: res.error ?? 'The simulator request was refused.' };
+    return res.data ?? { error: 'The simulator returned no payload.' };
   }
 
   const handleSend = async (textToSend?: string) => {
@@ -322,6 +334,8 @@ export function SimulatorScreen() {
           </button>
         </div>
       </div>
+
+      <AdminGate session={session} scope="A simulated number registers a real user record and conversation in this store, so the simulator is administrator-only." />
 
       {/* Quick Prompts Bar */}
       <div className="space-y-1.5">

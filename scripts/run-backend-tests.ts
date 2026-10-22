@@ -5,6 +5,13 @@
  */
 process.env.AGUKA_DATA_DIR = process.env.AGUKA_DATA_DIR || '.aguka-test-data';
 
+/**
+ * The admin-route tests need a session to sign, so this process gets a throwaway secret
+ * before the app config is read. It lives only in this CLI run: it is not a shipped
+ * default, is not written to any file, and the server never sees it.
+ */
+process.env.ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || `suite-only-${process.pid}`;
+
 async function main() {
   const { runPlatformTestSuiteAsync } = await import('@/lib/testing/suite');
 

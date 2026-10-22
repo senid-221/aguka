@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   X,
   FlaskConical,
@@ -11,54 +11,63 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { TestResultItem } from '@/lib/testing/suite';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
 
 interface TestSuiteModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
-export function TestSuiteModal({ isOpen, onClose }: TestSuiteModalProps) {
-  const [results, setResults] = useState<TestResultItem[]>([]);
-  const [isRunning, setIsRunning] = useState(false);
-  const [summary, setSummary] = useState<{ total: number; passed: number; failed: number } | null>(null);
+interface SuitePayload {
+  results?: TestResultItem[];
+  total?: number;
+  passedCount?: number;
+  failedCount?: number;
+}
 
-  const runTests = () => {
-    setIsRunning(true);
-    fetch('/api/tests')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!data) return;
-        setResults(data.results || []);
+export function TestSuiteModal({ isOpen, onClose }: TestSuiteModalProps) {
+  const session = useAdminSession();
+  const [results, setResults] = useState<TestResultItem[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [settled, setSettled] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [summary, setSummary] = useState<{ total: number; passed: number; failed: number } | null>(null);
+  // The first run starts from the effect and later ones from the rerun button, so the
+  // spinner is derived rather than started synchronously inside the effect.
+  const isRunning = session.authed && (!settled || refreshing);
+
+  const load = useCallback(() => {
+    adminFetch<SuitePayload>('/api/tests')
+      .then((res) => {
+        setRefreshing(false);
+        setSettled(true);
+        if (!res.ok || !res.data) {
+          setNotice(res.error || 'The suite did not run.');
+          return;
+        }
+        setNotice(null);
+        setResults(res.data.results || []);
         setSummary({
-          total: data.total || 0,
-          passed: data.passedCount || 0,
-          failed: data.failedCount || 0,
+          total: res.data.total || 0,
+          passed: res.data.passedCount || 0,
+          failed: res.data.failedCount || 0,
         });
       })
-      .catch((err) => console.error('Test execution failed:', err))
-      .finally(() => setIsRunning(false));
+      .catch((err) => {
+        setRefreshing(false);
+        console.error('Test execution failed:', err);
+      });
+  }, []);
+
+  const rerun = () => {
+    setRefreshing(true);
+    load();
   };
 
   useEffect(() => {
-    if (!isOpen) return;
-    let isMounted = true;
-    fetch('/api/tests')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!isMounted || !data) return;
-        setResults(data.results || []);
-        setSummary({
-          total: data.total || 0,
-          passed: data.passedCount || 0,
-          failed: data.failedCount || 0,
-        });
-      })
-      .catch((err) => console.error('Test execution failed:', err));
-
-    return () => {
-      isMounted = false;
-    };
-  }, [isOpen]);
+    if (isOpen && session.authed) load();
+  }, [isOpen, session.authed, load]);
 
   if (!isOpen) return null;
 
@@ -92,7 +101,7 @@ export function TestSuiteModal({ isOpen, onClose }: TestSuiteModalProps) {
 
           <div className="flex items-center gap-2">
             <button
-              onClick={runTests}
+              onClick={rerun}
               disabled={isRunning}
               className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
               title="Rerun tests"
@@ -110,7 +119,11 @@ export function TestSuiteModal({ isOpen, onClose }: TestSuiteModalProps) {
 
         {/* Test Items List */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-3">
-          {isRunning ? (
+          {!session.authed ? (
+            <AdminGate session={session} scope="The suite is the platform's own verification, so it is opened from an administrator session." />
+          ) : notice ? (
+            <p className="text-xs text-amber-400">{notice}</p>
+          ) : isRunning ? (
             <div className="text-center py-12 space-y-2">
               <RefreshCw className="w-6 h-6 text-emerald-400 animate-spin mx-auto" />
               <p className="text-xs text-zinc-400 font-mono">Running platform test suite assertions...</p>

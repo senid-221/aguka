@@ -16,8 +16,18 @@ import {
 } from 'lucide-react';
 import { WorkerProfile, EmployerProfile, Vacancy, JobMatch } from '@/lib/types';
 import { RwandaFlagIcon } from '@/components/icons/logos';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
+
+interface MarketplacePayload {
+  workers?: WorkerProfile[];
+  employers?: EmployerProfile[];
+  vacancies?: Vacancy[];
+  matches?: JobMatch[];
+}
 
 export function EmploymentScreen() {
+  const session = useAdminSession();
   const [workers, setWorkers] = useState<WorkerProfile[]>([]);
   const [employers, setEmployers] = useState<EmployerProfile[]>([]);
   const [vacancies, setVacancies] = useState<Vacancy[]>([]);
@@ -25,22 +35,17 @@ export function EmploymentScreen() {
   const [activeTab, setActiveTab] = useState<'matches' | 'workers' | 'vacancies'>('matches');
 
   useEffect(() => {
-    let isMounted = true;
-    fetch('/api/marketplace')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!isMounted || !data) return;
-        setWorkers(data.workers || []);
-        setEmployers(data.employers || []);
-        setVacancies(data.vacancies || []);
-        setMatches(data.matches || []);
+    if (!session.authed) return;
+    adminFetch<MarketplacePayload>('/api/marketplace')
+      .then((res) => {
+        if (!res.ok || !res.data) return;
+        setWorkers(res.data.workers || []);
+        setEmployers(res.data.employers || []);
+        setVacancies(res.data.vacancies || []);
+        setMatches(res.data.matches || []);
       })
       .catch((err) => console.error('Error fetching marketplace data:', err));
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+  }, [session.authed]);
 
   return (
     <div className="p-4 sm:p-6 space-y-6">
@@ -90,6 +95,8 @@ export function EmploymentScreen() {
           </button>
         </div>
       </div>
+
+      <AdminGate session={session} scope="Worker profiles hold names, phone numbers and districts, so the directory needs an administrator session." />
 
       {/* Tab: Matches */}
       {activeTab === 'matches' && (

@@ -16,6 +16,8 @@ import {
 } from 'lucide-react';
 import { PostgresLogo, RedisLogo, WhatsAppLogo } from '@/components/icons/logos';
 import { CodingTask } from '@/lib/types';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
 
 const TASK_TYPES: Array<{ value: CodingTask['taskType']; label: string }> = [
   { value: 'SCAFFOLD', label: 'Scaffold a service' },
@@ -24,6 +26,7 @@ const TASK_TYPES: Array<{ value: CodingTask['taskType']; label: string }> = [
 ];
 
 export function CodingScreen() {
+  const session = useAdminSession();
   const [tasks, setTasks] = useState<CodingTask[]>([]);
   const [selectedLanguage, setSelectedLanguage] = useState<CodingTask['language']>('typescript');
   const [taskType, setTaskType] = useState<CodingTask['taskType']>('SCAFFOLD');
@@ -36,10 +39,9 @@ export function CodingScreen() {
   const [activeTask, setActiveTask] = useState<CodingTask | null>(null);
 
   const loadTasks = () => {
-    fetch('/api/coding')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        const list: CodingTask[] = data?.tasks || [];
+    adminFetch<{ tasks?: CodingTask[] }>('/api/coding')
+      .then((res) => {
+        const list: CodingTask[] = res.data?.tasks || [];
         setTasks(list);
         setActiveTask((prev) => prev || list[0] || null);
       })
@@ -47,8 +49,8 @@ export function CodingScreen() {
   };
 
   useEffect(() => {
-    loadTasks();
-  }, []);
+    if (session.authed) loadTasks();
+  }, [session.authed]);
 
   const handleSubmit = async () => {
     if (!userId.trim() || !prompt.trim()) {
@@ -58,9 +60,8 @@ export function CodingScreen() {
     setError('');
     setIsExecuting(true);
     try {
-      const res = await fetch('/api/coding', {
+      const res = await adminFetch<{ task?: CodingTask; error?: string }>('/api/coding', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: userId.trim(),
           taskType,
@@ -69,12 +70,11 @@ export function CodingScreen() {
           code: code.trim() || undefined,
         }),
       });
-      const data = await res.json();
-      if (res.ok && data.task) {
-        setTasks((prev) => [data.task, ...prev]);
-        setActiveTask(data.task);
+      if (res.ok && res.data?.task) {
+        setTasks((prev) => [res.data!.task!, ...prev]);
+        setActiveTask(res.data.task);
       } else {
-        setError(data.error || 'The request failed.');
+        setError(res.error || 'The request failed.');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Network failure.');
@@ -119,6 +119,8 @@ export function CodingScreen() {
           </button>
         </div>
       </div>
+
+      <AdminGate session={session} scope="Each request spends provider tokens and files the result against a user account, so this hub is administrator-only." />
 
       {/* System Map — what is actually wired */}
       <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-4">

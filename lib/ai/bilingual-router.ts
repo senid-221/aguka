@@ -11,7 +11,8 @@ import {
 } from '@/lib/services/entitlements';
 import { getService } from '@/lib/services/catalog';
 import { handleRoadSafetyMessage } from '@/lib/road-safety/whatsapp-flow';
-import { publishedLessons, progressFor, formatProgress } from '@/lib/road-safety/academy';
+import { progressFor, formatProgress } from '@/lib/road-safety/academy';
+import { buildRoadSafetyTutorContext } from '@/lib/road-safety/tutor-context';
 import { resolveImageCapability } from '@/lib/images/provider';
 import { attachmentOf, runImageStudio, type ImageAttachment } from '@/lib/images/studio';
 
@@ -199,7 +200,7 @@ const AGENT_SYSTEM_INSTRUCTIONS: Record<AgentType, string> = {
   EMPLOYMENT_MARKETPLACE:
     'You connect Rwandan employers with workers. Report only the marketplace figures given in the platform data section and never name or describe a professional who is not listed there.',
   ROAD_SAFETY_ACADEMY:
-    'You teach Rwandan road safety and traffic rules. Use ONLY the published lesson material supplied in the platform data section, and state its legal-review status. If a rule is not in that material, say you have not verified it for Rwanda and direct the learner to the official authority instead of guessing. Never present a fine amount, licence category, age limit, speed limit or pass mark that is not in the supplied material.',
+    'You teach Rwandan road safety and traffic rules. Use ONLY the material supplied in the platform data section: the published lessons, the published road-sign register and this learner\'s own paper record. Quote the sign code, the letter the learner actually typed and the option they should have chosen, and repeat the legal-review status and source URL that came with the item. If a rule, sign, fine amount, licence category, age limit, speed limit or pass mark is not in that material, say plainly that it has not been verified for Rwanda and point the learner to the Rwanda National Police instead of guessing. Never describe a sign that is not in the register, never claim a picture you do not have, and never present a practice paper as the official government examination — the platform data says which papers are simulations.',
 };
 
 const AGENT_BUTTONS: Record<AgentType, Array<{ id: string; en: string; rw: string }>> = {
@@ -572,7 +573,7 @@ export async function executeAgent(
   // 4. Road Safety runs its lessons, exams and scoring deterministically in the
   //    backend, so it works with or without an AI provider.
   if (agentType === 'ROAD_SAFETY_ACADEMY') {
-    const flow = handleRoadSafetyMessage(user, sanitization.cleanText, replyLang);
+    const flow = await handleRoadSafetyMessage(user, sanitization.cleanText, replyLang);
     if (flow) {
       if (service) consumeUsage(user, service.code);
       const latencyMs = Date.now() - startTime;
@@ -666,26 +667,20 @@ export async function executeAgent(
 
   if (agentType === 'ROAD_SAFETY_ACADEMY') {
     const toolStart = Date.now();
-    const lessons = publishedLessons();
     const progress = progressFor(user.id);
+    const groundings = buildRoadSafetyTutorContext(user.id);
     toolCalls.push({
-      name: 'read_road_safety_library',
+      name: 'read_road_safety_record',
       args: {},
-      result: { publishedLessons: lessons.length, lessonsCompleted: progress.lessonsCompleted },
+      result: {
+        lessonsCompleted: progress.lessonsCompleted,
+        answeredQuestions: progress.totalAnswered,
+        papers: progress.practiceAttempts + progress.mockExams,
+        contextBlocks: groundings.length,
+      },
       latencyMs: Date.now() - toolStart,
     });
-
-    contextParts.push(
-      lessons.length === 0
-        ? 'Published Road Safety Academy lessons: none. Tell the learner that no verified material is published yet.'
-        : `Published Road Safety Academy lessons (the only material you may teach from):\n${lessons
-            .slice(0, 8)
-            .map(
-              (l) =>
-                `- ${l.titleEn} | ${l.bodyEn.slice(0, 600)} | legal review: ${l.legalVerifiedAt ? l.legalVerifiedAt.slice(0, 10) : 'NOT REVIEWED'} | sources: ${l.citations.map((c) => c.url).join(' ') || 'none'}`
-            )
-            .join('\n')}\n\nLearner progress: ${progress.lessonsCompleted} lessons completed, ${progress.mockExams} mock exams, best score ${progress.bestExamPercent}%.`
-    );
+    contextParts.push(...groundings);
   }
 
   // 6. Ask the provider chain; never answer from a scripted reply

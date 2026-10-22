@@ -574,6 +574,7 @@ enum ProofReviewStatus {
 enum PublishStatus {
   DRAFT
   PUBLISHED
+  NEEDS_REVIEW
   ARCHIVED
 }
 
@@ -595,6 +596,20 @@ enum QuestionDifficulty {
 enum ExamKind {
   PRACTICE
   MOCK_EXAM
+  LEARN
+}
+
+enum QuestionSource {
+  CURATED_PACK
+  AI_GENERATED
+  ADMIN_AUTHORED
+}
+
+enum GenerationRunKind {
+  PRACTICE
+  MOCK_EXAM
+  LEARN
+  ADMIN_BATCH
 }
 
 enum AuditActorRole {
@@ -779,36 +794,59 @@ model RoadSign {
   meaningRw        String
   shape            String
   colourConvention String
+  /// Durable key of a photographed official sign uploaded by an administrator. A
+  /// sign-identification question stays unpublished while this is null: an AI-drawn
+  /// approximation of a legal sign would teach the wrong meaning.
+  imageKey         String?
   citations        Json
   legalVerifiedAt  DateTime?
   status           PublishStatus    @default(DRAFT)
   createdAt        DateTime         @default(now())
   updatedAt        DateTime         @updatedAt
 
+  questions        RoadSafetyQuestion[]
+
   @@index([category, status])
 }
 
 model RoadSafetyQuestion {
-  id             String            @id @default(uuid())
-  moduleId       String
-  module         RoadSafetyModule  @relation(fields: [moduleId], references: [id], onDelete: Cascade)
-  lessonId       String?
-  lesson         RoadSafetyLesson? @relation(fields: [lessonId], references: [id], onDelete: SetNull)
-  questionEn     String
-  questionRw     String
-  optionsEn      String[]
-  optionsRw      String[]
-  correctIndex   Int
-  explanationEn  String
-  explanationRw  String
-  difficulty     QuestionDifficulty @default(MEDIUM)
-  citations      Json
+  id              String            @id @default(uuid())
+  moduleId        String
+  module          RoadSafetyModule  @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  lessonId        String?
+  lesson          RoadSafetyLesson? @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  signId          String?
+  sign            RoadSign?         @relation(fields: [signId], references: [id], onDelete: SetNull)
+  questionEn      String
+  questionRw      String
+  optionsEn       String[]
+  optionsRw       String[]
+  correctIndex    Int
+  /// Set only for a multi-answer paper; null means one correct option.
+  correctIndexes  Int[]
+  explanationEn   String
+  explanationRw   String
+  difficulty      QuestionDifficulty @default(MEDIUM)
+  citations       Json
   legalVerifiedAt DateTime?
-  status         PublishStatus     @default(DRAFT)
-  createdAt      DateTime          @default(now())
-  updatedAt      DateTime          @updatedAt
+  status          PublishStatus     @default(DRAFT)
+  /// Verified fact ids this item tests, so revision targeting has something to walk.
+  factIds         String[]          @default([])
+  source          QuestionSource    @default(CURATED_PACK)
+  /// Provider, model, run id and token cost of the run that produced this row.
+  generation      Json?
+  /// Why the verification gate held the item back; cleared when a person approves it.
+  reviewReasons   String[]          @default([])
+  /// Learner and admin reports that the item is wrong, with how each was resolved.
+  issueReports    Json              @default("[]")
+  /// Normalised stem + options + key, used by the duplicate detector.
+  fingerprint     String            @default("")
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
 
   @@index([moduleId, status])
+  @@index([fingerprint])
+  @@index([status])
 }
 
 model ExamTemplate {
@@ -820,6 +858,11 @@ model ExamTemplate {
   questionCount     Int               @default(10)
   passPercent       Int               @default(70)
   timeLimitMinutes  Int?
+  /// Server-enforced examination behaviour: no answer key before submission.
+  strictMode        Boolean           @default(false)
+  /// A citation only when count, duration or pass mark comes from an authoritative
+  /// source; null marks these as administrator-chosen simulation settings.
+  officialBasis     Json?
   status            PublishStatus     @default(DRAFT)
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
@@ -840,6 +883,10 @@ model ExamAttempt {
   language        LanguagePreference
   questionIds     String[]
   answers         Json          // per-question correction + bilingual explanation
+  /// Autosaved picks, index-aligned to questionIds; null at a position means unanswered.
+  savedAnswers    Json              @default("[]")
+  /// Seconds per item, index-aligned to questionIds, accumulated by the server.
+  answerSeconds   Int[]             @default([])
   totalQuestions  Int
   correctCount    Int           @default(0)
   scorePercent    Int           @default(0)
@@ -848,8 +895,47 @@ model ExamAttempt {
   startedAt       DateTime
   submittedAt     DateTime?
   durationSeconds Int?
+  /// Server-owned timer: the deadline is written at creation, never taken from a client clock.
+  timeLimitSeconds Int?
+  deadlineAt      DateTime?
+  strict          Boolean       @default(false)
+  /// False while a strict paper is unfinished, so the key cannot be read early.
+  answersRevealed Boolean       @default(true)
+  lastActivityAt  DateTime          @default(now())
 
   @@index([userId, kind])
+  @@index([submittedAt])
+}
+
+/// One provider call for fresh questions, kept so cost and failure are auditable.
+model QuestionGenerationRun {
+  id            String             @id @default(uuid())
+  startedAt     DateTime
+  userId        String?
+  kind          GenerationRunKind
+  requested     Int
+  factIds       String[]          @default([])
+  provider      String?
+  model         String?
+  candidates    Int                @default(0)
+  published     Int                @default(0)
+  heldForReview Int                @default(0)
+  tokensUsed    Int                @default(0)
+  latencyMs     Int                @default(0)
+  /// Provider chain trace, for the operator only.
+  attempts      String[]          @default([])
+  error         String?
+
+  @@index([startedAt])
+  @@index([userId])
+}
+
+/// Single-row academy configuration: what may be generated, at what limits, and which
+/// sources are approved. Kept as one row because the whole object is read together.
+model RoadSafetySettings {
+  id        String   @id @default("ROAD_SAFETY")
+  settings  Json
+  updatedAt DateTime @updatedAt
 }
 
 model LessonProgress {

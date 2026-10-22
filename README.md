@@ -21,7 +21,7 @@ consent management, pricing and curriculum control, payment review and an automa
 | **Passport & Photo Studio** | Written guidance on the 35×45 mm Rwandan passport standard and CV portraits, plus — when `OPENAI_API_KEY` or `GEMINI_API_KEY` is set — a real render: the image is produced by that provider, cropped to the exact 35:45 ratio with `sharp`, stored privately under `AGUKA_DATA_DIR` and delivered back on WhatsApp as an image message. A photo sent with a caption asking for it to be retouched is used as the reference. With no image key configured the request is refused before any model call and nothing is charged; a 30-day retention sweep (`IMAGE_RETENTION_DAYS`) deletes the expired file. |
 | **Study Tutor** | STEM and language explanations in Kinyarwanda or English, plus generated quizzes through `POST /api/study`. |
 | **Employment Marketplace** | Worker profiles, vacancies and match scores computed from stored skills, location and experience. |
-| **Road Safety Academy** | Bilingual lessons, road signs, traffic rules, practice questions and timed mock exams scored server-side, with a correction and explanation for every question and per-learner progress. Curriculum content carries the gazette or service page it was taken from. |
+| **Road Safety Academy** | Bilingual lessons, road signs, practice sets, learn mode and timed mock exams scored server-side, with a correction and explanation for every question and per-learner progress. New questions are generated from a registry of rules that each cite a gazette or service page, and a verification gate holds anything it cannot defend in a review queue instead of publishing it — the AI never supplies a speed limit, penalty or sign meaning of its own. Every paper is labelled a practice simulation, never the official examination. Difficulty adapts to the learner's own accuracy and timing, and each finished paper ends with a six-part report. |
 | **Services & Access** | The catalogue behind the first WhatsApp message: an administrator enables each service, sets price, billing period, trial length and usage caps, and picks the agent it routes to. |
 | **MoMo Payments** | Payment orders, receipt-screenshot upload with duplicate detection, provider reconciliation when configured, and an admin review queue that is the only thing that can unlock access by default. |
 | **Users & Consent** | DPPA consent records and per-user data controls. |
@@ -173,26 +173,27 @@ phone number, and the screen labels the result as a local payload preview.
 | Route | Method | Function |
 | --- | --- | --- |
 | `/api/whatsapp/webhook` | GET, POST | Meta subscription handshake and signed inbound messages. |
-| `/api/whatsapp/simulate` | POST | Inject a test message through the full pipeline. |
-| `/api/jobs` | GET, POST | Stored listings and board health; `POST` with `action: "CRAWL_SOURCE"` runs a real crawl of one board and needs an administrator token, because it makes outbound requests and writes to the store. |
-| `/api/marketplace`, `/api/study`, `/api/coding`, `/api/media`, `/api/users` | GET, POST | Console data feeds and module actions. |
-| `/api/agents`, `/api/conversations` | GET | Recorded agent runs and conversation history. |
+| `/api/whatsapp/simulate` | POST | Inject a test message through the full pipeline. Needs an administrator token: the number becomes a real user record. |
+| `/api/jobs` | GET, POST | Stored listings and board health. Both verbs need an administrator token — learners reach listings through the WhatsApp agent tool, and a crawl makes outbound requests and writes to the store. |
+| `/api/marketplace`, `/api/study`, `/api/coding`, `/api/media`, `/api/users` | GET, POST | Console data feeds and module actions. Every one of these carries someone's profile, photo, lesson or message history, so both verbs require an administrator token. |
+| `/api/agents`, `/api/conversations` | GET | Recorded agent runs and conversation history; administrator token. |
 | `/api/services` | GET | The enabled services currently offered in the WhatsApp menu. |
 | `/api/road-safety/catalog` | GET | Published lessons, road signs and practice questions. |
-| `/api/road-safety/exam` | POST | Start or answer a mock/practice attempt; scoring is server-side. |
+| `/api/road-safety/exam` | POST | Start, answer, resume, submit, review, report or report an inaccuracy on a learner's own attempt; the timer, the answer set and the score are server-side. |
 | `/api/payments/order` | POST | Create a mobile money order for a service. |
 | `/api/payments/proof` | POST | Upload the receipt screenshot against an order. |
 | `/api/payments/webhook` | POST | Provider confirmation; requires `PAYMENT_WEBHOOK_SECRET` and a valid HMAC. |
 | `/api/admin/login` | POST | Issue an admin bearer token. |
 | `/api/admin/services` | GET, POST, PATCH, DELETE | Price, trial, cap, agent and menu visibility per service. |
-| `/api/admin/road-safety` | GET, POST | Curriculum, road sign and question management. |
+| `/api/admin/road-safety` | GET, POST | Curriculum, road signs and exam papers, plus the academy controls: `SAVE_SETTINGS`, `REVIEW_APPROVE`, `REVIEW_REJECT`, `GENERATE_BATCH`, the review queue, the approved-source ledger and generation-run monitoring. |
 | `/api/admin/payments` | GET, POST | Review queue: verify, reject, reconcile. |
 | `/api/admin/payments/image` | GET | Serve a stored proof to the reviewer, token-gated. |
 | `/api/admin/media/image` | GET | Serve one stored studio photo to the console, token-gated; 410 once retention deleted it. |
 | `/api/admin/entitlements` | GET, POST | Live access list, manual grant, revocation. |
 | `/api/admin/audit` | GET | Who changed what, including every access decision. |
 | `/api/admin/maintenance` | POST | Retention sweep and queue drain. |
-| `/api/health`, `/api/ready`, `/api/tests` | GET | Liveness, readiness (including store mode) and the automated suite. |
+| `/api/health`, `/api/ready` | GET | Liveness and readiness, including store mode. Public so a deployment probe can read them; they carry configuration facts, never records. |
+| `/api/tests` | GET | The automated suite. Needs an administrator token so no anonymous visitor can trigger a platform exercise. |
 
 Every `/api/admin/*` route except `/api/admin/login` rejects a request without a valid bearer token,
 and so does `POST /api/jobs`.
@@ -204,7 +205,7 @@ npm test
 npx tsx scripts/run-extension-tests.ts
 ```
 
-34 checks cover the webhook challenge, invalid-token rejection, HMAC signature verification, event
+45 checks cover the webhook challenge, invalid-token rejection, HMAC signature verification, event
 deduplication idempotency, Kinyarwanda/English detection, agent intent routing, prompt injection
 resistance, secret redaction, marketplace matching driven only by stored records, the AI provider
 contract, the text provider chain — a rate limit retried once, a dead model id or blocked answer
@@ -228,7 +229,15 @@ feed listing stored with the employer split from the title, the salary, the boar
 excerpt, a re-crawl that refreshes instead of duplicating, a card page read with its day-first deadline and
 an expired posting marked expired, an unreadable board reporting its reason and storing nothing until
 `JOB_FEED_URL_<CODE>` is set, an override that points at a page reporting that it is not a feed, a board
-that answers 500 storing nothing, and a row with no link back refused.
+that answers 500 storing nothing, and a row with no link back refused. The Road Safety Academy checks
+cover the verified-rule registry, generation that is gated before it can publish, adaptive difficulty
+built from a learner's own answers and timings, fresh sets with exact and near-duplicate detection,
+deterministic option shuffling that keeps the key correct, the server timer with autosave and
+auto-submit, strict papers that withhold the key until submission, the six-part report and the tutor
+grounding built from the learner's actual paper, learner inaccuracy reports draining the review queue,
+and the administrator controls — approving an ungrounded item refused before the row is written, a
+rejection that needs a written reason, out-of-range settings clamped on save, and a batch with no
+provider recorded as blocked with nothing published.
 The suite never touches the network — the boards are answered by a stub — so it cannot hammer a real site.
 The same suite runs from the **Run Test Suite**
 button in the console topbar.
@@ -241,9 +250,15 @@ projects, study sessions and quizzes, agent runs and tool calls, webhook events,
 admin users, audit logs and usage records, plus the commercial and academy tables added by
 `prisma/migrations/20261021000000_commercial_and_road_safety/`: service catalogue, entitlements,
 trial grants, payment orders, payment proofs, road safety modules, lessons, signs, questions,
-citations, exam templates, exam attempts and lesson progress. `lib/db/prisma-readiness.ts` reports
-whether Prisma is installed and whether those migrations have been applied, so `/api/ready` states
-`productionDatabase` honestly instead of claiming a connection it does not have.
+citations, exam templates, exam attempts and lesson progress — and the exam-engine columns and tables
+added by `prisma/migrations/20261022000000_road_safety_exam_engine/` (rule links, multi-answer keys,
+fingerprints, hold reasons, learner reports, autosave and server timer on attempts, strict papers,
+`QuestionGenerationRun`, `RoadSafetySettings`). `lib/db/prisma-readiness.ts` reports whether Prisma is
+installed and whether those migrations have been applied, so `/api/ready` states `productionDatabase`
+honestly instead of claiming a connection it does not have. Neither academy migration has been run
+from this development machine — no PostgreSQL instance was reachable — so until
+`npx prisma migrate deploy` succeeds on the host, the file-backed store under `AGUKA_DATA_DIR` is what
+the running application actually reads and writes.
 
 ## Build & deploy
 

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
+import { requireAdmin } from '@/lib/security/admin-auth';
 import { generateText, chainSummary } from '@/lib/ai/provider-adapter';
 import { LanguagePreference, QuizItem } from '@/lib/types';
 import { logger } from '@/lib/logging/logger';
@@ -38,12 +39,20 @@ function toQuizzes(raw: unknown, sessionId: string): QuizItem[] {
   return quizzes;
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const sessions = repo.getStudySessions();
   return NextResponse.json({ sessions });
 }
 
 export async function POST(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const body = await request.json();
     const { action } = body;

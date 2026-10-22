@@ -14,3 +14,5 @@ package-lock.json
 .aguka-data/
 # Separate store used by `npm test` so the suite never writes into live data
 .aguka-test-data/
+# Throwaway store used for manual browser checks of the admin screens
+.aguka-verify-data/

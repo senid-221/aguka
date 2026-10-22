@@ -3,6 +3,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Bot, Briefcase, Code2, Image as ImageIcon, GraduationCap, Users2, FileText, Layers, Cpu } from 'lucide-react';
 import { AgentRun, AgentType, QueuedJob, ToolCallTrace, WebhookEventRecord } from '@/lib/types';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
 
 interface AgentsPayload {
   agentRuns: AgentRun[];
@@ -93,37 +95,33 @@ const AGENT_CATALOG: AgentDescriptor[] = [
 ];
 
 export function AgentsScreen() {
+  const session = useAdminSession();
   const [data, setData] = useState<AgentsPayload | null>(null);
   const [ready, setReady] = useState<ReadyPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let isMounted = true;
-    Promise.all([
-      fetch('/api/agents')
-        .then((res) => (res.ok ? res.json() : null))
-        .catch(() => null),
-      fetch('/api/ready')
-        .then((res) => res.json())
-        .catch(() => null),
-    ])
-      .then(([agentsPayload, readyPayload]) => {
-        if (!isMounted) return;
-        if (!agentsPayload || !readyPayload?.checks) {
-          setError('Agent telemetry endpoints did not respond.');
+    fetch('/api/ready')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: ReadyPayload | null) => {
+        if (payload?.checks) setReady(payload);
+      })
+      .catch(() => setError('The readiness endpoint did not respond.'));
+  }, []);
+
+  useEffect(() => {
+    if (!session.authed) return;
+    adminFetch<AgentsPayload>('/api/agents')
+      .then((res) => {
+        if (!res.ok || !res.data) {
+          setError(res.error || 'Agent telemetry did not respond.');
           return;
         }
-        setData(agentsPayload);
-        setReady(readyPayload);
+        setError(null);
+        setData(res.data);
       })
-      .catch((err) => {
-        if (isMounted) setError(err instanceof Error ? err.message : String(err));
-      });
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  }, [session.authed]);
 
   const runsByAgent = useMemo(() => {
     const map = new Map<AgentType, AgentRun[]>();
@@ -174,6 +172,8 @@ export function AgentsScreen() {
           </div>
         </div>
       </div>
+
+      <AdminGate session={session} scope="This log names the WhatsApp message ids and conversations each agent touched." />
 
       {error && (
         <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-xs text-red-300">

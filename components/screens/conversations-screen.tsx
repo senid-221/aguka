@@ -15,30 +15,32 @@ import {
 } from 'lucide-react';
 import { Conversation, User as UserType } from '@/lib/types';
 import { WhatsAppLogo } from '@/components/icons/logos';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
 
 export function ConversationsScreen() {
+  const session = useAdminSession();
   const [conversations, setConversations] = useState<Array<Conversation & { user?: UserType }>>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
-    let isMounted = true;
-    fetch('/api/conversations')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!isMounted || !data) return;
-        setConversations(data.conversations || []);
-        if (data.conversations?.length > 0) {
-          setSelectedId((prev) => prev || data.conversations[0].id);
+    if (!session.authed) return;
+    adminFetch<{ conversations?: Array<Conversation & { user?: UserType }> }>('/api/conversations')
+      .then((res) => {
+        if (!res.ok || !res.data) {
+          setNotice(res.error || 'The conversation list was refused.');
+          return;
+        }
+        setNotice(null);
+        setConversations(res.data.conversations || []);
+        if (res.data.conversations?.length) {
+          setSelectedId((prev) => prev || res.data!.conversations![0].id);
         }
       })
       .catch((err) => console.error('Error fetching conversations:', err));
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+  }, [session.authed]);
 
   const filtered = conversations.filter((c) => {
     const name = c.user?.fullName?.toLowerCase() || '';
@@ -63,6 +65,9 @@ export function ConversationsScreen() {
         </div>
       </div>
 
+      <AdminGate session={session} scope="A conversation carries everything a person typed to the agent, so it is opened only from an administrator session." />
+
+      {!session.authed ? null : (
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 flex-1 overflow-hidden">
         {/* Left Column: Conversation List */}
         <div className="lg:col-span-4 bg-zinc-900 border border-zinc-800 rounded-xl flex flex-col overflow-hidden">
@@ -260,6 +265,9 @@ export function ConversationsScreen() {
           )}
         </div>
       </div>
+      )}
+
+      {notice && <p className="text-xs text-amber-400">{notice}</p>}
     </div>
   );
 }

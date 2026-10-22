@@ -10,7 +10,8 @@ import {
   Upload,
 } from 'lucide-react';
 import { MediaTask } from '@/lib/types';
-import { adminBlobUrl } from '@/lib/client/admin-session';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminBlobUrl, adminFetch, useAdminSession } from '@/lib/client/admin-session';
 
 /** Studio inputs are described, never hosted: only real URLs render as images. */
 function isDisplayableUrl(value: string): boolean {
@@ -36,6 +37,7 @@ function statusStyle(status: MediaTask['status']): string {
 }
 
 export function MediaScreen() {
+  const session = useAdminSession();
   const [tasks, setTasks] = useState<MediaTask[]>([]);
   const [selectedTask, setSelectedTask] = useState<MediaTask | null>(null);
   const [userId, setUserId] = useState('');
@@ -70,11 +72,10 @@ export function MediaScreen() {
   );
 
   const loadTasks = () => {
-    fetch('/api/media')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!data) return;
-        const list: MediaTask[] = data.tasks || [];
+    adminFetch<{ tasks?: MediaTask[] }>('/api/media')
+      .then((res) => {
+        if (!res.ok || !res.data) return;
+        const list: MediaTask[] = res.data.tasks || [];
         setTasks(list);
         setSelectedTask((prev) => prev || list[0] || null);
       })
@@ -82,8 +83,8 @@ export function MediaScreen() {
   };
 
   useEffect(() => {
-    loadTasks();
-  }, []);
+    if (session.authed) loadTasks();
+  }, [session.authed]);
 
   const handleCreateTask = async () => {
     if (!userId.trim() || !imageUrl.trim()) {
@@ -93,21 +94,19 @@ export function MediaScreen() {
     setFormError('');
     setIsSubmitting(true);
     try {
-      const res = await fetch('/api/media', {
+      const res = await adminFetch<{ task?: MediaTask; error?: string }>('/api/media', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: userId.trim(),
           originalUrl: imageUrl.trim(),
           operation,
         }),
       });
-      const data = await res.json();
-      if (res.ok && data.task) {
-        setTasks((prev) => [data.task, ...prev]);
-        setSelectedTask(data.task);
+      if (res.ok && res.data?.task) {
+        setTasks((prev) => [res.data!.task!, ...prev]);
+        setSelectedTask(res.data.task);
       } else {
-        setFormError(data.error || 'Could not record the request.');
+        setFormError(res.error || 'Could not record the request.');
       }
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'Request failed.');
@@ -140,6 +139,8 @@ export function MediaScreen() {
           <span>Reload</span>
         </button>
       </div>
+
+      <AdminGate session={session} scope="Photo tasks carry a person's portrait, so the queue is read and written only from an administrator session." />
 
       {/* Record a request */}
       <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-3">

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
+import { requireAdmin } from '@/lib/security/admin-auth';
 import {
   buildButtonMessage,
   buildListMessage,
@@ -16,6 +17,12 @@ export const runtime = 'nodejs';
  * payload that would be sent. Nothing is dispatched to a phone number here.
  */
 export async function POST(request: NextRequest) {
+  // Any caller could otherwise create a real user record from an arbitrary phone
+  // number and spend provider tokens on it. Dashboard-only.
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const { phoneNumber, name, messageText, imageBase64, imageMimeType, imageCaption } = await request.json();
 

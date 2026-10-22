@@ -1,12 +1,24 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
+import { requireAdmin } from '@/lib/security/admin-auth';
 
-export async function GET() {
+// Everything here is personal data: a profile, a whole conversation history, or the
+// deletion of both. The userId arrives in the request, so the only thing that can
+// authorise it is an administrator session — never the caller's own claim.
+export async function GET(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const users = repo.getUsers();
   return NextResponse.json({ users });
 }
 
 export async function POST(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const { action, userId } = await request.json();
 

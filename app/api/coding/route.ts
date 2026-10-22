@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
+import { requireAdmin } from '@/lib/security/admin-auth';
 import { generateText, chainSummary } from '@/lib/ai/provider-adapter';
 import { detectLanguage } from '@/lib/ai/bilingual-router';
 import { logger } from '@/lib/logging/logger';
@@ -9,12 +10,22 @@ const CODING_SYSTEM_INSTRUCTION =
   'Markdown. Write only code you are certain compiles or runs; when something must be adapted, say so ' +
   'explicitly. Never claim that code was executed, tested or benchmarked — nothing is run here.';
 
-export async function GET() {
+// This route spends provider tokens and stores the result against a userId taken
+// from the request, so it is an administrator endpoint, not a public one.
+export async function GET(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const tasks = repo.getCodingTasks();
   return NextResponse.json({ tasks });
 }
 
 export async function POST(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const { userId, title, taskType, language, code, inputPrompt } = await request.json();
 

@@ -1,7 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
+import { requireAdmin } from '@/lib/security/admin-auth';
 
-export async function GET() {
+// Worker profiles carry a name and a phone number; an unauthenticated list is a
+// directory of private data.
+export async function GET(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const workers = repo.getWorkerProfiles();
   const employers = repo.getEmployerProfiles();
   const vacancies = repo.getVacancies();
@@ -16,6 +23,10 @@ export async function GET() {
 }
 
 export async function POST(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const body = await request.json();
     const { action } = body;

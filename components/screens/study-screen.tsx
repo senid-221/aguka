@@ -12,8 +12,11 @@ import {
 } from 'lucide-react';
 import { StudySession } from '@/lib/types';
 import { RwandaFlagIcon } from '@/components/icons/logos';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
 
 export function StudyScreen() {
+  const session = useAdminSession();
   const [sessions, setSessions] = useState<StudySession[]>([]);
   const [selectedSession, setSelectedSession] = useState<StudySession | null>(null);
   const [selectedAnswers, setSelectedAnswers] = useState<Record<string, number>>({});
@@ -25,22 +28,17 @@ export function StudyScreen() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    let isMounted = true;
-    fetch('/api/study')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!isMounted || !data) return;
-        setSessions(data.sessions || []);
-        if (data.sessions?.length > 0) {
-          setSelectedSession((prev) => prev || data.sessions[0]);
+    if (!session.authed) return;
+    adminFetch<{ sessions?: StudySession[] }>('/api/study')
+      .then((res) => {
+        if (!res.ok || !res.data) return;
+        setSessions(res.data.sessions || []);
+        if (res.data.sessions?.length) {
+          setSelectedSession((prev) => prev || res.data!.sessions![0]);
         }
       })
       .catch((err) => console.error('Error fetching study sessions:', err));
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+  }, [session.authed]);
 
   const handleSelectAnswer = (quizId: string, answerIdx: number) => {
     setSelectedAnswers((prev) => ({ ...prev, [quizId]: answerIdx }));
@@ -54,9 +52,8 @@ export function StudyScreen() {
     setError('');
     setIsRequesting(true);
     try {
-      const res = await fetch('/api/study', {
+      const res = await adminFetch<{ session?: StudySession; error?: string }>('/api/study', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'CREATE_SESSION',
           userId: userId.trim(),
@@ -65,13 +62,12 @@ export function StudyScreen() {
           language,
         }),
       });
-      const data = await res.json();
-      if (res.ok && data.session) {
-        setSessions((prev) => [data.session, ...prev]);
-        setSelectedSession(data.session);
+      if (res.ok && res.data?.session) {
+        setSessions((prev) => [res.data!.session!, ...prev]);
+        setSelectedSession(res.data.session);
         setTopic('');
       } else {
-        setError(data.error || 'The tutor could not prepare a lesson.');
+        setError(res.error || 'The tutor could not prepare a lesson.');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Network failure.');
@@ -95,6 +91,8 @@ export function StudyScreen() {
           </p>
         </div>
       </div>
+
+      <AdminGate session={session} scope="Lessons are stored against a user account and cost provider tokens, so the tutor hub is administrator-only." />
 
       <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-3">
         <p className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">

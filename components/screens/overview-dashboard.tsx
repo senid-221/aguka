@@ -17,12 +17,15 @@ import {
 } from 'lucide-react';
 import { WhatsAppLogo, RwandaFlagIcon, PostgresLogo, RedisLogo } from '@/components/icons/logos';
 import { SystemHealth, JobSource, QueuedJob } from '@/lib/types';
+import { AdminGate } from '@/components/layout/admin-gate';
+import { adminFetch, useAdminSession } from '@/lib/client/admin-session';
 
 interface OverviewProps {
   onNavigate: (screen: string) => void;
 }
 
 export function OverviewDashboard({ onNavigate }: OverviewProps) {
+  const session = useAdminSession();
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [sources, setSources] = useState<JobSource[]>([]);
   const [queuedJobs, setQueuedJobs] = useState<QueuedJob[]>([]);
@@ -32,37 +35,34 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
     setIsLoading(true);
     Promise.all([
       fetch('/api/health').then((r) => (r.ok ? r.json() : null)),
-      fetch('/api/jobs').then((r) => (r.ok ? r.json() : null)),
-      fetch('/api/agents').then((r) => (r.ok ? r.json() : null)),
+      adminFetch<{ sources?: JobSource[] }>('/api/jobs'),
+      adminFetch<{ queuedJobs?: QueuedJob[] }>('/api/agents'),
     ])
-      .then(([healthData, jobsData, agentsData]) => {
+      .then(([healthData, jobsRes, agentsRes]) => {
         if (healthData) setHealth(healthData);
-        if (jobsData) {
-          setSources(jobsData.sources || []);
-        }
-        if (agentsData) {
-          setQueuedJobs(agentsData.queuedJobs || []);
-        }
+        if (jobsRes.data) setSources(jobsRes.data.sources || []);
+        if (agentsRes.data) setQueuedJobs(agentsRes.data.queuedJobs || []);
       })
       .catch((err) => console.error(err))
       .finally(() => setIsLoading(false));
   };
 
   useEffect(() => {
+    if (!session.authed) return;
     let isMounted = true;
     Promise.all([
       fetch('/api/health').then((r) => (r.ok ? r.json() : null)),
-      fetch('/api/jobs').then((r) => (r.ok ? r.json() : null)),
-      fetch('/api/agents').then((r) => (r.ok ? r.json() : null)),
+      adminFetch<{ sources?: JobSource[] }>('/api/jobs'),
+      adminFetch<{ queuedJobs?: QueuedJob[] }>('/api/agents'),
     ])
-      .then(([healthData, jobsData, agentsData]) => {
+      .then(([healthData, jobsRes, agentsRes]) => {
         if (!isMounted) return;
         if (healthData) setHealth(healthData);
-        if (jobsData) {
-          setSources(jobsData.sources || []);
+        if (jobsRes.data) {
+          setSources(jobsRes.data.sources || []);
         }
-        if (agentsData) {
-          setQueuedJobs(agentsData.queuedJobs || []);
+        if (agentsRes.data) {
+          setQueuedJobs(agentsRes.data.queuedJobs || []);
         }
       })
       .catch((err) => console.error(err));
@@ -70,7 +70,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [session.authed]);
 
   const statsCount = health?.stats;
 
@@ -262,6 +262,8 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
               </div>
         </div>
       </div>
+
+      <AdminGate session={session} scope="Board crawl health and the worker queue are read from an administrator session." />
 
       {/* Architecture & Source Health Section */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">

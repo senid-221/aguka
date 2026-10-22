@@ -68,6 +68,95 @@ overwritten. The import writes an audit entry with the counts.
   listed in the pack before each term and update through **Road Safety Curriculum**; the screen shows
   the review date so stale pages are visible.
 
+### 3.1 The verified-rule registry, and why generation cannot invent law
+
+`lib/road-safety/verified-facts.ts` is the only grounding the exam engine has. Each row is one rule
+read out of a named instrument and carries `statementEn` / `statementRw`, `legalBasis`
+(`OFFICIAL_REQUIREMENT`, `ADMINISTRATIVE_INSTRUCTION`, `SAFETY_RECOMMENDATION`, `NOT_ESTABLISHED`),
+the article, a numeric `value` and unit where the rule has one, the `citation`, and
+`generationAllowed`. Rules that were searched for and **not found** are stored with
+`generationAllowed: false` so the gap is documented instead of quietly guessed — they are counted as
+*documented gaps* on the admin screen and can never be tested as law.
+
+`lib/road-safety/generator.ts` asks the text chain (Gemini first, OpenAI as the rescue) for questions
+built from a chosen subset of those rows, and `lib/road-safety/verification.ts` then decides whether
+each candidate may be published. The gate is code, not prompt wording:
+
+- the answer must match the rule's numeric value and unit where the rule has one;
+- the item must cite a source, carry a `legalVerifiedAt` date, and link to at least one registry row
+  when `verificationRequiredToPublish` is on;
+- wording is compared with the whole bank by fingerprint (stem + options + key) and by token-set
+  similarity, so a re-phrased copy is caught as a duplicate rather than taught as a new challenge;
+- option order is shuffled deterministically per attempt (`sha256(attemptId|questionId)`) so the key
+  stays correct while the letter changes;
+- anything failing any check is stored as `NEEDS_REVIEW` with `reviewReasons`, never as `PUBLISHED`.
+
+`publicationBlockers()` is shared by the generator and by the human approve button, so an
+administrator cannot publish something the machine refused to publish. The refusal happens **before**
+the row is written.
+
+### 3.2 Modes, timers and what a paper is allowed to claim
+
+`POST /api/road-safety/exam` runs `LEARN`, `PRACTICE` and `MOCK_EXAM` (actions `START`, `ANSWER`,
+`SUBMIT`, `RESUME`, `REVIEW`, `REPORT`, `REPORT_ISSUE`, `PROGRESS`, `COMPLETE_LESSON`). The clock,
+the answer set and the score all live on the server: `deadlineAt` is set at `START`, `ANSWER`
+autosaves, `SUBMIT` grades, and an attempt whose deadline passed is auto-submitted on the next
+contact. A strict paper keeps `answersRevealed` false until submission, so nothing on the client
+decides when time is up or which option was right.
+
+Every paper, reply and admin screen labels the test a **practice simulation**. The instruments cited
+in the registry give the theory test its 60 marks and 60 % pass mark; none of them states a duration,
+so `exam.mockMinutes` is an Aguka setting, not an official time limit, and no template may claim the
+format, length or passing mark of the government examination.
+
+After a graded paper, `lib/road-safety/session-report.ts` builds the six-part report (score, topics
+answered correctly, topics to improve, explanations, recommended lessons and practice, suggested next
+session) from that attempt only, and `lib/road-safety/tutor-context.ts` grounds the conversational
+agent in the same facts — the learner's own paper, their weak topics, the sign register and the
+cited rule — so "Kuki igisubizo cyanjye kitari cyo?" is answered about the question they actually
+got wrong. Reports are per `userId`; one learner's history is never mixed into another's prompt.
+
+### 3.3 Academy controls, review queue and monitoring
+
+The Road Safety Curriculum screen has **Review queue** and **Controls & monitoring** tabs, backed by
+`/api/admin/road-safety` (administrator bearer token on every verb):
+
+| Action | Effect |
+| --- | --- |
+| `SAVE_SETTINGS` | Writes content refresh interval, language pair, generation limits, token budget, paper sizes and the approved-source ledger. Every field is re-derived server-side and out-of-range numbers are clamped, so a partial or stale payload cannot switch a protection off by omission. |
+| `REVIEW_APPROVE` | Publishes a held item — only once `publicationBlockers()` is empty — clears its hold reasons and marks its learner reports resolved. |
+| `REVIEW_REJECT` | Archives the item and appends the written reason to it and to the audit trail. A rejection without a reason is refused. |
+| `GENERATE_BATCH` | 1–10 items grounded on the registry rows for a topic (or the whole curriculum), then run through the same gate. With no provider configured it reports `NO_PROVIDER`, publishes nothing and records the failed run. |
+| `GET` | Curriculum, `settings`, `reviewQueue`, `verifiedFacts` (the linkable registry rows offered in the question editor), `generationRuns`, `generation` health, `reviewOverdue` counts and stats. |
+
+The queue holds items the gate could not defend **and** published items with an unresolved learner
+report; a report only leaves the queue once an administrator approves or rejects the item, so the
+queue drains and stays a signal. `contentRefreshDays` is a live rule: published content whose
+`legalVerifiedAt` is older than it is counted on the Controls tab and needs re-checking against the
+gazette copy.
+
+Read honestly, the gate guarantees only this: *nothing reaches a learner unless it cites a source a
+person registered, and its answer matches that source as recorded.* It does not prove that the
+recorded reading of the law is correct, and it cannot teach a road sign whose real photograph is not
+on file — a sign item stays blocked until `RoadSign.imageKey` holds a genuine picture, because an
+AI-drawn approximation of an official sign teaches the wrong meaning.
+
+### 3.4 Schema and migration state
+
+`prisma/schema.prisma` describes the target PostgreSQL model for the academy (question `factIds`,
+`correctIndexes`, `source`, `generation`, `reviewReasons`, `issueReports`, `fingerprint`, `signId`;
+template `strictMode` and `officialBasis`; attempt autosave, timer and strict columns; the
+`QuestionGenerationRun` and `RoadSafetySettings` tables). The matching SQL is written in
+`prisma/migrations/20261022000000_road_safety_exam_engine/migration.sql` and is additive only.
+
+It has **not** been applied: no PostgreSQL instance was reachable from the development machine, so
+`prisma validate` and `prisma generate` were run with a throwaway inline `DATABASE_URL` and the
+migration was checked against `prisma migrate diff` output rather than executed. On the deployment
+host run `npx prisma migrate deploy` and then `npx prisma migrate status`, and treat the live tables
+as authoritative only after both succeed. Until then the file-backed store under `AGUKA_DATA_DIR` is
+the running persistence, and `/api/ready` reports Prisma readiness from configuration rather than
+from a checked deployment.
+
 ---
 
 ## 4. Payments: Development Adapter and Live Path
@@ -316,10 +405,13 @@ Keep that worker pointed at a real database rather than the file store: with
 Run the built-in test suite either through the Admin Topbar (**Run Test Suite**) or via the API:
 ```bash
 npm test
-curl -X GET http://localhost:3000/api/tests
+# /api/tests needs an administrator session, so ask with the token the console holds
+curl -X GET http://localhost:3000/api/tests -H "Authorization: Bearer <admin token from POST /api/admin/login>"
 ```
-`npm test` writes to a separate `.aguka-test-data` directory so the suite can never touch live records;
-delete it between runs for a clean slate.
+`npm test` needs no credentials and writes to a separate `.aguka-test-data` directory so the suite can
+never touch live records; delete it between runs for a clean slate. With `ADMIN_JWT_SECRET` set in the
+environment it also opens a real admin session and checks that the data routes accept it, so run it both
+ways if you are testing what production will do.
 
 Tests verified:
 - Webhook GET subscription challenge verification and invalid-token rejection
@@ -328,6 +420,9 @@ Tests verified:
 - Bilingual language detection (Kinyarwanda & English)
 - Specialized multi-agent intent routing
 - Prompt injection resistance & secret credential redaction
+- Data-route authorization: every console route that reads or changes another person's records answers
+  401 to an anonymous caller and to a token signed with the wrong secret, and only a session issued with
+  `ADMIN_JWT_SECRET` opens the list
 - Marketplace matching driven only by stored records, with full explainability on every match
 - AI provider contract (Gemini primary, no mock fallback) and its honest failure mode with no key
 - Text provider chain against injected providers: a rate limit retried once on the same provider, a
@@ -405,13 +500,13 @@ Mount a persistent volume at the `AGUKA_DATA_DIR` path and pass the environment 
 place.
 
 ### Going live checklist
-1. Admin login works (`ADMIN_JWT_SECRET` + credentials) and every `/api/admin/*` route rejects a request with no token.
+1. Admin login works (`ADMIN_JWT_SECRET` + credentials) and every `/api/admin/*` route rejects a request with no token. So does each console data route — `/api/users`, `/api/conversations`, `/api/media`, `/api/marketplace`, `/api/jobs`, `/api/agents`, `/api/coding`, `/api/study`, `/api/tests`, `/api/whatsapp/simulate` — on every verb; check one with `curl` before you trust the dashboard.
 2. `WHATSAPP_APP_SECRET` set, so unsigned webhooks are rejected; Meta handshake verified with your own `WHATSAPP_VERIFY_TOKEN`.
 3. Services & Pricing reviewed: `chargeEnabled`, price, currency, billing period, trial hours and usage caps per service; nothing bills a person until you switch it on.
 4. Menu order and visibility confirmed by sending a first message to the number.
 5. `MOMO_PAYEE_CODE` receives money; `PAYMENT_WEBHOOK_SECRET` shared with the provider; review queue exercised end to end (order → proof → verify → access → expiry → payment → re-access).
 6. Road safety citations re-checked against the current gazette and `REVIEW_DATE` updated.
-7. `/api/ready` and `/api/health` green, `npm test` at 34/34, and `AGUKA_DATA_DIR` on a backed-up volume.
+7. `/api/ready` and `/api/health` green, `npm test` at 35/35, and `AGUKA_DATA_DIR` on a backed-up volume.
 8. If scheduled jobs matter to you: `REDIS_URL` resolves (the health endpoint names the engine), the
    worker runs somewhere always-on, and `QUEUE_INLINE_WORKER=false` on serverless so a frozen function
    cannot hold a half-finished job.

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
-import { UNVERIFIED_TOPICS, REVIEW_DATE, CONTENT_PACK_VERSION } from '@/lib/road-safety/content-pack';
+import { UNVERIFIED_TOPICS, CONTENT_PACK_VERSION } from '@/lib/road-safety/content-pack';
+import { REVIEW_DATE } from '@/lib/road-safety/sources';
 
 export const runtime = 'nodejs';
 

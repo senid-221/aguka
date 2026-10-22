@@ -9,12 +9,17 @@ import {
   formatQuestionSheet,
   formatResult,
   gradeAttempt,
+  latestSubmittedAttempt,
   lessonSummary,
   looksLikeAnswers,
   progressFor,
   publishedLessons,
+  reapExpiredAttempts,
+  reportQuestionIssue,
   startAttempt,
+  toStoredAnswers,
 } from '@/lib/road-safety/academy';
+import { buildSessionReport, nextStepLines } from '@/lib/road-safety/session-report';
 
 export interface AcademyFlowResult {
   replyText: string;
@@ -27,8 +32,10 @@ const COMMANDS: Array<{ intent: string; words: string[] }> = [
   { intent: 'COMPLETE_LESSON', words: ['complete', 'byarangiye', 'done'] },
   { intent: 'ROAD_SIGNS', words: ['signs', 'sign', 'ibimenyetso', 'ikimenyetso'] },
   { intent: 'PRACTICE', words: ['practice', 'imyitozo', 'quiz', 'ibibazo'] },
+  { intent: 'LEARN', words: ['learn', 'kwiga', 'iga'] },
   { intent: 'MOCK_EXAM', words: ['exam', 'ikizamini', 'mock'] },
   { intent: 'PROGRESS', words: ['progress', 'aho ugeze', 'score', 'amanota'] },
+  { intent: 'REPORT_ISSUE', words: ['report', 'ndabona ikosa', 'ntibyo', 'si byo'] },
 ];
 
 function indexOf(text: string, lang: ReplyLanguage): number | null {
@@ -51,18 +58,84 @@ function detectCommand(text: string): string | null {
  * grading, progress) without an AI provider, so exams still work when Gemini is
  * not configured. Anything else falls through to the model.
  */
-export function handleRoadSafetyMessage(
+export async function handleRoadSafetyMessage(
   user: User,
   text: string,
   lang: ReplyLanguage
-): AcademyFlowResult | null {
-  const pending = findPendingAttempt(user.id);
-  if (pending && looksLikeAnswers(text, pending.questionIds.length)) {
-    const graded = gradeAttempt(pending, extractAnswerIndexes(text));
-    return { replyText: formatResult(graded, lang), intent: 'GRADE_ATTEMPT' };
+): Promise<AcademyFlowResult | null> {
+  const command = detectCommand(text);
+
+  // A report of a wrong answer must win over the answer detector: on a one-question
+  // learn card, "report 1: that fine is wrong" otherwise looks exactly like a pick.
+  if (command === 'REPORT_ISSUE') {
+    const paper = findPendingAttempt(user.id) ?? latestSubmittedAttempt(user.id);
+    if (!paper) {
+      return {
+        replyText:
+          lang === 'KINYARWANDA'
+            ? 'Ntabwo nanjye nakwemeza ikibazo ushaka kumenyesha kuko utaragira ikizamini ukora. Andika "practice" ubanza.'
+            : 'I cannot tell which question you mean because you have no paper yet. Send "practice" first, then "report 3: what is wrong".',
+        intent: 'REPORT_ISSUE_NO_PAPER',
+      };
+    }
+    const numberMatch = text.match(/(\d{1,3})/);
+    const number = numberMatch ? Number.parseInt(numberMatch[1], 10) : NaN;
+    if (!Number.isInteger(number) || number < 1 || number > paper.questionIds.length) {
+      return {
+        replyText:
+          lang === 'KINYARWANDA'
+            ? `Andika "report N" aho N ari numero y'ikibazo (1 kugeza ${paper.questionIds.length}), uvuge n'ikosa.`
+            : `Send "report N" where N is the question number (1 to ${paper.questionIds.length}), and say what is wrong.`,
+        intent: 'REPORT_ISSUE_NO_NUMBER',
+      };
+    }
+    const questionId = paper.questionIds[number - 1];
+    const note = text
+      .slice(text.toLowerCase().indexOf('report') + 6)
+      .replace(String(number), '')
+      .replace(/^[:\s,-]+/, '')
+      .trim();
+    const recorded = reportQuestionIssue({ questionId, userId: user.id, channel: 'WHATSAPP', note });
+    if (!recorded) {
+      return {
+        replyText:
+          lang === 'KINYARWANDA'
+            ? 'Ntibyashobotse: icyo kibazo ntikiboneka mu bubiko.'
+            : 'That could not be recorded: the question is no longer in the bank.',
+        intent: 'REPORT_ISSUE_FAILED',
+      };
+    }
+    return {
+      replyText: recorded.withdrawn
+        ? lang === 'KINYARWANDA'
+          ? `Murakoze. Ikibazo ${number} cyakuwe mu bisubizwa kugeza umuyobozi abisuzumye. Nta sandugu ihabwa abanyeshuri ivugurura ritaremewe.`
+          : `Thank you. Question ${number} has been taken out of the papers until an administrator reviews it, so no learner is taught an unverified correction.`
+        : lang === 'KINYARWANDA'
+          ? `Murakoze. Ikibazo ${number} cyongewe mu rukurikirane rw'isuzuma.`
+          : `Thank you. Question ${number} was added to the review queue.`,
+      intent: 'REPORT_ISSUE',
+    };
   }
 
-  const command = detectCommand(text);
+  const pending = findPendingAttempt(user.id);
+  if (pending && looksLikeAnswers(text, pending.questionIds.length)) {
+    const positions = extractAnswerIndexes(text);
+    const graded = gradeAttempt(pending, toStoredAnswers(pending, positions));
+    const report = buildSessionReport(graded);
+    return {
+      replyText: report ? `${formatResult(graded, lang)}\n\n${nextStepLines(report, lang)}` : formatResult(graded, lang),
+      intent: 'GRADE_ATTEMPT',
+    };
+  }
+  const timedOut = reapExpiredAttempts(user.id);
+  if (timedOut.length > 0) {
+    const last = timedOut[timedOut.length - 1];
+    const report = buildSessionReport(last);
+    return {
+      replyText: report ? `${formatResult(last, lang)}\n\n${nextStepLines(report, lang)}` : formatResult(last, lang),
+      intent: 'AUTO_SUBMIT_EXPIRED',
+    };
+  }
   if (!command) return null;
   const t = text.toLowerCase();
 
@@ -172,9 +245,9 @@ export function handleRoadSafetyMessage(
     };
   }
 
-  if (command === 'PRACTICE' || command === 'MOCK_EXAM') {
-    const kind = command === 'PRACTICE' ? 'PRACTICE' : 'MOCK_EXAM';
-    const started = startAttempt(user, kind);
+  if (command === 'PRACTICE' || command === 'MOCK_EXAM' || command === 'LEARN') {
+    const kind = command === 'PRACTICE' ? 'PRACTICE' : command === 'LEARN' ? 'LEARN' : 'MOCK_EXAM';
+    const started = await startAttempt(user, kind, kind === 'LEARN' ? { count: 1 } : {});
     if (!started) {
       return {
         replyText:
@@ -184,9 +257,10 @@ export function handleRoadSafetyMessage(
         intent: 'NO_PUBLISHED_QUESTIONS',
       };
     }
+    const sheet = formatQuestionSheet(started.questions, started.attempt, lang);
     return {
-      replyText: formatQuestionSheet(started.questions, started.attempt, lang),
-      intent: kind === 'PRACTICE' ? 'START_PRACTICE' : 'START_MOCK_EXAM',
+      replyText: started.note ? `${started.note}\n\n${sheet}` : sheet,
+      intent: kind === 'PRACTICE' ? 'START_PRACTICE' : kind === 'LEARN' ? 'START_LEARN' : 'START_MOCK_EXAM',
     };
   }
 

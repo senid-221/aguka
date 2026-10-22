@@ -1,7 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
+import { requireAdmin } from '@/lib/security/admin-auth';
 
+// A conversation list is every user's message history, so it is administrator-only
+// even though the ids it takes are not secrets.
 export async function GET(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const { searchParams } = new URL(request.url);
   const conversationId = searchParams.get('id');
 
