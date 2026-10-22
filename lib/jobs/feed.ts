@@ -178,6 +178,15 @@ export interface FeedItem {
 }
 
 /**
+ * True when the document is the kind of thing an item list is read from. A board's
+ * web page also contains the word "feed" in markup, so only the three feed root
+ * elements count here.
+ */
+export function looksLikeFeed(document: string): boolean {
+  return /<(rss|feed|rdf:RDF)\b/i.test(document.slice(0, 2048));
+}
+
+/**
  * Minimal RSS 2.0 / Atom reader. A full XML parser is not worth a dependency for
  * the flat item lists these boards publish, and a mis-shaped feed must yield
  * nothing rather than a half-read listing.

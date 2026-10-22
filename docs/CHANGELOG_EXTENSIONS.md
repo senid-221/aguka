@@ -276,3 +276,29 @@ for real, and a board that cannot be read says why instead of being filled with 
   without a `REDIS_URL`, and this machine has none, so `startJobSourceSchedule()` was exercised directly
   — startup sweep plus a 60-second tick — and not through a hosted BullMQ process. Confirm the
   `crawl(startup)` and `crawl(timer)` lines in the worker log after deploy.
+
+## A feed override that pointed at a page passed as a healthy board
+
+Checked against the live deployment after the crawler shipped. `/api/ready` reported
+`feedOverrides: { MIFOTRA: "https://recruitment.mifotra.gov.rw/" }` — the portal's home page, not a feed.
+Reproduced locally against that exact value: the crawl returned `OK` / `0 listings read from
+https://recruitment.mifotra.gov.rw in 463ms` and recorded the board `HEALTHY`. The one thing the refusal
+exists to say — that this board cannot be read — had been replaced by a green tick next to an empty list.
+
+- `lib/jobs/feed.ts` — `looksLikeFeed()` recognises only an RSS, Atom or RDF root in the first 2 KiB of the
+  document. A page mentioning the word "feed" in its markup does not count.
+- `lib/jobs/connectors/feed-connector.ts` — when a configured target yields no items **and** is not a feed
+  document, `fetchRawJobs()` throws `CONFIG` naming the URL and the status it answered with, instead of
+  returning an empty list. `failureKind()` maps that to `NO_PUBLIC_FEED`, so an operator's typo reads as a
+  configuration fault to fix, never as a board with nothing on it. A genuinely empty `<rss>` document still
+  crawls `OK` with zero rows — that distinction is what the check preserves.
+- The MIFOTRA refusal note now reads
+  `MIFOTRA E-Recruitment Portal: https://recruitment.mifotra.gov.rw/ answered 200 but is not an RSS or Atom
+  document, so it has no listings this platform can read. Set JOB_FEED_URL_MIFOTRA to the feed address the
+  board publishes, not to a page.` The board stays `WARNING` either way.
+- `test-job-board-crawler` (still the suite's 34th check) now crawls the portal home page through the stub
+  and asserts `NO_PUBLIC_FEED`, zero rows read, no new row in the store, `WARNING` health, and — the other
+  half — that the empty design-category feed still counts as a successful read.
+- Action for the deployment: clear `JOB_FEED_URL_MIFOTRA` on the host (or set it to a real feed if the
+  ministry publishes one). Until then Jobs shows MIFOTRA refusing, which is the truth, rather than the
+  old misleading green state the pre-fix build would have produced.

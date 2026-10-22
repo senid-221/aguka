@@ -144,7 +144,7 @@ All variables are documented in [`.env.example`](.env.example) and validated at 
 | `UPSTASH_REDIS_TCP_HOST`, `UPSTASH_REDIS_TOKEN` | Alternative to `REDIS_URL` when the Upstash token cannot be embedded in a URL. |
 | `QUEUE_NAME`, `QUEUE_CONCURRENCY`, `QUEUE_INLINE_WORKER`, `QUEUE_SKIP_VERSION_CHECK` | Queue name, worker parallelism, whether the web process also executes jobs, and a workaround for proxies that forbid `INFO`. |
 | `DATABASE_URL` | Opt-in PostgreSQL backend for the Prisma schema; no client is installed yet. |
-| `JOB_FEED_URL_<BOARD_CODE>` | Point a board at a feed or listing page it publishes, e.g. `JOB_FEED_URL_MIFOTRA`. Without it MIFOTRA reports that it has no readable public feed, and any other board reports it has no reader yet. |
+| `JOB_FEED_URL_<BOARD_CODE>` | Point a board at the feed it publishes, e.g. `JOB_FEED_URL_MIFOTRA`. Without it MIFOTRA reports that it has no readable public feed, and any other board reports it has no reader yet. Set it to a web page by mistake and the crawl says *not an RSS or Atom document* instead of reporting a healthy board with zero listings. |
 | `JOB_CRAWL_INTERVAL_MINUTES` | How often the worker re-reads every board. Default 60; `0` switches the schedule off and leaves only the Jobs screen button. |
 | `JOB_CRAWL_MAX_LISTINGS` | Ceiling on rows taken from one board per crawl. Default 60. |
 | `JOB_CRAWL_TIMEOUT_MS` | How long one board may take to answer before the crawl records a failure and moves on. Default 15000. |
@@ -227,7 +227,8 @@ orders, proofs and exam attempts surviving a restart, and job discovery against 
 feed listing stored with the employer split from the title, the salary, the board category and markup-free
 excerpt, a re-crawl that refreshes instead of duplicating, a card page read with its day-first deadline and
 an expired posting marked expired, an unreadable board reporting its reason and storing nothing until
-`JOB_FEED_URL_<CODE>` is set, a board that answers 500 storing nothing, and a row with no link back refused.
+`JOB_FEED_URL_<CODE>` is set, an override that points at a page reporting that it is not a feed, a board
+that answers 500 storing nothing, and a row with no link back refused.
 The suite never touches the network — the boards are answered by a stub — so it cannot hammer a real site.
 The same suite runs from the **Run Test Suite**
 button in the console topbar.

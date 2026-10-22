@@ -1272,6 +1272,11 @@ Published on 12-10-2026 | Deadline 30-11-2026
 </body></html>`;
 
   const MIFOTRA_FEED_URL = 'https://boards.example/mifotra/jobs.rss';
+  // What the deployment actually had configured: the portal's own address, which is
+  // a page, not a feed.
+  const MIFOTRA_PAGE_URL = 'https://recruitment.mifotra.gov.rw/';
+  const SPA_SHELL_FIXTURE = `<html><head><title>MIFOTRA E-Recruitment</title></head><body>
+<div id="root"></div><script src="/build/js/app.js"></script></body></html>`;
   let crawlFetchCalls: string[] = [];
   let boardRefuses = false;
 
@@ -1279,6 +1284,7 @@ Published on 12-10-2026 | Deadline 30-11-2026
     const url = String(input);
     crawlFetchCalls.push(url);
     if (boardRefuses) return new Response('the board exploded', { status: 500 });
+    if (url === MIFOTRA_PAGE_URL) return new Response(SPA_SHELL_FIXTURE, { status: 200 });
     if (url.includes('remote-programming-jobs.rss') || url === MIFOTRA_FEED_URL) {
       return new Response(REMOTE_FEED_FIXTURE, { status: 200 });
     }
@@ -1361,6 +1367,12 @@ Published on 12-10-2026 | Deadline 30-11-2026
     kit.store,
     { env: crawlerEnv({ JOB_FEED_URL_MIFOTRA: MIFOTRA_FEED_URL }), fetchImpl: crawlFetch }
   );
+  const rowsBeforePageOverride = kit.listings().length;
+  const govPageCrawl = await crawlSource(
+    govSource,
+    kit.store,
+    { env: crawlerEnv({ JOB_FEED_URL_MIFOTRA: MIFOTRA_PAGE_URL }), fetchImpl: crawlFetch }
+  );
   boardRefuses = true;
   const failedCrawl = await crawlSource(remoteSource, kit.store, crawlOptions);
   boardRefuses = false;
@@ -1427,6 +1439,22 @@ Published on 12-10-2026 | Deadline 30-11-2026
     govHealthAfterHonestCrawl.lastCrawlStatus === 'NO_PUBLIC_FEED';
 
   const govFeedOk = govFeedCrawl.status === 'OK' && govFeedCrawl.stored === 2;
+
+  // A feed URL that points at a page is a mistake to report, not a board with
+  // nothing on it: the crawl must say it is not a feed and store nothing new.
+  const pageOverrideRefused =
+    govPageCrawl.status === 'NO_PUBLIC_FEED' &&
+    govPageCrawl.read === 0 &&
+    govPageCrawl.note.includes('not an RSS or Atom document') &&
+    govPageCrawl.note.includes(MIFOTRA_PAGE_URL) &&
+    kit.source('MIFOTRA').lastCrawlStatus === 'NO_PUBLIC_FEED' &&
+    kit.source('MIFOTRA').healthStatus === 'WARNING' &&
+    kit.listings().length === rowsBeforePageOverride;
+
+  // The same empty body read from a real feed is a genuine answer, so the page check
+  // above must not become "zero listings always means failure".
+  const emptyFeedStillCountsAsRead =
+    firstRemoteCrawl.status === 'OK' && firstRemoteCrawl.read === 2 && secondRemoteCrawl.read === 2;
 
   const failureInventsNothing =
     failedCrawl.status === 'FAILED' &&
@@ -1539,13 +1567,15 @@ Published on 12-10-2026 | Deadline 30-11-2026
       cardsCrawlOk &&
       govHonestOk &&
       govFeedOk &&
+      pageOverrideRefused &&
+      emptyFeedStillCountsAsRead &&
       failureInventsNothing &&
       stubbedTransportAndHealth &&
       scheduleOk &&
       ungroundedThrew,
     expected:
-      'a feed listing is stored with the employer split from the title, the salary, the board category and a tag-only excerpt, re-crawling refreshes instead of duplicating, a card page is read with its day-first deadline and an expired posting marked EXPIRED, a board with no public feed reports the reason and stores nothing until JOB_FEED_URL_<CODE> is set, a board that answers 500 stores nothing, the worker sweeps on start and again on the configured interval without overlapping itself or crawling at all when the interval is 0, and a row without a source URL is refused',
-    actual: `feed=${firstRemoteCrawl.status}/${firstRemoteCrawl.stored} stored, recrawl=${secondRemoteCrawl.stored}/${secondRemoteCrawl.refreshed}, cards=${cardsCrawl.status}/${storedCards.length} with ${kit.source('JOB_IN_RWANDA').activeListingsCount} active, mifotra=${govCrawl.status} then ${govFeedCrawl.status}/${govFeedCrawl.stored}, down=${failedCrawl.status}/${failedCrawl.stored}, schedule=${scheduleRuns} sweeps on a ${timerDelayMs}ms timer with ${clearedTimers} cleared, requests=${crawlFetchCalls.length} served by the stub, ungrounded=${ungroundedThrew}`,
+      'a feed listing is stored with the employer split from the title, the salary, the board category and a tag-only excerpt, re-crawling refreshes instead of duplicating, a card page is read with its day-first deadline and an expired posting marked EXPIRED, a board with no public feed reports the reason and stores nothing until JOB_FEED_URL_<CODE> is set, an override aimed at a page reports that it is not a feed instead of passing as an empty board, a board that answers 500 stores nothing, the worker sweeps on start and again on the configured interval without overlapping itself or crawling at all when the interval is 0, and a row without a source URL is refused',
+    actual: `feed=${firstRemoteCrawl.status}/${firstRemoteCrawl.stored} stored, recrawl=${secondRemoteCrawl.stored}/${secondRemoteCrawl.refreshed}, cards=${cardsCrawl.status}/${storedCards.length} with ${kit.source('JOB_IN_RWANDA').activeListingsCount} active, mifotra=${govCrawl.status} then ${govFeedCrawl.status}/${govFeedCrawl.stored} then page-override ${govPageCrawl.status}, down=${failedCrawl.status}/${failedCrawl.stored}, schedule=${scheduleRuns} sweeps on a ${timerDelayMs}ms timer with ${clearedTimers} cleared, requests=${crawlFetchCalls.length} served by the stub, ungrounded=${ungroundedThrew}`,
     durationMs: Date.now() - t33Start,
   });
 

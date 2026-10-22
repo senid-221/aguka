@@ -6,6 +6,7 @@ import {
   crawlTimeoutMs,
   excerptFromHtml,
   fetchDocument,
+  looksLikeFeed,
   maxListingsPerSource,
   parseFeed,
   toIsoDate,
@@ -72,7 +73,17 @@ export class FeedJobConnector extends BaseJobConnector {
         timeoutMs: crawlTimeoutMs(this.env),
       });
       latencyMs += doc.latencyMs;
-      for (const item of parseFeed(doc.body, doc.url)) {
+      const feedItems = parseFeed(doc.body, doc.url);
+      // An empty feed is a real answer; a page that was never a feed is not. Reading
+      // a board's home page as a feed would otherwise store nothing and report the
+      // board as healthy, which is how a mistyped JOB_FEED_URL_<CODE> hides.
+      if (!feedItems.length && !looksLikeFeed(doc.body)) {
+        throw new SourceFetchError(
+          'CONFIG',
+          `${this.name}: ${feedUrl} answered ${doc.status} but is not an RSS or Atom document, so it has no listings this platform can read. Set JOB_FEED_URL_${this.sourceCode} to the feed address the board publishes, not to a page.`
+        );
+      }
+      for (const item of feedItems) {
         const key = item.externalId || item.url;
         if (seen.has(key)) continue;
         seen.add(key);
