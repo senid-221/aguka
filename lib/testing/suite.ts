@@ -55,6 +55,11 @@ import {
 } from '@/lib/road-safety/academy';
 import { NextRequest } from 'next/server';
 import { POST as paymentsWebhookPOST } from '@/app/api/payments/webhook/route';
+import { crawlSource, type CrawlRunResult, type JobCrawlStore, type SourceCrawlResult } from '@/lib/jobs/crawler';
+import { startJobSourceSchedule } from '@/lib/jobs/schedule';
+import { normalizeJobListing } from '@/lib/jobs/normalizer';
+import type { JobListing, JobSource } from '@/lib/types';
+import type { RawJobItem } from '@/lib/jobs/types';
 import { readFileSync } from 'node:fs';
 import crypto from 'node:crypto';
 
@@ -1235,6 +1240,313 @@ export async function runPlatformTestSuiteAsync(): Promise<{
       'a 429 from the rescue endpoint is retried once then reported as an outage, a successful rescue reply keeps the token usage and sends the system instruction plus the JSON format, and with no provider key the WhatsApp reply names both variables, leaks no credential or endpoint and charges no usage',
     actual: `outage=${rescueOutageOk ? `2 attempts (${outageDetail.slice(0, 48)})` : 'wrong'}, rescue=${rescueAnswerOk ? 'answered with 29 tokens' : 'failed'}, noKey=${noKeyTurn.modelUsed}/${noKeyTurn.reply.slice(0, 32)}…, leaked=${noKeyTurn.leaked}, usage=${noKeyTurn.usageAfter}`,
     durationMs: Date.now() - t32Start,
+  });
+
+  // Test 34: the job board crawler. A scripted transport hands back what a board
+  // itself publishes — a feed for one, rendered cards for another — so every stored
+  // listing is traceable to that fixture, and no board is ever fetched over the network.
+  const t33Start = Date.now();
+
+  const REMOTE_FEED_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Remote board</title>
+<item><title>Stripe: Abuse Research Engineer ($120-$160k)</title><region>Anywhere in the World</region><category>Full-Stack Programming</category><description>&lt;p&gt;Track &amp; prevent&amp;nbsp;abuse at scale. &lt;strong&gt;Apply on the board.&lt;/strong&gt;&lt;/p&gt;</description><pubDate>Sun, 04 Oct 2026 07:31:08 +0000</pubDate><guid>https://boards.example/remote-jobs/stripe-abuse-research-engineer</guid><link>https://boards.example/remote-jobs/stripe-abuse-research-engineer</link></item>
+<item><title>Nib: Legal Ops</title><region>Rwanda</region><category>Legal</category><description>A legal operations role in Kigali.</description><pubDate>Mon, 19 Oct 2026 07:00:00 +0000</pubDate><guid>https://boards.example/remote-jobs/nib-legal-ops</guid><link>https://boards.example/remote-jobs/nib-legal-ops</link></item>
+</channel></rss>`;
+
+  const CARD_PAGE_FIXTURE = `<html><body>
+<article data-history-node-id="32731" class="node node--type-job node--view-mode-teaser"><div class="card shadow-sm">
+<div class="card-body"><a href="/job/data-analyst"><h5 class="card-title">
+<span class="field field--name-title field--type-string">Data Analyst</span></h5></a>
+<p class="card-text"><a href="/employer/rgl-ltd">RGL Ltd</a> | <i class="fas fa-map-marker-alt"></i> Kigali |
+Published on 01-10-2026 | Deadline
+<time datetime="2026-10-05T15:00:00Z" class="datetime">05-10-2026</time>
+<br/>Senior (5+ years of experience)<br/><span class="badge badge-primary">Job</span></p>
+</div></div></article>
+<article data-history-node-id="32732" class="node node--type-job node--view-mode-teaser"><div class="card shadow-sm">
+<div class="card-body"><a href="/job/intern-accountant"><h5 class="card-title">
+<span class="field field--name-title field--type-string">Intern Accountant</span></h5></a>
+<p class="card-text"><a href="/employer/giz-rwanda">GIZ Rwanda</a> | <i class="fas fa-map-marker-alt"></i> Kigali |
+Published on 12-10-2026 | Deadline 30-11-2026
+<br/>Not specified<br/><span class="badge badge-primary">Job</span></p>
+</div></div></article>
+</body></html>`;
+
+  const MIFOTRA_FEED_URL = 'https://boards.example/mifotra/jobs.rss';
+  let crawlFetchCalls: string[] = [];
+  let boardRefuses = false;
+
+  const crawlFetch: typeof fetch = async (input) => {
+    const url = String(input);
+    crawlFetchCalls.push(url);
+    if (boardRefuses) return new Response('the board exploded', { status: 500 });
+    if (url.includes('remote-programming-jobs.rss') || url === MIFOTRA_FEED_URL) {
+      return new Response(REMOTE_FEED_FIXTURE, { status: 200 });
+    }
+    if (url.includes('remote-design-jobs.rss')) return new Response('<rss><channel></channel></rss>', { status: 200 });
+    if (url.includes('/jobs/all')) return new Response(CARD_PAGE_FIXTURE, { status: 200 });
+    return new Response('gone', { status: 404 });
+  };
+
+  const crawlerEnv = (overrides: Record<string, string>): NodeJS.ProcessEnv => {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const key of Object.keys(env)) if (key.startsWith('JOB_FEED_URL_')) delete env[key];
+    return Object.assign(env, overrides);
+  };
+
+  const freshSource = (partial: Pick<JobSource, 'id' | 'name' | 'code' | 'baseUrl'>): JobSource => ({
+    ...partial,
+    isPermitted: true,
+    healthStatus: 'UNKNOWN',
+    lastCrawledAt: null,
+    activeListingsCount: 0,
+  });
+
+  function makeCrawlStore(sources: JobSource[]): {
+    store: JobCrawlStore;
+    listings: () => JobListing[];
+    source: (code: string) => JobSource;
+  } {
+    const listings = new Map<string, JobListing>();
+    const state = new Map(sources.map((s) => [s.code, { ...s }]));
+    return {
+      store: {
+        getSources: () => Array.from(state.values()),
+        upsertCrawledJob: (listing) => {
+          const isNew = !listings.has(listing.id);
+          listings.set(listing.id, listing);
+          return isNew;
+        },
+        recordSourceCrawl: (code, patch) => {
+          const source = state.get(code);
+          if (source) Object.assign(source, patch);
+        },
+        countActiveJobsForSource: (sourceId) =>
+          Array.from(listings.values()).filter((j) => j.sourceId === sourceId && !j.isExpired).length,
+      },
+      listings: () => Array.from(listings.values()),
+      source: (code) => state.get(code) as JobSource,
+    };
+  }
+
+  const remoteSource = freshSource({
+    id: 'src-remote-africa',
+    name: 'Global Remote Tech for Africa',
+    code: 'REMOTE_TECH',
+    baseUrl: 'https://weworkremotely.com',
+  });
+  const cardsSource = freshSource({
+    id: 'src-jobinrwanda',
+    name: 'Job in Rwanda',
+    code: 'JOB_IN_RWANDA',
+    baseUrl: 'https://www.jobinrwanda.com',
+  });
+  const govSource = freshSource({
+    id: 'src-mifotra',
+    name: 'MIFOTRA E-Recruitment Portal',
+    code: 'MIFOTRA',
+    baseUrl: 'https://recruitment.mifotra.gov.rw',
+  });
+
+  const kit = makeCrawlStore([govSource, cardsSource, remoteSource]);
+  const crawlOptions = { env: crawlerEnv({ JOB_CRAWL_MAX_LISTINGS: '20' }), fetchImpl: crawlFetch };
+
+  const firstRemoteCrawl = await crawlSource(remoteSource, kit.store, crawlOptions);
+  const secondRemoteCrawl = await crawlSource(remoteSource, kit.store, crawlOptions);
+  const cardsCrawl = await crawlSource(cardsSource, kit.store, crawlOptions);
+  const govCrawl = await crawlSource(govSource, kit.store, crawlOptions);
+  const govListingsAfterHonestCrawl = kit.listings().filter((j) => j.sourceId === govSource.id).length;
+  const govHealthAfterHonestCrawl = { ...kit.source('MIFOTRA') };
+  const govFeedCrawl = await crawlSource(
+    govSource,
+    kit.store,
+    { env: crawlerEnv({ JOB_FEED_URL_MIFOTRA: MIFOTRA_FEED_URL }), fetchImpl: crawlFetch }
+  );
+  boardRefuses = true;
+  const failedCrawl = await crawlSource(remoteSource, kit.store, crawlOptions);
+  boardRefuses = false;
+
+  const storedRemote = kit.listings().filter((j) => j.sourceId === remoteSource.id);
+  const stripe = storedRemote.find((j) => j.employer === 'Stripe');
+  const storedCards = kit.listings().filter((j) => j.sourceId === cardsSource.id);
+  const expiredCard = storedCards.find((j) => j.externalId === 'data-analyst');
+  const dayFirstCard = storedCards.find((j) => j.externalId === 'intern-accountant');
+
+  let ungroundedThrew = false;
+  try {
+    normalizeJobListing(
+      {
+        externalId: 'x',
+        sourceCode: 'REMOTE_TECH',
+        sourceName: 'fixture',
+        title: 'No link',
+        employer: 'Nobody',
+        location: 'Kigali',
+        description: 'nothing',
+        sourceUrl: '',
+      } as RawJobItem,
+      'src-remote-africa'
+    );
+  } catch {
+    ungroundedThrew = true;
+  }
+
+  // A missing listing must fail the assertion, not quietly make it `undefined`.
+  const feedCrawlOk = Boolean(
+    firstRemoteCrawl.status === 'OK' &&
+      firstRemoteCrawl.stored === 2 &&
+      stripe?.jobType === 'REMOTE' &&
+      stripe?.salaryRange === '$120-$160k' &&
+      stripe?.tags.includes('Full-Stack Programming') &&
+      !/<[a-z]/i.test(stripe?.description || '') &&
+      stripe?.description.includes('Track & prevent abuse') &&
+      stripe?.sourceUrl === 'https://boards.example/remote-jobs/stripe-abuse-research-engineer'
+  );
+
+  const reCrawlDedupes =
+    secondRemoteCrawl.stored === 0 &&
+    secondRemoteCrawl.refreshed === 2 &&
+    kit.listings().filter((j) => j.sourceId === remoteSource.id).length === 2;
+
+  const cardsCrawlOk = Boolean(
+    cardsCrawl.status === 'OK' &&
+      storedCards.length === 2 &&
+      expiredCard?.verificationStatus === 'EXPIRED' &&
+      expiredCard?.isExpired === true &&
+      dayFirstCard?.deadline?.startsWith('2026-11-30') &&
+      dayFirstCard?.jobType === 'INTERNSHIP' &&
+      dayFirstCard?.location === 'Kigali, Rwanda' &&
+      kit.source('JOB_IN_RWANDA').activeListingsCount === 1
+  );
+
+  const govHonestOk =
+    govCrawl.status === 'NO_PUBLIC_FEED' &&
+    govCrawl.read === 0 &&
+    govCrawl.note.includes('JOB_FEED_URL_MIFOTRA') &&
+    govListingsAfterHonestCrawl === 0 &&
+    govHealthAfterHonestCrawl.healthStatus === 'WARNING' &&
+    govHealthAfterHonestCrawl.lastCrawlStatus === 'NO_PUBLIC_FEED';
+
+  const govFeedOk = govFeedCrawl.status === 'OK' && govFeedCrawl.stored === 2;
+
+  const failureInventsNothing =
+    failedCrawl.status === 'FAILED' &&
+    failedCrawl.read === 0 &&
+    failedCrawl.stored === 0 &&
+    failedCrawl.note.includes('500') &&
+    kit.listings().filter((j) => j.sourceId === remoteSource.id).length === 2;
+
+  // Every request went through the stub, and the URLs it asked for are the real
+  // board addresses the connectors ship with — not a test-only guess.
+  const askedForRealBoardUrls =
+    crawlFetchCalls.includes('https://weworkremotely.com/categories/remote-programming-jobs.rss') &&
+    crawlFetchCalls.includes('https://www.jobinrwanda.com/jobs/all');
+
+  const healthRecordedOk =
+    kit.source('REMOTE_TECH').lastCrawledAt !== null &&
+    kit.source('REMOTE_TECH').lastCrawlStatus === 'FAILED' &&
+    String(kit.source('REMOTE_TECH').lastCrawlNote).includes('500') &&
+    kit.source('JOB_IN_RWANDA').lastCrawlStatus === 'OK';
+
+  const stubbedTransportAndHealth = askedForRealBoardUrls && healthRecordedOk;
+
+  // The scheduled half of the trigger: sweep on start, tick again, never let a slow
+  // board overlap itself, and say plainly when the schedule is switched off. Timers are
+  // captured, not waited for, and no board or repository is touched.
+  const scheduleLog: string[] = [];
+  let scheduleRuns = 0;
+  let timerTicks: (() => void)[] = [];
+  let timerDelayMs = 0;
+  let clearedTimers = 0;
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setInterval = ((fn: () => void, ms: number) => {
+    timerTicks.push(fn);
+    timerDelayMs = ms;
+    return 0 as unknown as NodeJS.Timeout;
+  }) as typeof globalThis.setInterval;
+  globalThis.clearInterval = ((() => { clearedTimers += 1; }) as unknown) as typeof globalThis.clearInterval;
+
+  const waiting: Array<() => void> = [];
+  const stubCrawl = async (onResult: (result: SourceCrawlResult) => void): Promise<CrawlRunResult> => {
+    scheduleRuns += 1;
+    await new Promise<void>((resolve) => waiting.push(resolve));
+    const result: SourceCrawlResult = {
+      sourceCode: 'JOB_IN_RWANDA',
+      sourceName: 'Job in Rwanda',
+      status: 'OK',
+      note: '1 listing read from https://www.jobinrwanda.com in 5ms',
+      read: 1,
+      stored: 1,
+      refreshed: 0,
+      skipped: 0,
+      latencyMs: 5,
+      activeListingsCount: 1,
+    };
+    onResult(result);
+    return { ranAt: new Date().toISOString(), results: [result], stored: 1, refreshed: 0 };
+  };
+  const releaseCrawl = () => waiting.shift()?.();
+  const flushPromises = () => new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+
+  let scheduleOk = false;
+  let scheduleStopped: () => void = () => {};
+  try {
+    scheduleStopped = await startJobSourceSchedule((line) => scheduleLog.push(line), {
+      env: crawlerEnv({ JOB_CRAWL_INTERVAL_MINUTES: '2' }),
+      crawl: stubCrawl,
+    });
+    await flushPromises();
+    // A slow board: three ticks arrive while the startup sweep is still open.
+    timerTicks.forEach((tick) => { tick(); tick(); });
+    releaseCrawl();
+    await flushPromises();
+    timerTicks.forEach((tick) => tick());
+    releaseCrawl();
+    await flushPromises();
+    scheduleStopped();
+
+    const offLog: string[] = [];
+    const stopOff = await startJobSourceSchedule((line) => offLog.push(line), {
+      env: crawlerEnv({ JOB_CRAWL_INTERVAL_MINUTES: '0' }),
+      crawl: stubCrawl,
+    });
+    stopOff();
+    timerTicks = [];
+
+    scheduleOk =
+      scheduleRuns === 2 &&
+      timerDelayMs === 120_000 &&
+      clearedTimers === 1 &&
+      scheduleLog.some((l) => /scheduled every 2 minute\(s\), starting now/.test(l)) &&
+      scheduleLog.some((l) => l.startsWith('crawl(startup) JOB_IN_RWANDA: OK') && l.includes('1 new / 0 refreshed')) &&
+      scheduleLog.some((l) => l.startsWith('crawl(timer) JOB_IN_RWANDA: OK')) &&
+      scheduleLog.some((l) => /crawl\(startup\) done: 1 new, 0 refreshed across 1 board/.test(l)) &&
+      offLog.some((l) => /schedule disabled \(JOB_CRAWL_INTERVAL_MINUTES=0\)/.test(l)) &&
+      timerTicks.length === 0;
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+  }
+
+  results.push({
+    id: 'test-job-board-crawler',
+    category: 'Job Discovery',
+    name: 'Boards Are Crawled For Real And An Unreadable Board Says Why',
+    passed:
+      feedCrawlOk &&
+      reCrawlDedupes &&
+      cardsCrawlOk &&
+      govHonestOk &&
+      govFeedOk &&
+      failureInventsNothing &&
+      stubbedTransportAndHealth &&
+      scheduleOk &&
+      ungroundedThrew,
+    expected:
+      'a feed listing is stored with the employer split from the title, the salary, the board category and a tag-only excerpt, re-crawling refreshes instead of duplicating, a card page is read with its day-first deadline and an expired posting marked EXPIRED, a board with no public feed reports the reason and stores nothing until JOB_FEED_URL_<CODE> is set, a board that answers 500 stores nothing, the worker sweeps on start and again on the configured interval without overlapping itself or crawling at all when the interval is 0, and a row without a source URL is refused',
+    actual: `feed=${firstRemoteCrawl.status}/${firstRemoteCrawl.stored} stored, recrawl=${secondRemoteCrawl.stored}/${secondRemoteCrawl.refreshed}, cards=${cardsCrawl.status}/${storedCards.length} with ${kit.source('JOB_IN_RWANDA').activeListingsCount} active, mifotra=${govCrawl.status} then ${govFeedCrawl.status}/${govFeedCrawl.stored}, down=${failedCrawl.status}/${failedCrawl.stored}, schedule=${scheduleRuns} sweeps on a ${timerDelayMs}ms timer with ${clearedTimers} cleared, requests=${crawlFetchCalls.length} served by the stub, ungrounded=${ungroundedThrew}`,
+    durationMs: Date.now() - t33Start,
   });
 
   const passedCount = results.filter((r) => r.passed).length;

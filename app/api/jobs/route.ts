@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { repo } from '@/lib/db/repository';
+import { requireAdmin } from '@/lib/security/admin-auth';
+import { crawlOneSource } from '@/lib/jobs/crawler';
+import { jobDiscoveryConfig } from '@/lib/config';
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
@@ -15,10 +18,15 @@ export async function GET(request: NextRequest) {
     jobs,
     sources,
     totalCount: jobs.length,
+    crawl: jobDiscoveryConfig(),
   });
 }
 
 export async function POST(request: NextRequest) {
+  if (!requireAdmin(request).ok) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const body = await request.json();
     const { action } = body;
@@ -29,8 +37,10 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'CRAWL_SOURCE') {
-      const result = repo.triggerSourceCrawl(body.sourceCode);
-      return NextResponse.json({ success: true, result });
+      // Runs the board here and now: the answer is what the site actually returned,
+      // including the reason when it cannot be read.
+      const result = await crawlOneSource(String(body.sourceCode || ''), repo);
+      return NextResponse.json({ success: result.status === 'OK', result });
     }
 
     if (action === 'CREATE_JOB') {

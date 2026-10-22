@@ -99,6 +99,9 @@ export interface JobSource {
   healthStatus: 'HEALTHY' | 'WARNING' | 'DOWN' | 'UNKNOWN';
   lastCrawledAt: string | null; // null until a crawl actually runs
   activeListingsCount: number;
+  /** Outcome of the most recent real crawl attempt, with the board's own reason. */
+  lastCrawlStatus?: 'OK' | 'NO_PUBLIC_FEED' | 'FAILED' | 'UNKNOWN_SOURCE';
+  lastCrawlNote?: string;
 }
 
 export interface JobListing {

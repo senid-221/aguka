@@ -35,9 +35,9 @@ const AGENT_CATALOG: AgentDescriptor[] = [
     name: 'Job Finder',
     icon: <Briefcase className="w-5 h-5 text-emerald-400" />,
     routesTo: 'Keywords about searching, applying for or listing jobs. Reads VERIFIED listings through the search_verified_jobs tool call.',
-    does: 'Answers only from listings already in the store, and says so when there are none.',
+    does: 'Answers from listings the crawl stored, and says when the pool is empty.',
     limits: [
-      'No crawler is wired to MIFOTRA, Job in Rwanda or any other board',
+      'Reads only what a crawl stored: Job in Rwanda and We Work Remotely are crawled, MIFOTRA publishes no readable feed',
       'Cannot invent employers, salaries, deadlines or source links',
     ],
   },

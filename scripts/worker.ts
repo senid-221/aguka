@@ -36,6 +36,9 @@ async function runQueueWorker() {
       'is live, and run this separate worker only against a real database.'
   );
   console.log('Waiting for jobs. Ctrl+C to stop.');
+  // Imported here, not at the top: this file sets its own environment before any module reads it.
+  const { startJobSourceSchedule } = await import('@/lib/jobs/schedule');
+  await startJobSourceSchedule((line) => console.log(line));
 
   let closing = false;
   const shutdown = async (signal: string) => {

@@ -5,11 +5,39 @@
 
 import { GEMINI_MODEL } from '@/lib/gemini';
 import { resolveRedisEndpoint } from '@/lib/queue/redis-connection';
+import { crawlTimeoutMs, maxListingsPerSource } from '@/lib/jobs/feed';
+
+export interface JobDiscoveryConfig {
+  /** 0 means the schedule is off: only the Jobs screen button crawls. */
+  crawlIntervalMinutes: number;
+  crawlTimeoutMs: number;
+  maxListingsPerSource: number;
+  /** Boards an operator repointed with JOB_FEED_URL_<CODE>; URL, never a secret. */
+  feedOverrides: Record<string, string>;
+}
+
+export function jobDiscoveryConfig(env: NodeJS.ProcessEnv = process.env): JobDiscoveryConfig {
+  const rawInterval = parseInt(env.JOB_CRAWL_INTERVAL_MINUTES || '60', 10);
+  const overrides: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    const match = /^JOB_FEED_URL_([A-Z0-9_]+)$/.exec(key);
+    const url = (value || '').trim();
+    if (match && url) overrides[match[1]] = url;
+  }
+
+  return {
+    crawlIntervalMinutes: Number.isFinite(rawInterval) ? Math.max(0, rawInterval) : 60,
+    crawlTimeoutMs: crawlTimeoutMs(env),
+    maxListingsPerSource: maxListingsPerSource(env),
+    feedOverrides: overrides,
+  };
+}
 
 export interface AppConfig {
   env: 'development' | 'production' | 'test';
   port: number;
   appUrl: string;
+  jobs: JobDiscoveryConfig;
   whatsapp: {
     phoneNumberId: string;
     verifyToken: string;
@@ -160,6 +188,7 @@ export function parseAndValidateConfig(env: NodeJS.ProcessEnv = process.env): Co
     env: nodeEnv,
     port,
     appUrl,
+    jobs: jobDiscoveryConfig(env),
     whatsapp: {
       phoneNumberId: waPhoneId,
       verifyToken: waVerifyToken,
@@ -252,5 +281,8 @@ export function getEnvPresence(env: NodeJS.ProcessEnv = process.env): Record<str
     GEMINI_IMAGE_MODEL: present('GEMINI_IMAGE_MODEL'),
     PASSPORT_PHOTO_WIDTH: present('PASSPORT_PHOTO_WIDTH'),
     IMAGE_RETENTION_DAYS: present('IMAGE_RETENTION_DAYS'),
+    JOB_CRAWL_INTERVAL_MINUTES: present('JOB_CRAWL_INTERVAL_MINUTES'),
+    JOB_CRAWL_MAX_LISTINGS: present('JOB_CRAWL_MAX_LISTINGS'),
+    JOB_CRAWL_TIMEOUT_MS: present('JOB_CRAWL_TIMEOUT_MS'),
   };
 }

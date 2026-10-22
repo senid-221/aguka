@@ -62,6 +62,20 @@ export async function GET() {
         output: systemHealth.imageStudio.output,
         retentionDays: systemHealth.imageStudio.retentionDays,
       },
+      jobDiscovery: {
+        status: configResult.config.jobs.crawlIntervalMinutes > 0 ? 'SCHEDULED' : 'MANUAL_ONLY',
+        ...configResult.config.jobs,
+        // What each board last actually returned: the interval is a setting, this is the proof.
+        boards: repo.getSources().map((source) => ({
+          code: source.code,
+          name: source.name,
+          healthStatus: source.healthStatus,
+          lastCrawledAt: source.lastCrawledAt,
+          activeListingsCount: source.activeListingsCount,
+          lastCrawlStatus: source.lastCrawlStatus ?? null,
+          lastCrawlNote: source.lastCrawlNote ?? '',
+        })),
+      },
       payments: {
         status: configResult.config.payments.providerEndpointConfigured ? 'PASS' : 'MANUAL_REVIEW_ONLY',
         ...configResult.config.payments,

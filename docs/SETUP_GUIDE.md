@@ -10,7 +10,7 @@
   job handlers run in this process when it does not, and `/api/health` reports which engine is live
 - **AI Orchestrator**: Bilingual Router with Kinyarwanda & English detection, Gemini model selection (`GEMINI_MODEL`, default `gemini-2.5-flash`), prompt-injection shielding, secret redaction, and two real tool calls (`search_verified_jobs`, `query_talent_marketplace`)
 - **Core Modules**:
-  1. **Job Finder**: boards are registered (MIFOTRA, Job in Rwanda, remote) but no live crawler runs yet; listings appear only after a real crawl or a manual `POST /api/jobs` with a source URL. Zero invented listings.
+  1. **Job Finder**: Job in Rwanda cards and We Work Remotely category feeds are crawled for real; MIFOTRA publishes no readable feed, so the crawl reports that reason instead of inventing listings (see 5.3). The pool starts empty until a crawl runs.
   2. **Career Assistant**: bilingual CV, cover letter and interview-prep text from the model; explicit application consent required
   3. **Coding Agent**: scaffolds, debugging and architecture explanations returned as text. There is no execution sandbox and submitted code is never run.
   4. **Passport & Image Studio**: written guidance on the 35x45mm passport standard, and — when `OPENAI_API_KEY` or `GEMINI_API_KEY` is configured — a real render cropped to 35:45 with `sharp`, stored privately under `AGUKA_DATA_DIR` and delivered as a WhatsApp image. Model ids are `OPENAI_IMAGE_MODEL` and `GEMINI_IMAGE_MODEL`. Without an image key the request is refused in code before any model call. A retention sweep deletes expired photo files.
@@ -188,6 +188,41 @@ the keys that are actually set, so fixing the environment takes effect without a
 
 ---
 
+### 5.3 Job board discovery: what is crawled, and what is honestly refused
+
+The Job Finder answers only from listings a crawl actually stored. `lib/jobs/crawler.ts` reads each
+registered board with the connector for its page shape, and `POST /api/jobs` with
+`{ "action": "CRAWL_SOURCE", "sourceCode": "JOB_IN_RWANDA" }` runs one board on demand — that request
+needs an administrator bearer token because it makes outbound calls and writes to the store.
+
+| Board | How it is read today |
+| --- | --- |
+| **Job in Rwanda** (`JOB_IN_RWANDA`) | `/jobs/all` renders its job cards server-side, so the crawler reads the card page: title, employer, location, the `DD-MM-YYYY` published and deadline dates the board prints, seniority and one ≤320-character excerpt. A posting whose deadline has passed is stored as `EXPIRED` and left out of the active count. |
+| **Global Remote Tech for Africa** (`REMOTE_TECH`) | We Work Remotely publishes official category RSS feeds; `<item>` blocks give title, employer (split from a `Employer: Title` heading), salary range, region and category. |
+| **MIFOTRA** (`MIFOTRA`) | Not readable, and the crawl says so. The e-recruitment portal returns an empty JavaScript shell to a client that does not execute scripts and publishes no RSS or Atom feed, no sitemap and no documented listings API. Reaching its listings would mean reverse-engineering a private government endpoint, which this platform will not do. The board is recorded `WARNING` / `NO_PUBLIC_FEED` with that reason, and **zero listings are invented to fill it**. If the ministry ever publishes a feed, `JOB_FEED_URL_MIFOTRA=<url>` makes the next crawl use it. |
+| Any other registered code | Reports *no reader for its page shape yet*; `JOB_FEED_URL_<CODE>` points it at a feed it does publish. |
+
+- **Storage policy.** Only what the board itself printed is kept — plus the link back. Full
+  advertisement text is never republished, and `normalizeJobListing()` throws for any row whose
+  `sourceUrl` is not a real `http…` address, so a reply can always send the person to the source. A row
+  that cannot be grounded is dropped and counted in the board's note, never guessed at.
+- **Re-crawling is idempotent.** A listing is keyed on the board's own posting id (the feed `guid` or the
+  card's slug), so the hourly pass refreshes `lastVerifiedAt` instead of storing the same job twice. A
+  job posted in two categories of the same feed collapses to one row.
+- **Schedule.** `scripts/worker.ts` → `lib/jobs/schedule.ts` crawls every board on start and then every
+  `JOB_CRAWL_INTERVAL_MINUTES` (default 60). A tick that arrives while a crawl is still running is
+  skipped rather than queued, so one slow board cannot pile up processes. `0` turns the schedule off and
+  leaves the console button. `JOB_CRAWL_TIMEOUT_MS` (default 15000) bounds one board, and
+  `JOB_CRAWL_MAX_LISTINGS` (default 60) bounds how many rows are taken from it.
+- **Where to look.** The **Jobs Discovery** screen lists each board with its last outcome, the board's own
+  note and a *Crawl now* button; **System Settings** shows the schedule, caps and per-board state; and
+  `/api/ready` returns the same as `checks.jobDiscovery`, including `SCHEDULED` or `MANUAL_ONLY`.
+- **Etiquette.** Requests carry an identifying `User-Agent` (`AgukaAIJobDiscovery/1.0`), go only to pages
+  the board publishes for readers, and stay inside the interval and cap above. Check a board's terms
+  before lowering `JOB_CRAWL_INTERVAL_MINUTES`.
+
+---
+
 ## 6. Persistence, Database & Migrations
 
 Two layers, reported separately by `/api/ready`:
@@ -325,6 +360,13 @@ Tests verified:
   language the person last wrote in
 - Mock exam scored server-side with corrections and explanations
 - Users, orders, proofs and exam attempts persisting across a restart
+- Job board crawl against a stubbed transport (no request leaves the machine, so the suite can never
+  hammer a real site): a feed listing stored with the employer split from the title, the salary range, the
+  board's own category and a markup-free excerpt after double-escaped entities are decoded; a re-crawl that
+  refreshes the two known rows and stores none; a card page read with its day-first `DD-MM-YYYY` deadline,
+  with the expired posting marked `EXPIRED` and excluded from the active count; a board with no public feed
+  reporting its reason, storing nothing and flipping to a real crawl once `JOB_FEED_URL_<CODE>` is set; a
+  board answering 500 storing nothing; and a row with no `sourceUrl` refused by the zero-hallucination gate
 
 ---
 
@@ -368,7 +410,7 @@ place.
 4. Menu order and visibility confirmed by sending a first message to the number.
 5. `MOMO_PAYEE_CODE` receives money; `PAYMENT_WEBHOOK_SECRET` shared with the provider; review queue exercised end to end (order → proof → verify → access → expiry → payment → re-access).
 6. Road safety citations re-checked against the current gazette and `REVIEW_DATE` updated.
-7. `/api/ready` and `/api/health` green, `npm test` at 33/33, and `AGUKA_DATA_DIR` on a backed-up volume.
+7. `/api/ready` and `/api/health` green, `npm test` at 34/34, and `AGUKA_DATA_DIR` on a backed-up volume.
 8. If scheduled jobs matter to you: `REDIS_URL` resolves (the health endpoint names the engine), the
    worker runs somewhere always-on, and `QUEUE_INLINE_WORKER=false` on serverless so a frozen function
    cannot hold a half-finished job.
@@ -381,3 +423,8 @@ place.
     that API is an outage for the person on WhatsApp. After a day of live traffic, grep the log for
     `AI_PROVIDER_FELLED_BACK` — the rate at which the rescue answers is how often the primary is
     failing, and a chain that never falls back is also worth checking.
+11. Job boards: run a crawl from the Jobs screen and check each board's note. `/api/ready` reports
+    `SCHEDULED` only if the worker will crawl on the `JOB_CRAWL_INTERVAL_MINUTES` you are comfortable
+    asking of those sites — and if MIFOTRA still says *No public feed*, decide whether to ask the ministry
+    for a feed you may read, or to leave the refusal visible. Job Finder replies must keep sending people
+    to the board's own link.

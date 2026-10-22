@@ -209,3 +209,70 @@ Meta webhook open past the host timeout, so the failure the person saw was a sta
   `GEMINI_API_KEY`, so the chain is verified against stubbed HTTP and scripted providers only.
   Check `AI_PROVIDER_FELLED_BACK` in the server log after deploy to confirm the handover works
   against the live APIs.
+
+## Job board discovery: real crawls, honest refusals
+
+The Jobs screen used to say *No crawl wired yet* and the listing pool stayed empty. Boards are now read
+for real, and a board that cannot be read says why instead of being filled with invented postings.
+
+- `lib/jobs/feed.ts` — the transport and the parser. `fetchDocument()` aborts at `JOB_CRAWL_TIMEOUT_MS`
+  (default 15000), caps the reply at 2 MB, and sends an identifying `AgukaAIJobDiscovery/1.0` User-Agent;
+  a non-2xx answer becomes a `SourceFetchError` carrying the board's own status, so the failure the admin
+  reads is the failure that happened. `parseFeed()` handles RSS 2.0 `<item>` and Atom `<entry>` without an
+  XML dependency, merges the block's attributes, and keeps `guid`/`url` as the posting id. `stripTags()`
+  decodes entities *before* removing markup — feed bodies arrive escaped, some of them twice (`&amp;nbsp;`) —
+  and repeats until the text settles, so no escaped tag or `&nbsp;` survives into a stored excerpt.
+  `toIsoDate()` reads day-first `DD-MM-YYYY` because that is what Rwandan boards print.
+- `lib/jobs/connectors/` — one reader per page shape. `base-connector.ts` adds the `JOB_FEED_URL_<CODE>`
+  operator override and derives health from the last real attempt. `feed-connector.ts` splits
+  `Employer: Title` headings, pulls the salary range and the board's category, and stores a
+  ≤320-character excerpt rather than the advertisement. `jobinrwanda-connector.ts` reads the server-rendered
+  cards on `/jobs/all`, keeps the seniority line and the badge as data, and refuses a page that yields no
+  cards. `mifotra-connector.ts` states the refusal: the portal answers an empty JavaScript shell and
+  publishes no feed, sitemap or documented listings API, so reaching it would mean reverse-engineering a
+  private government endpoint. It throws `CONFIG`, which the crawler records as `NO_PUBLIC_FEED`, and it
+  crawls the moment `JOB_FEED_URL_MIFOTRA` is set.
+- `lib/jobs/crawler.ts` — `crawlSource()` normalises every raw row through `normalizeJobListing()`, which
+  throws on a row with no `http…` `sourceUrl`: an ungroundable listing is dropped and counted, never
+  invented. Duplicate postings collapse, each surviving row upserts on the board's own posting id so an
+  hourly pass refreshes rather than duplicates, and `finish()` writes health status, timing, active count
+  and a note that explains the gap between rows read and rows stored. `crawlAllSources()` takes an
+  `onResult` callback so a slow board cannot hide the results already collected.
+- `lib/db/repository.ts`, `lib/types/index.ts` — `recordSourceCrawl()`, `countActiveJobsForSource()` and
+  `upsertCrawledJob()` sit behind a `JobCrawlStore` interface so the crawler never imports the repository.
+  Board identity comes from the program and crawl history from disk: `hydrateState()` overlays stored
+  health, timing and notes onto the declared boards, and `lastCrawlStatus`/`lastCrawlNote` are new optional
+  fields — no Prisma migration, because nothing writes to the SQL tables yet. Expired postings are stored
+  as `EXPIRED` and excluded from the active count.
+- `lib/jobs/normalizer.ts` — deadlines now go through `toIsoDate()`, and the board's own categories are
+  merged into `tags` instead of being dropped on the floor.
+- `lib/jobs/schedule.ts`, `scripts/worker.ts` — the worker crawls every board on start and again every
+  `JOB_CRAWL_INTERVAL_MINUTES` (default 60, `0` = button only), logs each board as it finishes, and skips a
+  tick that arrives while a crawl is still running. The schedule lives in its own module so it can be
+  started and stopped without a Redis connection.
+- `app/api/jobs/route.ts`, `lib/queue/jobs.ts` — `POST /api/jobs` is now administrator-gated, because it
+  makes outbound requests and writes to the store; `CRAWL_SOURCE` returns the full result and
+  `CRAWL_JOB_SOURCES` is the queue-side name for the whole sweep. `GET` also returns the live crawl
+  configuration so the screen can state the schedule it is actually running.
+- `app/api/ready/route.ts`, `lib/config/index.ts` — `jobDiscoveryConfig()` publishes interval, timeout,
+  per-board cap and every `JOB_FEED_URL_*` override; `/api/ready` adds a `jobDiscovery` check reporting
+  `SCHEDULED` or `MANUAL_ONLY` plus each board's health and last note.
+- `components/screens/jobs-screen.tsx`, `settings-screen.tsx`, `overview-dashboard.tsx`,
+  `agents-screen.tsx`, `coding-screen.tsx` — Jobs gained an `AdminGate`, a *Crawl now* button per board,
+  the board's own note under its card and a result banner with real counts; Settings gained a Job Board
+  Discovery panel; the Overview board list shows last-crawled time and note. Copy that promised a crawler
+  which did not exist is gone.
+- Test `test-job-board-crawler` (the suite's 34th check) runs entirely against a stubbed transport that
+  answers with saved feed and card-page fixtures, so the suite cannot touch a real board. It asserts
+  the employer
+  split, salary, category and markup-free excerpt of a feed row; `0 new / 2 refreshed` on the second pass;
+  a day-first deadline parsed and an expired posting excluded from the active count; MIFOTRA refusing and
+  storing nothing until its override is set; a board answering 500 storing nothing; and the ungrounded row
+  throwing.
+- Live proof on this machine: one sweep stored 60 Job in Rwanda cards and 56 We Work Remotely feed rows,
+  the second sweep refreshed all 116 and added nothing, and the scratch store reopened in a new process
+  with every listing and every board note intact. MIFOTRA reported `NO_PUBLIC_FEED` in both runs.
+- Not yet proven here: the schedule running inside the deployed worker. `npm run worker` refuses to start
+  without a `REDIS_URL`, and this machine has none, so `startJobSourceSchedule()` was exercised directly
+  — startup sweep plus a 60-second tick — and not through a hosted BullMQ process. Confirm the
+  `crawl(startup)` and `crawl(timer)` lines in the worker log after deploy.

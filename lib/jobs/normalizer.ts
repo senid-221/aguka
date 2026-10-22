@@ -1,5 +1,6 @@
 import { JobListing, JobType, VerificationStatus } from '@/lib/types';
 import { RawJobItem } from './types';
+import { toIsoDate } from './feed';
 
 /**
  * Standardizes job location strings for Rwanda and remote boards
@@ -45,13 +46,12 @@ export function evaluateDeadline(rawDeadline?: string): {
     return { isExpired: false };
   }
 
-  const parsed = new Date(rawDeadline);
-  if (isNaN(parsed.getTime())) {
+  const normalized = toIsoDate(rawDeadline);
+  if (!normalized) {
     return { isExpired: false };
   }
 
-  const normalized = parsed.toISOString();
-  const isExpired = parsed.getTime() < Date.now();
+  const isExpired = new Date(normalized).getTime() < Date.now();
   return {
     normalizedDeadline: normalized,
     isExpired,
@@ -98,6 +98,11 @@ export function normalizeJobListing(raw: RawJobItem, sourceId: string): JobListi
   const tags: string[] = [raw.sourceCode];
   if (jobType === 'REMOTE') tags.push('Remote');
   if (location.includes('Kigali')) tags.push('Kigali');
+  // The board's own labels carry more than a keyword scan ever could.
+  for (const tag of raw.tags || []) {
+    const clean = tag.trim();
+    if (clean && !tags.some((t) => t.toLowerCase() === clean.toLowerCase())) tags.push(clean.slice(0, 32));
+  }
 
   const contentToSearch = `${raw.title} ${raw.requirements || ''} ${raw.description}`.toLowerCase();
   const knownKeywords = [

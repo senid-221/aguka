@@ -43,8 +43,8 @@ import { resolveImageCapability } from '@/lib/images/provider';
 import { imageRetentionDays, passportHeightPx, passportWidthPx } from '@/lib/images/spec';
 import { chainSummary } from '@/lib/ai/provider-adapter';
 
-// Boards the platform is configured to read. Health and listing counts stay
-// unknown until a real crawl populates them.
+// Boards the platform is configured to read. Health, last-crawled time and
+// listing counts are written only by a crawl that actually reached the board.
 const KNOWN_JOB_SOURCES: JobSource[] = [
   {
     id: 'src-mifotra',
@@ -58,7 +58,7 @@ const KNOWN_JOB_SOURCES: JobSource[] = [
   },
   {
     id: 'src-jobinrwanda',
-    name: 'Job in Rwanda Official Feed',
+    name: 'Job in Rwanda',
     code: 'JOB_IN_RWANDA',
     baseUrl: 'https://www.jobinrwanda.com',
     isPermitted: true,
@@ -232,12 +232,49 @@ class AppRepository implements Persistable {
     return job;
   }
 
-  triggerSourceCrawl(sourceCode: string): { status: string; crawledCount: number } {
-    // No live crawler is wired to these boards yet, so a crawl yields nothing and
-    // must not rewrite source health.
-    const source = this.jobSources.find((s) => s.code === sourceCode);
-    if (!source) return { status: 'UNKNOWN_SOURCE', crawledCount: 0 };
-    return { status: 'NOT_CONFIGURED', crawledCount: 0 };
+  recordSourceCrawl(
+    code: string,
+    patch: {
+      healthStatus: JobSource['healthStatus'];
+      lastCrawledAt: string;
+      activeListingsCount: number;
+      lastCrawlStatus: string;
+      lastCrawlNote: string;
+    }
+  ): JobSource | undefined {
+    const source = this.jobSources.find((s) => s.code === code);
+    if (!source) return undefined;
+    source.healthStatus = patch.healthStatus;
+    source.lastCrawledAt = patch.lastCrawledAt;
+    source.activeListingsCount = patch.activeListingsCount;
+    source.lastCrawlStatus = patch.lastCrawlStatus as JobSource['lastCrawlStatus'];
+    source.lastCrawlNote = patch.lastCrawlNote;
+    return source;
+  }
+
+  countActiveJobsForSource(sourceId: string): number {
+    return this.jobListings.filter(
+      (j) => j.sourceId === sourceId && !j.isExpired && j.verificationStatus !== 'EXPIRED'
+    ).length;
+  }
+
+  /**
+   * Stores a crawled listing. Identity is the board's own posting id, so re-reading
+   * a board refreshes its listings instead of piling up copies.
+   */
+  upsertCrawledJob(listing: JobListing): boolean {
+    const existing = this.jobListings.find((j) => j.id === listing.id);
+    if (!existing) {
+      this.jobListings.unshift(listing);
+      return true;
+    }
+    Object.assign(existing, listing, {
+      id: existing.id,
+      sourceId: existing.sourceId,
+      discoveredAt: existing.discoveredAt || listing.discoveredAt,
+      lastVerifiedAt: new Date().toISOString(),
+    });
+    return false;
   }
 
   // --- Employment Marketplace ---
@@ -843,6 +880,7 @@ class AppRepository implements Persistable {
   exportState(): Record<string, unknown> {
     return {
       users: this.users,
+      jobSources: this.jobSources,
       jobListings: this.jobListings,
       workerProfiles: this.workerProfiles,
       employerProfiles: this.employerProfiles,
@@ -878,6 +916,22 @@ class AppRepository implements Persistable {
       Array.isArray(state[key]) ? (state[key] as T[]) : fallback;
 
     this.users = arr<User>('users', this.users);
+    // Source health is restored over the code-declared board list: the identity of a
+    // board comes from the program, its crawl history from disk.
+    const storedSources = new Map(arr<JobSource>('jobSources', []).map((s) => [s.id, s]));
+    this.jobSources = this.jobSources.map((source) => {
+      const stored = storedSources.get(source.id);
+      return stored
+        ? {
+            ...source,
+            healthStatus: stored.healthStatus,
+            lastCrawledAt: stored.lastCrawledAt,
+            activeListingsCount: stored.activeListingsCount,
+            lastCrawlStatus: stored.lastCrawlStatus,
+            lastCrawlNote: stored.lastCrawlNote,
+          }
+        : source;
+    });
     this.jobListings = arr<JobListing>('jobListings', this.jobListings);
     this.workerProfiles = arr<WorkerProfile>('workerProfiles', this.workerProfiles);
     this.employerProfiles = arr<EmployerProfile>('employerProfiles', this.employerProfiles);

@@ -167,13 +167,13 @@ export function CodingScreen() {
             <p className="text-[10px] text-zinc-400">Prisma schema exists; no database client is connected.</p>
           </div>
 
-          <div className="p-3.5 rounded-xl bg-zinc-950 border border-dashed border-amber-500/40 space-y-2">
+          <div className="p-3.5 rounded-xl bg-zinc-950 border border-emerald-500/30 space-y-2">
             <div className="flex items-center justify-between">
-              <span className="text-[10px] text-amber-400 font-semibold uppercase">5. Job Feeds</span>
-              <Server className="w-4 h-4 text-amber-400" />
+              <span className="text-[10px] text-emerald-400 font-semibold uppercase">5. Job Feeds</span>
+              <Server className="w-4 h-4 text-emerald-400" />
             </div>
-            <p className="text-xs font-bold text-white">Boards Registered</p>
-            <p className="text-[10px] text-zinc-400">MIFOTRA and others are listed; crawlers are not built, so no listings.</p>
+            <p className="text-xs font-bold text-white">Boards Crawled</p>
+            <p className="text-[10px] text-zinc-400">Job in Rwanda cards and We Work Remotely feeds are read for real; MIFOTRA publishes no machine-readable feed and reports that.</p>
           </div>
         </div>
       </div>

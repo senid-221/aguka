@@ -36,6 +36,22 @@ interface ReadinessPayload {
       output: string;
       retentionDays: number;
     };
+    jobDiscovery: {
+      status: string;
+      crawlIntervalMinutes: number;
+      crawlTimeoutMs: number;
+      maxListingsPerSource: number;
+      feedOverrides: Record<string, string>;
+      boards: Array<{
+        code: string;
+        name: string;
+        healthStatus: string;
+        lastCrawledAt: string | null;
+        activeListingsCount: number;
+        lastCrawlStatus: string | null;
+        lastCrawlNote: string;
+      }>;
+    };
     payments: {
       status: string;
       payeeName: string;
@@ -81,6 +97,9 @@ const ENV_LABELS: Array<{ name: string; note: string }> = [
   { name: 'PAYMENT_WEBHOOK_SECRET', note: 'HMAC key for POST /api/payments/webhook — unset means every callback is rejected' },
   { name: 'PAYMENT_AUTO_VERIFY', note: 'Set to "true" so a provider confirmation unlocks the service without an admin click' },
   { name: 'AGUKA_DATA_DIR', note: 'Where the durable store and receipt binaries live (defaults to ./.aguka-data)' },
+  { name: 'JOB_CRAWL_INTERVAL_MINUTES', note: 'How often the queue worker re-reads the job boards (default 60; 0 means only the Jobs screen crawls)' },
+  { name: 'JOB_CRAWL_MAX_LISTINGS', note: 'Listings stored per board per crawl (default 60)' },
+  { name: 'JOB_CRAWL_TIMEOUT_MS', note: 'Milliseconds one board may take to answer before the crawl gives up on it (default 15000)' },
   { name: 'DATABASE_URL', note: 'PostgreSQL target for the Prisma schema' },
   { name: 'REDIS_URL', note: 'BullMQ queue backend — redis:// locally, rediss:// for a hosted TLS endpoint such as Upstash TCP' },
   { name: 'UPSTASH_REDIS_TCP_HOST', note: 'Alternative to REDIS_URL: Upstash TCP proxy host (its REST endpoint cannot run BullMQ)' },
@@ -412,6 +431,76 @@ export function SettingsScreen() {
           >
             {readiness?.checks.imageStudio.status === 'PASS' ? 'Studio renders photos' : 'Studio not configured'}
           </span>
+        </div>
+      </div>
+
+      {/* Job board discovery */}
+      <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-sm font-bold text-white">Job Board Discovery</h2>
+          <span
+            className={`px-2 py-1 rounded border font-semibold text-[11px] ${
+              readiness?.checks.jobDiscovery.status === 'SCHEDULED'
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {readiness?.checks.jobDiscovery.status === 'SCHEDULED'
+              ? `Scheduled every ${readiness?.checks.jobDiscovery.crawlIntervalMinutes ?? 60} min`
+              : 'Manual crawl only'}
+          </span>
+        </div>
+        <p className="text-xs text-zinc-400 leading-relaxed">
+          A crawl opens a board and stores what that board printed: title, employer, location, the dates on the
+          card, a short excerpt and the link back. Full advertisements are never copied into this store, and a board
+          that cannot be read keeps its own reason instead of a made-up listing. The schedule runs inside{' '}
+          <span className="font-mono text-zinc-300">npm run worker</span>; the Jobs screen button crawls on demand.
+        </p>
+        <div className="flex flex-wrap gap-2 text-[10px] font-mono">
+          <span className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300">
+            cap: {readiness?.checks.jobDiscovery.maxListingsPerSource ?? 60} per board
+          </span>
+          <span className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-zinc-300">
+            timeout: {readiness?.checks.jobDiscovery.crawlTimeoutMs ?? 15000}ms
+          </span>
+          {Object.entries(readiness?.checks.jobDiscovery.feedOverrides || {}).map(([code, url]) => (
+            <span key={code} className="px-2 py-1 rounded border bg-zinc-950 border-zinc-800 text-emerald-400">
+              JOB_FEED_URL_{code} set
+              <span className="text-zinc-400"> · {url}</span>
+            </span>
+          ))}
+        </div>
+        <div className="divide-y divide-zinc-800/80 bg-zinc-950 rounded-xl border border-zinc-800 overflow-hidden">
+          {(readiness?.checks.jobDiscovery.boards || []).map((board) => (
+            <div key={board.code} className="p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="min-w-0">
+                <span className="text-[11px] font-semibold text-zinc-200">{board.name}</span>
+                <p className="text-[10px] text-zinc-500 truncate max-w-[420px]" title={board.lastCrawlNote}>
+                  {board.lastCrawlNote || 'No crawl has run on this server yet.'}
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <span className="text-[10px] font-mono text-zinc-400">{board.activeListingsCount} stored</span>
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${
+                    board.lastCrawlStatus === 'OK'
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                      : board.lastCrawlStatus === 'FAILED'
+                      ? 'bg-red-500/10 text-red-400 border-red-500/20'
+                      : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                  }`}
+                >
+                  {board.lastCrawlStatus === 'OK'
+                    ? 'Read fine'
+                    : board.lastCrawlStatus === 'NO_PUBLIC_FEED'
+                    ? 'No public feed'
+                    : board.lastCrawlStatus === 'FAILED'
+                    ? 'Crawl failed'
+                    : 'Not crawled yet'}
+                </span>
+              </div>
+            </div>
+          ))}
         </div>
       </div>
 

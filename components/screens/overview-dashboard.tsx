@@ -80,7 +80,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
       value: statsCount ? String(statsCount.verifiedJobListings) : '—',
       subtext: 'Stored in this server’s in-memory store',
       icon: <Briefcase className="w-5 h-5 text-emerald-400" />,
-      change: statsCount?.verifiedJobListings ? 'Active' : 'No crawl wired yet',
+      change: statsCount?.verifiedJobListings ? 'Active' : 'Crawl a board from the Jobs screen',
     },
     {
       label: 'Messages Exchanged',
@@ -221,7 +221,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                   </p>
                   <p className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-cyan-500/20 text-cyan-400 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">4</span>
-                    <span><strong>Job Boards:</strong> MIFOTRA, Job in Rwanda and remote feeds are registered; live crawlers are not wired yet, so listings start empty.</span>
+                    <span><strong>Job Boards:</strong> Job in Rwanda cards and We Work Remotely feeds are crawled for real; MIFOTRA publishes no readable feed and reports that instead of inventing listings.</span>
                   </p>
                 </div>
                 <button
@@ -274,7 +274,7 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                 <span>Job Sources & Crawler Health</span>
               </h2>
               <p className="text-xs text-zinc-400 mt-0.5">
-                Registered boards only: MIFOTRA, Job in Rwanda and a remote feed. Listings appear after a real crawl.
+                Boards this platform reads: Job in Rwanda and We Work Remotely are crawled; MIFOTRA reports why it cannot be.
               </p>
             </div>
             <button
@@ -328,6 +328,11 @@ export function OverviewDashboard({ onNavigate }: OverviewProps) {
                         ? `Last crawled ${new Date(src.lastCrawledAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
                         : 'Never crawled'}
                     </p>
+                    {src.lastCrawlNote && (
+                      <p className="text-[10px] text-zinc-500 max-w-[260px] truncate" title={src.lastCrawlNote}>
+                        {src.lastCrawlNote}
+                      </p>
+                    )}
                   </div>
                   <span
                     className={`flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded border ${

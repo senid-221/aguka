@@ -10,6 +10,7 @@
 import { repo } from '@/lib/db/repository';
 import { logger } from '@/lib/logging/logger';
 import { runRetentionCleanup } from '@/lib/maintenance/retention';
+import { crawlAllSources, crawlOneSource, type SourceCrawlResult } from '@/lib/jobs/crawler';
 
 export interface JobOutcome {
   processedCount: number;
@@ -18,13 +19,30 @@ export interface JobOutcome {
 
 export type JobHandler = (data: Record<string, unknown>) => JobOutcome | Promise<JobOutcome>;
 
+function describeCrawl(result: SourceCrawlResult): string {
+  if (result.status === 'OK') {
+    return `${result.sourceCode}: read ${result.read}, stored ${result.stored} new / ${result.refreshed} refreshed${result.skipped ? `, skipped ${result.skipped}` : ''}`;
+  }
+  return `${result.sourceCode}: ${result.status} — ${result.note}`;
+}
+
 const handlers: Record<string, JobHandler> = {
-  CRAWL_MIFOTRA_VACANCIES: (data) => {
+  CRAWL_JOB_SOURCES: async () => {
+    const run = await crawlAllSources(repo);
+    const detail = run.results.map(describeCrawl).join(' | ');
+    logger.info('JOB_CRAWL_SUMMARY', detail, {
+      metadata: { stored: run.stored, refreshed: run.refreshed },
+    });
+    return { processedCount: run.stored + run.refreshed, detail };
+  },
+
+  // Kept as the per-board name it was first scheduled under; crawls one board.
+  CRAWL_MIFOTRA_VACANCIES: async (data) => {
     const sourceCode = String(data.sourceCode || 'MIFOTRA');
-    const result = repo.triggerSourceCrawl(sourceCode);
+    const result = await crawlOneSource(sourceCode, repo);
     return {
-      processedCount: result.crawledCount,
-      detail: `${sourceCode}: ${result.status}, ${result.crawledCount} listing(s) imported`,
+      processedCount: result.stored + result.refreshed,
+      detail: describeCrawl(result),
     };
   },
 

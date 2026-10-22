@@ -15,7 +15,7 @@ consent management, pricing and curriculum control, payment review and an automa
 
 | Module | What it does |
 | --- | --- |
-| **Jobs Discovery** | Registered boards (MIFOTRA e-recruitment, Job in Rwanda, a remote feed) and one normalised listing shape. No live crawler is wired yet, so the pool starts empty and grows only through `POST /api/jobs` with a real `sourceUrl`. Nothing is invented. |
+| **Jobs Discovery** | Real crawlers read the boards as they publish: Job in Rwanda renders server-side job cards and We Work Remotely (the `REMOTE_TECH` board) publishes category RSS feeds. MIFOTRA's e-recruitment portal is a JavaScript shell with no feed, sitemap or documented API, so the crawl reports that reason instead of inventing listings — set `JOB_FEED_URL_MIFOTRA` when the ministry provides one. Only what the board itself printed is stored (title, employer, location, dates, a ≤320-character excerpt and the link back), a row with no link back is refused, and re-crawling refreshes a posting instead of duplicating it. |
 | **Career Assistant** | Bilingual CV, cover letter and interview coaching text through the AI model; applications require explicit user consent. |
 | **Coding Agent** | Scaffolds, debugging and architecture explanations returned as text by Gemini through `POST /api/coding`. There is no execution sandbox. |
 | **Passport & Photo Studio** | Written guidance on the 35×45 mm Rwandan passport standard and CV portraits, plus — when `OPENAI_API_KEY` or `GEMINI_API_KEY` is set — a real render: the image is produced by that provider, cropped to the exact 35:45 ratio with `sharp`, stored privately under `AGUKA_DATA_DIR` and delivered back on WhatsApp as an image message. A photo sent with a caption asking for it to be retouched is used as the reference. With no image key configured the request is refused before any model call and nothing is charged; a 30-day retention sweep (`IMAGE_RETENTION_DAYS`) deletes the expired file. |
@@ -71,6 +71,16 @@ WhatsApp user → Meta Cloud API webhook → Next.js route handler
   an unregistered job name completes with a `NO_HANDLER` note instead of inventing work, and a Redis
   enqueue that fails is recorded as failed rather than quietly run elsewhere. Run `npm run worker` on
   an always-on host for the standalone worker; serverless hosts need `QUEUE_INLINE_WORKER=false`.
+  The worker also owns the job-board schedule: it crawls every registered board on start and then every
+  `JOB_CRAWL_INTERVAL_MINUTES` (default 60, `0` turns the schedule off and leaves the console button).
+- **Job discovery** — `lib/jobs/feed.ts` fetches a board within `JOB_CRAWL_TIMEOUT_MS` and a byte cap,
+  then parses RSS 2.0 `<item>` and Atom `<entry>` shapes without an XML dependency. `lib/jobs/connectors/`
+  holds one reader per board shape: server-side job cards (Job in Rwanda, including its day-first
+  `DD-MM-YYYY` deadlines), official category feeds (We Work Remotely) and MIFOTRA, which declares why it
+  cannot be read and accepts a `JOB_FEED_URL_MIFOTRA` override. `lib/jobs/crawler.ts` orchestrates a
+  source: normalise → refuse anything with no link back → collapse duplicate postings → upsert by the
+  board's own posting id → record the board's health, timing, active count and the board's own words for
+  a failure. Expired postings are stored as `EXPIRED` and excluded from the active count.
 - **Data** — `lib/db/repository.ts` starts empty: no users, conversations, jobs, profiles, orders or
   exam attempts exist until real traffic or an explicit API call creates them. `lib/db/store.ts`
   writes the operational records to an atomic, versioned JSON snapshot under `AGUKA_DATA_DIR` (default
@@ -134,6 +144,10 @@ All variables are documented in [`.env.example`](.env.example) and validated at 
 | `UPSTASH_REDIS_TCP_HOST`, `UPSTASH_REDIS_TOKEN` | Alternative to `REDIS_URL` when the Upstash token cannot be embedded in a URL. |
 | `QUEUE_NAME`, `QUEUE_CONCURRENCY`, `QUEUE_INLINE_WORKER`, `QUEUE_SKIP_VERSION_CHECK` | Queue name, worker parallelism, whether the web process also executes jobs, and a workaround for proxies that forbid `INFO`. |
 | `DATABASE_URL` | Opt-in PostgreSQL backend for the Prisma schema; no client is installed yet. |
+| `JOB_FEED_URL_<BOARD_CODE>` | Point a board at a feed or listing page it publishes, e.g. `JOB_FEED_URL_MIFOTRA`. Without it MIFOTRA reports that it has no readable public feed, and any other board reports it has no reader yet. |
+| `JOB_CRAWL_INTERVAL_MINUTES` | How often the worker re-reads every board. Default 60; `0` switches the schedule off and leaves only the Jobs screen button. |
+| `JOB_CRAWL_MAX_LISTINGS` | Ceiling on rows taken from one board per crawl. Default 60. |
+| `JOB_CRAWL_TIMEOUT_MS` | How long one board may take to answer before the crawl records a failure and moves on. Default 15000. |
 | `MAX_MESSAGES_PER_MINUTE_PER_USER`, `MAX_DAILY_AI_TOKENS_PER_USER` | Rate and budget limits read by `UsageLimiter`; enforcement still needs wiring. |
 
 Prices, trial length, usage caps and which services appear in the WhatsApp menu are not environment
@@ -160,7 +174,8 @@ phone number, and the screen labels the result as a local payload preview.
 | --- | --- | --- |
 | `/api/whatsapp/webhook` | GET, POST | Meta subscription handshake and signed inbound messages. |
 | `/api/whatsapp/simulate` | POST | Inject a test message through the full pipeline. |
-| `/api/jobs`, `/api/marketplace`, `/api/study`, `/api/coding`, `/api/media`, `/api/users` | GET, POST | Console data feeds and module actions. |
+| `/api/jobs` | GET, POST | Stored listings and board health; `POST` with `action: "CRAWL_SOURCE"` runs a real crawl of one board and needs an administrator token, because it makes outbound requests and writes to the store. |
+| `/api/marketplace`, `/api/study`, `/api/coding`, `/api/media`, `/api/users` | GET, POST | Console data feeds and module actions. |
 | `/api/agents`, `/api/conversations` | GET | Recorded agent runs and conversation history. |
 | `/api/services` | GET | The enabled services currently offered in the WhatsApp menu. |
 | `/api/road-safety/catalog` | GET | Published lessons, road signs and practice questions. |
@@ -179,7 +194,8 @@ phone number, and the screen labels the result as a local payload preview.
 | `/api/admin/maintenance` | POST | Retention sweep and queue drain. |
 | `/api/health`, `/api/ready`, `/api/tests` | GET | Liveness, readiness (including store mode) and the automated suite. |
 
-Every `/api/admin/*` route except `/api/admin/login` rejects a request without a valid bearer token.
+Every `/api/admin/*` route except `/api/admin/login` rejects a request without a valid bearer token,
+and so does `POST /api/jobs`.
 
 ## Tests
 
@@ -188,7 +204,7 @@ npm test
 npx tsx scripts/run-extension-tests.ts
 ```
 
-33 checks cover the webhook challenge, invalid-token rejection, HMAC signature verification, event
+34 checks cover the webhook challenge, invalid-token rejection, HMAC signature verification, event
 deduplication idempotency, Kinyarwanda/English detection, agent intent routing, prompt injection
 resistance, secret redaction, marketplace matching driven only by stored records, the AI provider
 contract, the text provider chain — a rate limit retried once, a dead model id or blocked answer
@@ -207,7 +223,13 @@ Gemini, the output contract (35:45 geometry, configurable width, retention clamp
 the retention sweep actually deleting the expired file, and the WhatsApp image payload with its
 upload guards. The suite scrubs every provider credential before it runs, so it can never spend money
 or post to a live number. Server-side exam scoring with corrections, and users,
-orders, proofs and exam attempts surviving a restart round out the list. The same suite runs from the **Run Test Suite**
+orders, proofs and exam attempts surviving a restart, and job discovery against a stubbed transport: a
+feed listing stored with the employer split from the title, the salary, the board category and markup-free
+excerpt, a re-crawl that refreshes instead of duplicating, a card page read with its day-first deadline and
+an expired posting marked expired, an unreadable board reporting its reason and storing nothing until
+`JOB_FEED_URL_<CODE>` is set, a board that answers 500 storing nothing, and a row with no link back refused.
+The suite never touches the network — the boards are answered by a stub — so it cannot hammer a real site.
+The same suite runs from the **Run Test Suite**
 button in the console topbar.
 
 ## Database
@@ -265,6 +287,9 @@ Before the platform charges anyone, confirm all of these:
 7. If a billed service uses the studio, `OPENAI_IMAGE_MODEL` / `GEMINI_IMAGE_MODEL` and the matching
    key are set — each render costs real provider money, and `/api/health` names the provider it will
    call. Set `IMAGE_RETENTION_DAYS` to the shortest period your DPPA purposes note can defend.
+8. The crawl asks the boards on their own public pages, stores a snippet and always answers with the
+   link back. Check each board's terms before lowering `JOB_CRAWL_INTERVAL_MINUTES` below the default
+   hour, and set `JOB_FEED_URL_MIFOTRA` if the ministry publishes a feed you are permitted to read.
 
 ## Further reading
 
