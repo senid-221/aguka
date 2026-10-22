@@ -1442,11 +1442,14 @@ Published on 12-10-2026 | Deadline 30-11-2026
 
   // A feed URL that points at a page is a mistake to report, not a board with
   // nothing on it: the crawl must say it is not a feed and store nothing new.
+  // The note also must not repeat the board name, because the screen prints it
+  // in front of the note already.
   const pageOverrideRefused =
     govPageCrawl.status === 'NO_PUBLIC_FEED' &&
     govPageCrawl.read === 0 &&
     govPageCrawl.note.includes('not an RSS or Atom document') &&
     govPageCrawl.note.includes(MIFOTRA_PAGE_URL) &&
+    !govPageCrawl.note.startsWith(govSource.name) &&
     kit.source('MIFOTRA').lastCrawlStatus === 'NO_PUBLIC_FEED' &&
     kit.source('MIFOTRA').healthStatus === 'WARNING' &&
     kit.listings().length === rowsBeforePageOverride;

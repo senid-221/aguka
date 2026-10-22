@@ -60,7 +60,7 @@ export class FeedJobConnector extends BaseJobConnector {
   async fetchRawJobs(): Promise<RawJobItem[]> {
     const feeds = this.targets();
     if (!feeds.length) {
-      throw new SourceFetchError('CONFIG', `${this.name} has no feed URL configured`);
+      throw new SourceFetchError('CONFIG', `${this.sourceCode} has no feed URL configured`);
     }
 
     const items: FeedItem[] = [];
@@ -80,7 +80,7 @@ export class FeedJobConnector extends BaseJobConnector {
       if (!feedItems.length && !looksLikeFeed(doc.body)) {
         throw new SourceFetchError(
           'CONFIG',
-          `${this.name}: ${feedUrl} answered ${doc.status} but is not an RSS or Atom document, so it has no listings this platform can read. Set JOB_FEED_URL_${this.sourceCode} to the feed address the board publishes, not to a page.`
+          `${feedUrl} answered ${doc.status} but is not an RSS or Atom document, so it has no listings this platform can read. Set JOB_FEED_URL_${this.sourceCode} to the feed address the board publishes, not to a page.`
         );
       }
       for (const item of feedItems) {

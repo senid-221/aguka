@@ -89,7 +89,7 @@ class UnconfiguredSourceConnector extends BaseJobConnector {
   async fetchRawJobs(): Promise<never> {
     throw new SourceFetchError(
       'CONFIG',
-      `${this.name} has no reader for its page shape yet. If it publishes an RSS or Atom feed, set JOB_FEED_URL_${this.sourceCode} to that URL and the crawl will use it.`
+      `${this.sourceCode} has no reader for its page shape yet. If it publishes an RSS or Atom feed, set JOB_FEED_URL_${this.sourceCode} to that URL and the crawl will use it.`
     );
   }
 }

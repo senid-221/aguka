@@ -293,9 +293,11 @@ exists to say — that this board cannot be read — had been replaced by a gree
   configuration fault to fix, never as a board with nothing on it. A genuinely empty `<rss>` document still
   crawls `OK` with zero rows — that distinction is what the check preserves.
 - The MIFOTRA refusal note now reads
-  `MIFOTRA E-Recruitment Portal: https://recruitment.mifotra.gov.rw/ answered 200 but is not an RSS or Atom
-  document, so it has no listings this platform can read. Set JOB_FEED_URL_MIFOTRA to the feed address the
-  board publishes, not to a page.` The board stays `WARNING` either way.
+  `https://recruitment.mifotra.gov.rw/ answered 200 but is not an RSS or Atom document, so it has no
+  listings this platform can read. Set JOB_FEED_URL_MIFOTRA to the feed address the board publishes, not to
+  a page.` The board stays `WARNING` either way. The board name is left out of the note because every
+  surface that shows it already labels the board — the Jobs banner renders `MIFOTRA E-Recruitment Portal:`
+  in front of the note, so a note that began with the same name printed it twice.
 - `test-job-board-crawler` (still the suite's 34th check) now crawls the portal home page through the stub
   and asserts `NO_PUBLIC_FEED`, zero rows read, no new row in the store, `WARNING` health, and — the other
   half — that the empty design-category feed still counts as a successful read.
