@@ -47,6 +47,9 @@ export async function GET() {
         rescueConfigured: chain.rescueConfigured,
         attemptsPerProvider: chain.attemptsPerProvider,
         budgetMs: chain.budgetMs,
+        // Reported next to the chain, never gated on it: a server that cannot browse
+        // still answers, it just answers only from its own data.
+        reasoning: systemHealth.reasoning,
       },
       whatsappWebhook: {
         status: systemHealth.whatsappApi.configured ? 'PASS' : 'FAIL',

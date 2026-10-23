@@ -15,6 +15,12 @@ import { logger } from '@/lib/logging/logger';
 
 export type TextProviderName = 'gemini' | 'openai';
 
+/** One web page Google Search returned behind an answer. */
+export interface GroundedSource {
+  title: string;
+  url: string;
+}
+
 export interface AIProviderResponse {
   text: string;
   tokensInput: number;
@@ -23,16 +29,30 @@ export interface AIProviderResponse {
   latencyMs: number;
   model: string;
   provider: TextProviderName;
+  /** Populated only for a searched answer: the pages the provider actually read. */
+  sources?: GroundedSource[];
+  /** The queries the provider ran, so an operator can audit why an answer says what it says. */
+  searchQueries?: string[];
+}
+
+export interface GenerateOptions {
+  json?: boolean;
+  /** Ground the answer in a live Google Search instead of only the prompt data. */
+  search?: boolean;
+  /** Higher for prose the person reads for its own sake, lower for factual listings. */
+  temperature?: number;
 }
 
 export interface IAIProvider {
   readonly name: string;
   readonly providerName: TextProviderName;
   readonly model: string;
+  /** Absent or false means this provider cannot run a web search, so a search turn skips it. */
+  readonly supportsSearch?: boolean;
   generateResponse(
     prompt: string,
     systemInstruction?: string,
-    options?: { json?: boolean }
+    options?: GenerateOptions
   ): Promise<AIProviderResponse>;
   healthCheck(): Promise<{ ok: boolean; provider: string; model: string; latencyMs: number }>;
 }
@@ -131,17 +151,87 @@ function normalizeText(raw: string): AIProviderResponse['text'] {
 }
 
 /**
+ * Pulls the searched pages and the queries out of whatever a provider returned.
+ * Kept as a pure function over an unknown payload because the SDK type for
+ * grounding is deep, optional and different from OpenAI's annotation shape, and
+ * the suite has to prove the parsing without a paid search.
+ */
+export function parseGrounding(payload: unknown): { sources: GroundedSource[]; queries: string[] } {
+  const meta = (payload as {
+    groundingMetadata?: {
+      groundingChunks?: Array<{
+        web?: { uri?: string; title?: string };
+        retrievedContext?: { uri?: string; title?: string };
+      }>;
+      webSearchQueries?: string[];
+    };
+  })?.groundingMetadata;
+
+  const seen = new Set<string>();
+  const sources: GroundedSource[] = [];
+  for (const chunk of meta?.groundingChunks ?? []) {
+    const entry = chunk.web ?? chunk.retrievedContext;
+    const url = String(entry?.uri || '').trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    let host = url;
+    try {
+      host = new URL(url).host;
+    } catch {
+      // Keep the citation even when its URL cannot be parsed — hiding the only
+      // source behind a searched answer would be worse than showing a raw one.
+    }
+    sources.push({ url, title: String(entry?.title || '').trim() || host });
+  }
+
+  return {
+    sources,
+    queries: (meta?.webSearchQueries ?? []).map((q) => String(q).trim()).filter(Boolean),
+  };
+}
+
+/**
+ * OpenAI returns citations as message annotations on a search-capable model, so
+ * the same output shape is built from a completely different payload.
+ */
+export function parseOpenAiAnnotations(payload: unknown): GroundedSource[] {
+  const annotations =
+    (payload as { choices?: Array<{ message?: { annotations?: unknown[] } }> })?.choices?.[0]?.message
+      ?.annotations ?? [];
+
+  const seen = new Set<string>();
+  const sources: GroundedSource[] = [];
+  for (const raw of annotations) {
+    const citation = (raw as { url_citation?: { url?: string; title?: string } }).url_citation;
+    const url = String(citation?.url || '').trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    let host = url;
+    try {
+      host = new URL(url).host;
+    } catch {
+      // A malformed citation URL still goes to the person as-is; refusing to build
+      // the list would silently hide the only source behind the answer.
+    }
+    sources.push({ url, title: String(citation?.title || '').trim() || host });
+  }
+  return sources;
+}
+
+/**
  * Gemini provider through the official SDK.
  */
 export class GeminiAIProvider implements IAIProvider {
   readonly name = 'Google Gemini';
   readonly providerName = 'gemini';
   readonly model = GEMINI_MODEL;
+  /** Google Search grounding is a Gemini API feature; OpenAI needs its own model. */
+  readonly supportsSearch = true;
 
   async generateResponse(
     prompt: string,
     systemInstruction?: string,
-    options?: { json?: boolean }
+    options?: GenerateOptions
   ): Promise<AIProviderResponse> {
     const startTime = Date.now();
     const client = getGeminiClient();
@@ -158,6 +248,8 @@ export class GeminiAIProvider implements IAIProvider {
         config: {
           ...(systemInstruction ? { systemInstruction } : {}),
           ...(options?.json ? { responseMimeType: 'application/json' } : {}),
+          ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
+          ...(options?.search ? { tools: [{ googleSearch: {} }] } : {}),
         },
       });
     } catch (err) {
@@ -188,10 +280,18 @@ export class GeminiAIProvider implements IAIProvider {
     const tokensOutput = usage?.candidatesTokenCount ?? 0;
     const tokensUsed = usage?.totalTokenCount ?? tokensInput + tokensOutput;
     const latencyMs = Date.now() - startTime;
+    const grounding = parseGrounding((response.candidates ?? [])[0]);
 
     logger.info('AI_GENERATION_SUCCESS', 'Gemini response generated successfully', {
       latencyMs,
-      metadata: { model: this.model, promptLength: prompt.length, tokensUsed },
+      metadata: {
+        model: this.model,
+        promptLength: prompt.length,
+        tokensUsed,
+        ...(options?.search
+          ? { searched: true, queries: grounding.queries, sources: grounding.sources.length }
+          : {}),
+      },
     });
 
     return {
@@ -202,6 +302,7 @@ export class GeminiAIProvider implements IAIProvider {
       latencyMs,
       model: this.model,
       provider: 'gemini',
+      ...(options?.search ? { sources: grounding.sources, searchQueries: grounding.queries } : {}),
     };
   }
 
@@ -218,6 +319,18 @@ const OPENAI_REQUEST_TIMEOUT_MS = 20_000;
 /** Model id used for text. The vision and image models stay separate on purpose. */
 export function openAITextModel(env: NodeJS.ProcessEnv = process.env): string {
   return (env.OPENAI_TEXT_MODEL || 'gpt-4o').trim() || 'gpt-4o';
+}
+
+/**
+ * The model that may browse the web, when the operator names one (e.g.
+ * `gpt-4o-search-preview`). Unset means OpenAI never answers a searched turn, so
+ * the chain keeps using Gemini for research instead of letting a non-browsing
+ * model dress up its own knowledge as a current fact.
+ */
+export function openAISearchModel(env: NodeJS.ProcessEnv = process.env): string | null {
+  const model = (env.OPENAI_SEARCH_MODEL || '').trim();
+  if (!model || model.toLowerCase().includes('replace_with')) return null;
+  return model;
 }
 
 function usableOpenAiKey(env: NodeJS.ProcessEnv = process.env): string | null {
@@ -239,21 +352,31 @@ export class OpenAITextProvider implements IAIProvider {
   readonly name = 'OpenAI';
   readonly providerName = 'openai';
   readonly model: string;
+  /**
+   * Only true when an operator names a search-capable model. Chat Completions does
+   * not browse the web for `gpt-4o`, and claiming it did would put invented
+   * "current" facts in front of a job seeker.
+   */
+  readonly supportsSearch: boolean;
 
   constructor(private readonly env: NodeJS.ProcessEnv = process.env) {
     this.model = openAITextModel(env);
+    this.supportsSearch = Boolean(openAISearchModel(env));
   }
 
   async generateResponse(
     prompt: string,
     systemInstruction?: string,
-    options?: { json?: boolean }
+    options?: GenerateOptions
   ): Promise<AIProviderResponse> {
     const startTime = Date.now();
     const apiKey = usableOpenAiKey(this.env);
     if (!apiKey) {
       throw new ProviderAttemptError('OPENAI_API_KEY is not configured.', 'permanent');
     }
+
+    const searched = options?.search === true;
+    const model = searched ? openAISearchModel(this.env) || this.model : this.model;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), OPENAI_REQUEST_TIMEOUT_MS);
@@ -268,12 +391,15 @@ export class OpenAITextProvider implements IAIProvider {
         },
         signal: controller.signal,
         body: JSON.stringify({
-          model: this.model,
+          model,
           messages: [
             ...(systemInstruction ? [{ role: 'system', content: systemInstruction }] : []),
             { role: 'user', content: prompt },
           ],
           ...(options?.json ? { response_format: { type: 'json_object' } } : {}),
+          ...(typeof options?.temperature === 'number' && !searched
+            ? { temperature: options.temperature }
+            : {}),
         }),
       });
       if (!res.ok) {
@@ -312,10 +438,16 @@ export class OpenAITextProvider implements IAIProvider {
     const tokensInput = payload.usage?.prompt_tokens ?? 0;
     const tokensOutput = payload.usage?.completion_tokens ?? 0;
     const tokensUsed = payload.usage?.total_tokens ?? tokensInput + tokensOutput;
+    const sources = searched ? parseOpenAiAnnotations(payload) : [];
 
     logger.info('AI_GENERATION_SUCCESS', 'OpenAI response generated successfully', {
       latencyMs,
-      metadata: { model: this.model, promptLength: prompt.length, tokensUsed },
+      metadata: {
+        model,
+        promptLength: prompt.length,
+        tokensUsed,
+        ...(searched ? { searched: true, sources: sources.length } : {}),
+      },
     });
 
     return {
@@ -324,8 +456,9 @@ export class OpenAITextProvider implements IAIProvider {
       tokensOutput,
       tokensUsed,
       latencyMs,
-      model: this.model,
+      model,
       provider: 'openai',
+      ...(searched ? { sources, searchQueries: [] as string[] } : {}),
     };
   }
 
@@ -342,7 +475,7 @@ export class OpenAITextProvider implements IAIProvider {
 
 interface OpenAiChatPayload {
   choices?: Array<{
-    message?: { content?: string };
+    message?: { content?: string; annotations?: unknown[] };
     finish_reason?: string;
   }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
@@ -370,6 +503,8 @@ export interface TextChainResult extends AIProviderResponse {
   attempts: string[];
   /** True when the rescue provider answered instead of the primary. */
   fellBack: boolean;
+  /** True only when a searched answer actually came back with pages behind it. */
+  searched: boolean;
 }
 
 /**
@@ -399,13 +534,20 @@ export async function runTextChain(
   providers: IAIProvider[],
   prompt: string,
   systemInstruction?: string,
-  options?: { json?: boolean },
+  options?: GenerateOptions,
   budgetMs = CHAIN_BUDGET_MS
 ): Promise<TextChainResult> {
   const attempts: string[] = [];
   const deadline = Date.now() + budgetMs;
+  const wantsSearch = options?.search === true;
 
   for (const provider of providers) {
+    // A searched turn must not be answered by a provider that cannot browse: it
+    // would return yesterday's knowledge and present it as a researched fact.
+    if (wantsSearch && provider.supportsSearch !== true) {
+      attempts.push(`${provider.providerName}:${provider.model} skipped — no web search capability`);
+      continue;
+    }
     for (let attempt = 1; attempt <= ATTEMPTS_PER_PROVIDER; attempt++) {
       const label = `${provider.providerName}:${provider.model}`;
       try {
@@ -416,6 +558,7 @@ export async function runTextChain(
           // A retry that lands on the primary is not a fallback: the rescue only
           // gets the label when a second provider actually had to answer.
           fellBack: provider.providerName !== providers[0].providerName,
+          searched: wantsSearch,
         };
       } catch (err) {
         const classified = classifyThrown(err);
@@ -452,7 +595,7 @@ function retryAfterFromMessage(message: string): number | null {
 export async function generateText(
   prompt: string,
   systemInstruction?: string,
-  options?: { json?: boolean },
+  options?: GenerateOptions,
   env: NodeJS.ProcessEnv = process.env
 ): Promise<TextChainResult> {
   const providers = getTextProviders(env);
@@ -483,13 +626,31 @@ export function chainSummary(env: NodeJS.ProcessEnv = process.env): {
   rescueConfigured: boolean;
   attemptsPerProvider: number;
   budgetMs: number;
+  /** Whether a turn can be grounded in a live Google Search on this server. */
+  webSearchConfigured: boolean;
+  webSearchProvider: TextProviderName | null;
 } {
   const providers = getTextProviders(env);
+  const searchProvider = providers.find((p) => p.supportsSearch === true) ?? null;
   return {
     configured: providers.length > 0,
     order: providers.map((p) => ({ provider: p.providerName, model: p.model })),
     rescueConfigured: providers.length > 1,
     attemptsPerProvider: ATTEMPTS_PER_PROVIDER,
     budgetMs: CHAIN_BUDGET_MS,
+    webSearchConfigured: searchProvider !== null && webSearchEnabled(env),
+    webSearchProvider: webSearchEnabled(env) ? searchProvider?.providerName ?? null : null,
   };
+}
+
+/**
+ * Google Search grounding is billed per search, not per token, so an operator can
+ * turn it off without losing ordinary replies. On unless AI_WEB_SEARCH says
+ * otherwise — silence means "the platform may look things up", which is what the
+ * product is for.
+ */
+export function webSearchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = String(env.AI_WEB_SEARCH || '').trim().toLowerCase();
+  if (!flag) return true;
+  return !['false', '0', 'off', 'no'].includes(flag);
 }

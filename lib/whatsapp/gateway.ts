@@ -35,6 +35,22 @@ export interface WhatsAppIncomingMessage {
   };
 }
 
+/**
+ * Read receipts and typing indicators need a Graph version that supports them,
+ * so every call shares one version instead of the older constant this file used
+ * to hardcode. Typing indicators are unavailable before v22.0.
+ */
+const DEFAULT_GRAPH_VERSION = 'v23.0';
+
+export function whatsappGraphVersion(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = String(env.WHATSAPP_GRAPH_VERSION || '').trim();
+  return /^v\d+\.\d+$/.test(configured) ? configured : DEFAULT_GRAPH_VERSION;
+}
+
+function graphUrl(path: string): string {
+  return `https://graph.facebook.com/${whatsappGraphVersion()}/${path}`;
+}
+
 export interface WhatsAppOutgoingMessage {
   messaging_product: 'whatsapp';
   recipient_type: 'individual';
@@ -224,7 +240,7 @@ export async function sendWhatsAppMessage(payload: WhatsAppOutgoingMessage): Pro
 
   if (isLiveConfigured) {
     try {
-      const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
+      const url = graphUrl(`${phoneNumberId}/messages`);
       const res = await fetch(url, {
         method: 'POST',
         headers: {
@@ -278,6 +294,104 @@ function liveCredentials(): { phoneNumberId: string; accessToken: string } | nul
   return { phoneNumberId, accessToken };
 }
 
+/** Whether this server can actually call Meta, for health and agent grounding. */
+export function isWhatsAppLiveConfigured(): boolean {
+  return liveCredentials() !== null;
+}
+
+export interface WhatsAppPresencePayload {
+  messaging_product: 'whatsapp';
+  status: 'read';
+  message_id: string;
+  typing_indicator?: { type: 'text' };
+}
+
+export interface WhatsAppPresenceResult {
+  ok: boolean;
+  mode: 'LIVE_META_API' | 'NOT_CONFIGURED';
+  error?: string;
+}
+
+/**
+ * The read receipt and the typing indicator are the same Cloud API call: mark
+ * the inbound wamid as read, optionally attaching the indicator. Meta shows the
+ * indicator for at most 25 seconds or until the reply is sent, whichever is
+ * first, which is why the webhook refreshes it while a long turn is running.
+ */
+export function buildPresencePayload(messageId: string, typing: boolean): WhatsAppPresencePayload {
+  return {
+    messaging_product: 'whatsapp',
+    status: 'read',
+    message_id: messageId,
+    ...(typing ? { typing_indicator: { type: 'text' as const } } : {}),
+  };
+}
+
+/**
+ * Never throws and never blocks the reply on a Meta problem: a receipt is a
+ * courtesy, and an expired token or a rate limit must not cost the person their
+ * answer. The caller logs the failure; the user is never told about it.
+ */
+export async function markWhatsAppMessageRead(
+  messageId: string,
+  options: { typing?: boolean } = {}
+): Promise<WhatsAppPresenceResult> {
+  const creds = liveCredentials();
+  if (!creds) return { ok: false, mode: 'NOT_CONFIGURED' };
+  if (!messageId) return { ok: false, mode: 'NOT_CONFIGURED', error: 'The inbound message carried no id.' };
+
+  try {
+    const res = await fetch(graphUrl(`${creds.phoneNumberId}/messages`), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${creds.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(buildPresencePayload(messageId, options.typing === true)),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) {
+      let detail = `Meta answered status ${res.status}`;
+      try {
+        const data = (await res.json()) as { error?: { message?: string } };
+        if (data?.error?.message) detail = data.error.message;
+      } catch {
+        // A non-JSON error body still leaves the status code, which is enough.
+      }
+      return { ok: false, mode: 'LIVE_META_API', error: detail };
+    }
+    return { ok: true, mode: 'LIVE_META_API' };
+  } catch (err: unknown) {
+    return { ok: false, mode: 'LIVE_META_API', error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Meta drops the indicator after ~25s, so re-send well inside that window. */
+export const WHATSAPP_TYPING_REFRESH_MS = 20_000;
+
+/**
+ * Starts "seen + typing…" for an inbound message and keeps it alive until the
+ * turn ends. `ready` is the first call, awaited by the webhook so the receipt is
+ * on the wire before the model starts thinking.
+ */
+export function beginWhatsAppTyping(messageId: string): {
+  ready: Promise<WhatsAppPresenceResult>;
+  stop: () => void;
+} {
+  if (!liveCredentials() || !messageId) {
+    return { ready: Promise.resolve({ ok: false, mode: 'NOT_CONFIGURED' }), stop: () => {} };
+  }
+
+  const ready = markWhatsAppMessageRead(messageId, { typing: true });
+  const timer = setInterval(() => {
+    void markWhatsAppMessageRead(messageId, { typing: true });
+  }, WHATSAPP_TYPING_REFRESH_MS);
+  // Never hold the process open for a courtesy refresh.
+  if (typeof timer.unref === 'function') timer.unref();
+
+  return { ready, stop: () => clearInterval(timer) };
+}
+
 /**
  * Fetches an inbound media attachment (a payment screenshot, for example) from
  * the Meta media API. Returns an explicit failure when credentials are missing
@@ -302,7 +416,7 @@ export async function downloadWhatsAppMedia(
   }
 
   try {
-    const metaRes = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
+    const metaRes = await fetch(graphUrl(mediaId), {
       headers: { Authorization: `Bearer ${creds.accessToken}` },
     });
     const meta = (await metaRes.json()) as { url?: string; mime_type?: string; error?: { message?: string } };
@@ -430,7 +544,7 @@ export async function uploadWhatsAppMedia(
     form.append('type', mimeType || 'image/jpeg');
     form.append('file', new Blob([new Uint8Array(buffer)], { type: mimeType || 'image/jpeg' }));
 
-    const res = await fetch(`https://graph.facebook.com/v21.0/${creds.phoneNumberId}/media`, {
+    const res = await fetch(graphUrl(`${creds.phoneNumberId}/media`), {
       method: 'POST',
       headers: { Authorization: `Bearer ${creds.accessToken}` },
       body: form,

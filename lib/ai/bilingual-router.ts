@@ -11,8 +11,18 @@ import {
 } from '@/lib/services/entitlements';
 import { getService } from '@/lib/services/catalog';
 import { handleRoadSafetyMessage } from '@/lib/road-safety/whatsapp-flow';
-import { progressFor, formatProgress } from '@/lib/road-safety/academy';
 import { buildRoadSafetyTutorContext } from '@/lib/road-safety/tutor-context';
+import { buildPlatformContext, PLATFORM_DATA_RULES } from './platform-context';
+import {
+  needsWebSearch,
+  searchAndAnswer,
+  formatSources,
+  RESEARCH_RULES,
+  SEARCH_UNAVAILABLE,
+} from './research';
+import { needsAgentClassification, classifyAgentWithModel } from './intent';
+import { SAMPLING_BY_AGENT, REWRITE_INSTRUCTION, isRepeatOf, recentAssistantReplies } from './variety';
+import { shouldExtractMemories, extractMemories, mergeMemories } from './memory';
 import { resolveImageCapability } from '@/lib/images/provider';
 import { attachmentOf, runImageStudio, type ImageAttachment } from '@/lib/images/studio';
 
@@ -67,10 +77,15 @@ export function detectLanguage(text: string): LanguagePreference {
 }
 
 /**
- * Classifies message intent into the right specialized agent
+ * Classifies message intent into the right specialized agent.
+ *
+ * `matches` counts how many distinct categories the words pointed at, because that
+ * number is the routing decision: exactly one is a confident keyword answer, zero or
+ * several is where the model is asked to classify the turn instead.
  */
-export function classifyIntent(text: string): { agentType: AgentType; intent: string } {
+export function classifyIntent(text: string): { agentType: AgentType; intent: string; matches: number } {
   const t = text.toLowerCase();
+  const found: Array<{ agentType: AgentType; intent: string }> = [];
 
   // 0. Road Safety Academy — checked first so "highway code" or "driving
   //    licence exam" is not swallowed by the coding or study tutors.
@@ -90,7 +105,7 @@ export function classifyIntent(text: string): { agentType: AgentType; intent: st
     t.includes('pedestrian') ||
     t.includes('patrol')
   ) {
-    return { agentType: 'ROAD_SAFETY_ACADEMY', intent: 'ROAD_SAFETY_LEARNING' };
+    found.push({ agentType: 'ROAD_SAFETY_ACADEMY', intent: 'ROAD_SAFETY_LEARNING' });
   }
 
   // 1. Coding Agent
@@ -108,7 +123,7 @@ export function classifyIntent(text: string): { agentType: AgentType; intent: st
     t.includes('architecture') ||
     t.includes('docker')
   ) {
-    return { agentType: 'CODING_AGENT', intent: 'SOFTWARE_DEV_AND_SANDBOX' };
+    found.push({ agentType: 'CODING_AGENT', intent: 'SOFTWARE_DEV_AND_SANDBOX' });
   }
 
   // 2. Image Studio
@@ -122,7 +137,7 @@ export function classifyIntent(text: string): { agentType: AgentType; intent: st
     t.includes('crop') ||
     t.includes('isura')
   ) {
-    return { agentType: 'IMAGE_STUDIO', intent: 'IMAGE_EDITING_PASSPORT' };
+    found.push({ agentType: 'IMAGE_STUDIO', intent: 'IMAGE_EDITING_PASSPORT' });
   }
 
   // 3. Study Tutor
@@ -138,7 +153,7 @@ export function classifyIntent(text: string): { agentType: AgentType; intent: st
     t.includes('flashcard') ||
     t.includes('explain')
   ) {
-    return { agentType: 'STUDY_TUTOR', intent: 'ACADEMIC_CONCEPT_TUTOR' };
+    found.push({ agentType: 'STUDY_TUTOR', intent: 'ACADEMIC_CONCEPT_TUTOR' });
   }
 
   // 4. Career Assistant (CV, Cover letters, Interview prep)
@@ -151,7 +166,7 @@ export function classifyIntent(text: string): { agentType: AgentType; intent: st
     t.includes('ikizamini cy\'akazi') ||
     t.includes('application guidance')
   ) {
-    return { agentType: 'CAREER_ASSISTANT', intent: 'CV_AND_CAREER_GUIDANCE' };
+    found.push({ agentType: 'CAREER_ASSISTANT', intent: 'CV_AND_CAREER_GUIDANCE' });
   }
 
   // 5. Employment Marketplace (Hire talent or offer services)
@@ -164,10 +179,10 @@ export function classifyIntent(text: string): { agentType: AgentType; intent: st
     t.includes('isoko') ||
     t.includes('post job')
   ) {
-    return { agentType: 'EMPLOYMENT_MARKETPLACE', intent: 'MARKETPLACE_MATCHING' };
+    found.push({ agentType: 'EMPLOYMENT_MARKETPLACE', intent: 'MARKETPLACE_MATCHING' });
   }
 
-  // 6. Job Finder (Default fallback for job discovery)
+  // 6. Job Finder (job discovery)
   if (
     t.includes('akazi') ||
     t.includes('job') ||
@@ -177,11 +192,13 @@ export function classifyIntent(text: string): { agentType: AgentType; intent: st
     t.includes('vacancy') ||
     t.includes('imirimo')
   ) {
-    return { agentType: 'JOB_FINDER', intent: 'DISCOVER_VERIFIED_JOBS' };
+    found.push({ agentType: 'JOB_FINDER', intent: 'DISCOVER_VERIFIED_JOBS' });
   }
 
-  // Default General Router
-  return { agentType: 'JOB_FINDER', intent: 'GENERAL_ASSISTANCE' };
+  if (found.length === 0) {
+    return { agentType: 'JOB_FINDER', intent: 'GENERAL_ASSISTANCE', matches: 0 };
+  }
+  return { ...found[0], matches: found.length };
 }
 
 const AGENT_SYSTEM_INSTRUCTIONS: Record<AgentType, string> = {
@@ -378,8 +395,8 @@ export async function executeAgent(
   const serviceCode = opts.serviceCode ?? conversation.activeServiceCode ?? user.selectedServiceCode ?? null;
   const service = serviceCode ? getService(serviceCode) : undefined;
   const classified = classifyIntent(sanitization.cleanText);
-  const agentType: AgentType = service?.agentType ?? classified.agentType;
-  const intent = service ? `SERVICE:${service.code}` : classified.intent;
+  let agentType: AgentType = service?.agentType ?? classified.agentType;
+  let intent = service ? `SERVICE:${service.code}` : classified.intent;
 
   // Update conversation active agent
   repo.setConversationAgent(conversation.id, agentType);
@@ -570,6 +587,37 @@ export async function executeAgent(
     };
   }
 
+  // 3b. Category routing. Keywords match words, and words lie: "ndashaka kwiga"
+  //     matches the study tutor, but a sentence the matcher cannot place (or that it
+  //     places two ways) gets one model call to name the category. The answer counts
+  //     only if it names an agent this build has, and any failure keeps the keyword
+  //     routing — the model improves the turn, it cannot break it.
+  let routingTrace: AgentExecutionResult['toolCalls'][number] | null = null;
+  if (
+    needsAgentClassification({
+      currentText: sanitization.cleanText,
+      serviceAgentType: service?.agentType ?? null,
+      keywordMatches: classified.matches,
+      currentAgentType: agentType,
+      replyLang,
+    })
+  ) {
+    const routeStart = Date.now();
+    const choice = await classifyAgentWithModel(sanitization.cleanText, null);
+    if (choice.agentType && choice.agentType !== agentType) {
+      agentType = choice.agentType;
+      intent = `MODEL_ROUTED:${choice.agentType}`;
+      repo.setConversationAgent(conversation.id, agentType);
+    }
+    routingTrace = {
+      name: 'classify_category',
+      args: { keywordMatches: classified.matches, keywordAgent: classified.agentType },
+      result: { chosen: choice.agentType ?? 'none', answering_as: agentType, note: choice.note },
+      latencyMs: Date.now() - routeStart,
+    };
+  }
+  const routingTraces: AgentExecutionResult['toolCalls'] = routingTrace ? [routingTrace] : [];
+
   // 4. Road Safety runs its lessons, exams and scoring deterministically in the
   //    backend, so it works with or without an AI provider.
   if (agentType === 'ROAD_SAFETY_ACADEMY') {
@@ -587,9 +635,16 @@ export async function executeAgent(
           tokensOutput: 0,
           latencyMs,
           status: 'COMPLETED',
-          toolCallsCount: 1,
+          toolCallsCount: 1 + routingTraces.length,
         },
         [
+          ...routingTraces.map((tc) => ({
+            toolName: tc.name,
+            arguments: tc.args,
+            result: tc.result,
+            latencyMs: tc.latencyMs,
+            redacted: false,
+          })),
           {
             toolName: 'road_safety_flow',
             arguments: { intent: flow.intent, userId: user.id },
@@ -614,74 +669,45 @@ export async function executeAgent(
         tokensUsed: 0,
         latencyMs,
         modelUsed: 'road-safety-engine',
-        toolCalls: [],
+        toolCalls: routingTraces,
       };
     }
   }
 
-  // 5. Collect facts that the model is allowed to repeat
-  const toolCalls: AgentExecutionResult['toolCalls'] = [];
-  const contextParts: string[] = [];
+  // 5. Collect facts that the model is allowed to repeat. Every agent gets the
+  //    whole platform snapshot, not only the slice its keywords pointed at: a
+  //    tutor asked "what else does Aguka do?" must see the real catalogue, and a
+  //    job question must see board health. All of it is read from the live store.
+  const platform = buildPlatformContext({
+    user,
+    conversation,
+    agentType,
+    replyLang,
+    currentText: sanitization.cleanText,
+  });
+  const toolCalls: AgentExecutionResult['toolCalls'] = [...routingTraces, ...platform.tools];
+  const contextParts: string[] = [...platform.parts];
 
-  if (agentType === 'JOB_FINDER') {
-    const toolStart = Date.now();
-    const isRemote = sanitization.cleanText.toLowerCase().includes('remote');
-    const listings = repo.getJobs({
-      isRemote: isRemote ? true : undefined,
-      verificationStatus: 'VERIFIED',
-    });
-
-    toolCalls.push({
-      name: 'search_verified_jobs',
-      args: { isRemote, verifiedOnly: true },
-      result: { count: listings.length },
-      latencyMs: Date.now() - toolStart,
-    });
-
-    contextParts.push(
-      listings.length === 0
-        ? 'Verified job listings available: none.'
-        : `Verified job listings available:\n${listings
-            .slice(0, 5)
-            .map((j) => `- ${j.title} | ${j.employer} | ${j.location} | ${j.salaryRange || 'Salary not stated'} | ${j.sourceName} | ${j.sourceUrl}`)
-            .join('\n')}`
-    );
-  }
-
-  if (agentType === 'EMPLOYMENT_MARKETPLACE') {
-    const toolStart = Date.now();
-    const workers = repo.getWorkerProfiles();
-    const vacancies = repo.getVacancies();
-
-    toolCalls.push({
-      name: 'query_talent_marketplace',
-      args: {},
-      result: { availableWorkers: workers.length, openVacancies: vacancies.length },
-      latencyMs: Date.now() - toolStart,
-    });
-
-    contextParts.push(
-      `Marketplace figures: ${workers.length} registered worker profile(s), ${vacancies.length} open vacancy record(s).`
-    );
-  }
-
+  // The academy turn also gets the detailed learner record (their paper, the
+  // letter they typed, the source behind each item), which the summary above
+  // deliberately does not dump into every other agent's prompt.
   if (agentType === 'ROAD_SAFETY_ACADEMY') {
     const toolStart = Date.now();
-    const progress = progressFor(user.id);
     const groundings = buildRoadSafetyTutorContext(user.id);
     toolCalls.push({
       name: 'read_road_safety_record',
       args: {},
-      result: {
-        lessonsCompleted: progress.lessonsCompleted,
-        answeredQuestions: progress.totalAnswered,
-        papers: progress.practiceAttempts + progress.mockExams,
-        contextBlocks: groundings.length,
-      },
+      result: { contextBlocks: groundings.length },
       latencyMs: Date.now() - toolStart,
     });
     contextParts.push(...groundings);
   }
+
+  // 5b. Research gate. Whether this turn needs a live Google Search is decided here,
+  //     from the message and from what the snapshot actually holds, before the model is
+  //     asked anything. A model only *told* to look things up either never does or says
+  //     it did, so the decision cannot live in the prompt.
+  const research = needsWebSearch(sanitization.cleanText, agentType, contextParts);
 
   // 6. Ask the provider chain; never answer from a scripted reply
   const chain = chainSummary();
@@ -691,44 +717,140 @@ export async function executeAgent(
   let tokensOutput = 0;
   let tokensUsed = 0;
   let status: 'COMPLETED' | 'FAILED' = 'FAILED';
+  let answeredFromSearch = false;
 
   if (!chain.configured) {
     replyText = AI_NOT_CONFIGURED[replyLang];
   } else {
     const platformData = contextParts.length
-      ? `\n\nPlatform data (the only facts you may cite):\n${contextParts.join('\n')}`
+      ? `\n\nPlatform data (read from this deployment's store just now; the only facts you may cite):\n${contextParts.join('\n')}`
       : '';
     const prompt =
       `User name: ${user.fullName || 'User'}\n` +
       `Reply language: ${replyLang === 'KINYARWANDA' ? 'Kinyarwanda' : 'English'}\n` +
       `User message: "${sanitization.cleanText}"${platformData}`;
+    const system = `${AGENT_SYSTEM_INSTRUCTIONS[agentType]}\n\n${PLATFORM_DATA_RULES}`;
+    const temperature = SAMPLING_BY_AGENT[agentType];
 
-    try {
-      const generated = await generateText(prompt, AGENT_SYSTEM_INSTRUCTIONS[agentType]);
-      modelUsed = generated.fellBack ? `${generated.model} (rescue)` : generated.model;
-      tokensInput = generated.tokensInput;
-      tokensOutput = generated.tokensOutput;
-      tokensUsed = generated.tokensUsed;
-      replyText = generated.text;
-      status = 'COMPLETED';
-    } catch (err: unknown) {
-      // A 404 for a wrong model id, a quota message or a TLS failure is an operator
-      // detail. Keep it in the log and the agent run, not in the reply sent to a
-      // person on WhatsApp. The chain already tried the rescue provider by now, so
-      // reaching this branch means nothing answered.
-      const attempts =
-        err instanceof AllTextProvidersFailed ? err.attempts : [(err instanceof Error ? err.message : String(err))];
-      logger.error('AI_GENERATION_FAILED', err instanceof Error ? err : new Error(attempts.join(' | ')), {
-        metadata: {
-          order: chain.order.map((p) => `${p.provider}:${p.model}`).join(' → '),
-          attempts,
-          agentType,
-          conversationId: conversation.id,
-        },
+    if (research.research) {
+      const searchStart = Date.now();
+      const searched = await searchAndAnswer(prompt, `${system}\n\n${RESEARCH_RULES}`, temperature);
+      toolCalls.push({
+        name: 'web_research',
+        args: { reason: research.reason, agent: agentType },
+        result: searched.ok
+          ? { queries: searched.queries, sources: searched.sources.map((s) => s.url), provider: searched.provider }
+          : { searched: false, fell_back_to_store: true },
+        latencyMs: Date.now() - searchStart,
       });
-      modelUsed = `chain-failed:${chain.order.map((p) => p.model).join(',')}`;
-      replyText = AI_UNAVAILABLE[replyLang];
+
+      if (searched.ok) {
+        answeredFromSearch = true;
+        status = 'COMPLETED';
+        replyText = searched.text + formatSources(searched.sources, replyLang);
+        modelUsed = `${searched.model} (searched)`;
+        tokensInput = searched.tokensInput;
+        tokensOutput = searched.tokensOutput;
+        tokensUsed = searched.tokensUsed;
+      } else {
+        // The provider's own message (a quota, a 404 model id, a TLS failure) is an
+        // operator detail and stays in the log, never in the text sent to a person.
+        logger.error('AI_SEARCH_FAILED', new Error(searched.error ?? 'web search failed'), {
+          metadata: { agentType, conversationId: conversation.id, reason: research.reason },
+        });
+      }
     }
+
+    if (!answeredFromSearch) {
+      try {
+        const generated = await generateText(prompt, system, { temperature });
+        modelUsed = generated.fellBack ? `${generated.model} (rescue)` : generated.model;
+        tokensInput = generated.tokensInput;
+        tokensOutput = generated.tokensOutput;
+        tokensUsed = generated.tokensUsed;
+        replyText = generated.text;
+        status = 'COMPLETED';
+        // The lookup the person asked for did not happen, so say so instead of
+        // letting a store-only answer read like a researched one.
+        if (research.research) replyText = `${replyText}\n\n${SEARCH_UNAVAILABLE[replyLang]}`;
+      } catch (err: unknown) {
+        // A 404 for a wrong model id, a quota message or a TLS failure is an operator
+        // detail. Keep it in the log and the agent run, not in the reply sent to a
+        // person on WhatsApp. The chain already tried the rescue provider by now, so
+        // reaching this branch means nothing answered.
+        const attempts =
+          err instanceof AllTextProvidersFailed ? err.attempts : [(err instanceof Error ? err.message : String(err))];
+        logger.error('AI_GENERATION_FAILED', err instanceof Error ? err : new Error(attempts.join(' | ')), {
+          metadata: {
+            order: chain.order.map((p) => `${p.provider}:${p.model}`).join(' → '),
+            attempts,
+            agentType,
+            conversationId: conversation.id,
+          },
+        });
+        modelUsed = `chain-failed:${chain.order.map((p) => p.model).join(',')}`;
+        replyText = AI_UNAVAILABLE[replyLang];
+      }
+    }
+
+    // 6b. Repetition gate. The reply is compared with what this person was already
+    //     told, and a near-duplicate gets exactly one re-ask with the earlier answer
+    //     put in front of the model. Facts are not allowed to change on the way — only
+    //     the wording — so if the second attempt still repeats or fails, the first
+    //     answer is kept: the same good reply beats an error message.
+    if (status === 'COMPLETED' && replyText) {
+      const earlier = recentAssistantReplies(conversation.messages);
+      if (earlier.length > 0 && isRepeatOf(replyText, earlier)) {
+        const rewriteStart = Date.now();
+        let reworded = false;
+        try {
+          const again = await generateText(
+            `${prompt}\n\nWhat you already answered:\n"${earlier[earlier.length - 1].slice(0, 1200)}"\n\n${REWRITE_INSTRUCTION}`,
+            system,
+            { temperature: Math.max(temperature, 0.9) }
+          );
+          if (!isRepeatOf(again.text, earlier)) {
+            replyText = again.text;
+            modelUsed = `${again.model} (reworded)`;
+            tokensInput += again.tokensInput;
+            tokensOutput += again.tokensOutput;
+            tokensUsed += again.tokensUsed;
+            reworded = true;
+          }
+        } catch (err: unknown) {
+          logger.warn('AI_REWRITE_FAILED', err instanceof Error ? err.message : String(err), {
+            metadata: { conversationId: conversation.id },
+          });
+        }
+        toolCalls.push({
+          name: 'rewrite_repeat',
+          args: { compared_with: earlier.length },
+          result: { reworded },
+          latencyMs: Date.now() - rewriteStart,
+        });
+      }
+    }
+  }
+
+  // 6c. Durable memory. Aguka keeps the last few messages, which is why a follow-up
+  //      question makes sense, but "ndi i Huye" said in week one should still be known
+  //      in week four. Facts go into this conversation's own memory map — read back
+  //      into every later prompt and stored per person, so one learner's notes can
+  //      never reach another's. A memory call that fails costs an explanation later; a
+  //      memory written wrong follows the person forever, hence the validation in
+  //      memory.ts and the fact that only an answered turn is remembered.
+  if (status === 'COMPLETED' && shouldExtractMemories(sanitization.cleanText)) {
+    const memoryStart = Date.now();
+    const existing = conversation.memories || {};
+    const extracted = await extractMemories(sanitization.cleanText, existing);
+    const keys = Object.keys(extracted.facts);
+    if (keys.length > 0) repo.rememberInConversation(conversation.id, mergeMemories(existing, extracted.facts));
+    toolCalls.push({
+      name: 'remember_person_facts',
+      args: { conversationId: conversation.id, already_remembered: Object.keys(existing).length },
+      result: { wrote: keys, note: extracted.note },
+      latencyMs: Date.now() - memoryStart,
+    });
   }
 
   const buttonDefinitions = AGENT_BUTTONS[agentType];

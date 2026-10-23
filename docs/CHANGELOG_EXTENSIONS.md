@@ -418,3 +418,143 @@ gate, not around a prompt.
   be published; French is not implemented, because no suitable configured provider path exists yet; and
   the learner exam route still identifies the learner from the `userId`/phone in the request body, which
   is an ownership check, not authentication.
+
+## WhatsApp presence, and an agent that can see the whole backend
+
+Reported in Kinyarwanda: *"kosora ku mikorere ya whatsapp yerekane ko yakiriye utumwa, ko irimo
+igaragaze ko irimo kwandika kandi uyihuze na backend yose kuburyo itazajya ivuga ko ntacyo ifite kandi
+gihari"* — show that a message was received, show that it is being typed, and connect the agent to the
+whole backend so it never claims it has nothing when the data exists. Two separate defects were behind
+it, and one of them was worse than it looked.
+
+- `lib/whatsapp/gateway.ts` now builds the Graph URL from `whatsappGraphVersion()` instead of three
+  hardcoded `v21.0` literals, defaulting to `v23.0` and honouring `WHATSAPP_GRAPH_VERSION`. It accepts
+  only a well-formed `vN.M`, so a malformed override falls back rather than producing a URL Meta will
+  not recognise. Typing indicators need v22.0 or newer, which the version floor encodes as a test.
+- `markWhatsAppMessageRead(messageId, { typing })` posts `status: read` with
+  `typing_indicator: { type: 'text' }` for the inbound `wamid`, and `beginWhatsAppTyping()` starts that
+  immediately and repeats it every 20 seconds, because Meta dismisses the indicator after roughly 25 and
+  a long generation would otherwise leave the person staring at nothing. Presence is deliberately
+  unable to cost anyone their answer: with no credentials the call makes zero HTTP requests and reports
+  `NOT_CONFIGURED`, and a Meta rejection resolves as `{ ok: false }` carrying the provider's own reason,
+  logged as `WHATSAPP_PRESENCE_FAILED` and never thrown. The webhook fires it off and carries on.
+- **The real defect was in the prompt, not the gateway.** `executeAgent` assembled platform data for
+  only three of the eight agent types, so a `STUDY_TUTOR`, `CODING_AGENT`, `CAREER_ASSISTANT` or
+  `ROUTER` turn reached the model with an empty data block — and conversation history was never in the
+  prompt at all, an audit defect from earlier in this programme. An agent asked about a service, a
+  listing, a photo or a payment it had been told nothing about could only say it had nothing. That was
+  true even when the row existed.
+- `lib/ai/platform-context.ts` replaces that with one snapshot for every turn: live catalogue, runtime
+  capability facts (provider chain order, whether WhatsApp and the studio are configured, the manual
+  payment rule), this person's account / entitlement / latest payment order, verified listings with
+  board health, the talent marketplace, this person's own study, coding and photo rows, road-safety
+  content totals with their own progress and open paper, and the last six messages plus stored memories.
+  Each block records a tool call, so the Agents screen trace is the truth about what the model was
+  shown. `PLATFORM_DATA_RULES` goes into the system prompt with it and says, in terms, that the snapshot
+  is the only source of facts, that a section reading NONE or NOT CONFIGURED must be reported plainly
+  with the nearest real alternative offered, and that nothing may be invented.
+- Isolation is enforced in code rather than by wording: `getStudySessions()`, `getCodingTasks()` and
+  `getMediaTasks()` return every user's rows, so the snapshot filters on `userId` before it formats
+  anything. The marketplace block prints titles and districts only — never another person's name or
+  phone number.
+- `app/api/whatsapp/webhook/route.ts` was restructured at the same time, which closed a pre-existing
+  bug: `markMessageProcessed(id)` ran *before* the message was handled, so any throw lost the message
+  for good. Each message now goes through an async `processInboundMessage()` whose `finally` stops the
+  typing heartbeat, and the id is only burned once the handler has run.
+- Tests: the suite is at 47. `test-whatsapp-read-receipt-and-typing` asserts the payload shape, the
+  version floor, an honoured override and a malformed one, the no-credentials path making zero requests,
+  a live call hitting `<phoneNumberId>/messages`, a 400 `(#131000)` returned as a failure with its
+  reason, and the refresh staying inside the 25-second window. It runs with `WHATSAPP_*` scrubbed and a
+  stubbed `globalThis.fetch`, so nothing can reach Meta or a real number.
+  `test-agent-grounded-in-whole-backend` creates two people, gives each a coding project, and requires
+  the tutoring turn to name every live menu service, the board status, the published-content totals, the
+  latest payment order and this person's own rows — while the other person's project title never appears.
+- Still not proven, and not claimed: **the typing-indicator contract was never checked against Meta's
+  documentation during this session** — web access was unavailable — so the payload rests on the model's
+  knowledge of the Cloud API and must be confirmed against the current reference and, above all, against
+  a real test number before anyone relies on seeing "typing…". No credentials exist on this machine, so
+  no live send, receipt or indicator has ever been made from it. What the suite proves is the shape, the
+  guards and the offline behaviour; the visual result on a phone is still an unverified claim.
+
+## Research, category routing, per-person memory and reply variety
+
+The complaint this closes was that the assistant "answers the same thing, does not think, and does not
+look anything up". Each of those is now a server-side gate rather than an instruction in a prompt,
+because a model that is only *asked* to research, vary or remember either does not, or says it did.
+
+- `lib/ai/provider-adapter.ts` grew the transport for a searched turn. `GenerateOptions.search` puts
+  `google_search` in the Gemini `generateContent` config and reads the returned
+  `groundingMetadata.groundingChunks[].web` into `{ title, url }` sources plus the queries actually
+  run; the OpenAI transport reads the same shape out of `choices[0].message.annotations[].url_citation`
+  and answers on `OPENAI_SEARCH_MODEL` — a model the operator has named as search-capable — with the
+  sampling temperature removed, because a browsed answer is not a creative-writing task. A searched
+  turn is never handed to a provider that cannot browse: `runTextChain` skips it with
+  `skipped — no web search capability` in the attempt log instead of letting remembered text arrive
+  labelled as research. `chainSummary()` now reports `webSearchConfigured` and `webSearchProvider`,
+  and `AI_WEB_SEARCH=false` disables lookups without touching ordinary replies, since Google bills per
+  search.
+- `lib/ai/research.ts` is the gate. `needsWebSearch(message, agentType, snapshot)` decides from the
+  message and from what the snapshot actually holds: an explicit lookup, a fact that changes over time,
+  or a subject with nothing stored says search; the person's own records, the Road Safety Academy and
+  a platform that already holds the answer say no, each with a recorded reason. The academy is excluded
+  on purpose — a web page stating a wrong speed limit is worse than no answer, so Rwandan traffic law
+  may only come from the verified registry. When a search was requested and did not happen, the reply
+  carries `SEARCH_UNAVAILABLE` instead of reading as if it had been checked; pages that were read are
+  printed as `Sources:` / `Inkomoko:`, capped at three, URLs exactly as the provider returned them.
+- `lib/ai/intent.ts` decides *which* agent answers when the words do not. `classifyIntent` now returns
+  how many categories the keywords pointed at, and exactly one is the only confident answer: zero or
+  several triggers `classifyAgentWithModel`, whose reply counts only if it names one of the eight
+  agents this build has (`parseAgentChoice` folds `study tutor` and `Image-Studio` into the enum, and
+  refuses anything else). A menu pick is never overridden — that is the person naming their own
+  category, and the service they were just charged for — nor is a reply under eight characters, nor
+  the academy, whose open exam paper is stateful and would be lost mid-paper. Every failure keeps the
+  keyword routing.
+- `lib/ai/memory.ts` + `repo.rememberInConversation()` give each person a memory that outlives the
+  last six messages. After an answered turn one JSON call extracts durable facts, and the shape is
+  validated in code: `snake_case` keys, values clipped to 120 characters, four per turn and sixteen per
+  person, and a refusal of anything secret-shaped — a key matching token/password/api/key/pin/card, a
+  value matching a provider-token or JWT shape, or a value containing seven or more consecutive
+  digits, which is where a phone number, an ID number and a card number all live. A memory written
+  wrong follows a person forever, so a memory that fails to write is the acceptable error. Facts are
+  stored on the conversation, so they are read back into that person's later prompts and into nobody
+  else's; `AI_MEMORY_EXTRACT=false` turns the feature off.
+- `lib/ai/variety.ts` is the anti-repetition layer, which is half of the complaint. `SAMPLING_BY_AGENT`
+  gives each agent its own temperature (0.3 where a wrong figure costs someone, 0.85 for coaching that
+  reads badly when it is rote). `pickWindow()` rotates which stored listings reach the model, offset by
+  the number of assistant replies already in the conversation — no extra state, and it survives a
+  restart — so a fourth "shaka akazi" shows the next slice instead of the same five rows while forty
+  more sit in the store, and the snapshot now says how many are stored in total. `isRepeatOf()` compares
+  a finished answer with the last two this person saw (Jaccard over word sets, so a reshuffled reply is
+  still caught) and, at 0.72 overlap or more, the turn is re-asked exactly once with the earlier answer
+  in front of the model and the facts pinned; if the second attempt still matches or fails, the first
+  answer is kept.
+- `lib/ai/bilingual-router.ts` runs them in order: entitlement gate, image-production gate, category
+  classification, the academy's deterministic flow, the whole-backend snapshot, then the research gate
+  and the answer. Routing traces, the `web_research`, `rewrite_repeat` and `remember_person_facts`
+  traces all land on the agent run, so the Agents screen shows what actually happened.
+- Capability is reported, not assumed: `getSystemHealth().reasoning` carries
+  `webSearchConfigured`, `webSearchProvider`, `memoryExtraction`, `categoryRouting` and
+  `repeatRewrite`; `/api/ready` nests it under `aiProvider`, the Settings screen shows a *Research,
+  Routing & Memory* panel, `getEnvPresence()` lists `AI_WEB_SEARCH`, `OPENAI_SEARCH_MODEL` and
+  `AI_MEMORY_EXTRACT`, and the capability block inside every prompt tells the model whether it can
+  search on this server — so it cannot promise a lookup it does not have.
+- Tests: the suite is at 51. `test-agent-researches-when-it-has-no-answer` proves the gate both ways,
+  that a browse-less provider is skipped for a searched turn and that a chain with only one refuses
+  rather than guessing, then drives a full agent turn through a stubbed OpenAI transport and requires
+  the citation URL to arrive in the reply. `test-agent-category-decided-not-only-matched` routes an
+  unmatched message to `CAREER_ASSISTANT` and requires a model that invents `MOTIVATIONAL_SPEAKER` to be
+  refused with the keyword agent still answering. `test-agent-remembers-each-person-apart` writes
+  district and trade, refuses the phone number in the same payload, and requires the next snapshot of a
+  *different* person to contain neither. `test-agent-does-not-answer-the-same-twice` seeds a prior
+  assistant reply, requires the rewrite call to carry it and the new answer to be sent, and requires a
+  model that can only repeat to leave the first answer intact rather than erroring. All four run against
+  a stubbed `globalThis.fetch` with `GEMINI_API_KEY` scrubbed: nothing is billed and no key in the
+  operator's shell is used.
+- Still not proven, and not claimed: **no search, memory write or rewrite has ever been billed from
+  this machine**, because no provider key exists here. The tests prove the gates, the payloads, the
+  refusal paths and the wiring — not that Google returns usable pages for a Rwandan query, not that a
+  search-capable OpenAI model id is current, and not that a real model varies its wording enough to
+  clear the threshold on the first try. Confirm one searched reply, one remembered fact and one
+  rewritten answer on a deployed server, and read the three traces on the Agents screen, before
+  repeating this as working behaviour. A turn can also now make up to four sequential model calls, so
+  latency on a slow provider is worth watching on a real number.

@@ -319,6 +319,22 @@ export interface SystemHealth {
     attemptsPerProvider: number;
     budgetMs: number;
   };
+  /**
+   * The reasoning layers on top of the chain. Each is a real capability with its own
+   * gate, so an operator can see which of them this server can actually perform
+   * instead of being told the agent "researches and remembers".
+   */
+  reasoning: {
+    /** A turn can be grounded in a live Google Search. */
+    webSearchConfigured: boolean;
+    webSearchProvider: 'gemini' | 'openai' | null;
+    /** Durable facts about a person are extracted from an answered turn. */
+    memoryExtraction: boolean;
+    /** The category of an unmatched free-text message is decided by the model. */
+    categoryRouting: boolean;
+    /** An answer that repeats this person's earlier answer is re-asked once. */
+    repeatRewrite: boolean;
+  };
   imageStudio: {
     configured: boolean;
     provider: 'openai' | 'gemini' | 'none';

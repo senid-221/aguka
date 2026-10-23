@@ -10,6 +10,8 @@ import {
   buildButtonMessage,
   buildListMessage,
   buildImageMessage,
+  beginWhatsAppTyping,
+  type WhatsAppIncomingMessage,
 } from '@/lib/whatsapp/gateway';
 import { repo } from '@/lib/db/repository';
 import { durableStore } from '@/lib/db/store';
@@ -68,132 +70,14 @@ export async function POST(request: NextRequest) {
     const incomingMessages = parseWhatsAppWebhookPayload(payload);
 
     for (const msg of incomingMessages) {
-      // 3. Deduplicate events
+      // 3. Deduplicate events. The id is only burned once the message has been
+      // handled: marking it first meant a throw lost the message for good,
+      // because Meta's retry then arrived to a store that had already seen it.
       if (repo.isMessageAlreadyProcessed(msg.id)) {
         continue;
       }
+      await processInboundMessage(msg);
       repo.markMessageProcessed(msg.id);
-
-      // Record event log
-      repo.recordWebhookEvent({
-        eventId: msg.id,
-        senderWaId: msg.from,
-        eventType: `messages.${msg.type}`,
-        isProcessed: true,
-        payloadSummary: msg.text?.body || `Interactive or ${msg.type} message`,
-      });
-
-      // 4. Resolve or create user & conversation
-      const user = repo.getOrCreateUserByPhone(`+${msg.from}`);
-      const conversation = repo.getOrCreateConversation(user.id);
-
-      let outcome: InboundOutcome;
-
-      if (msg.type === 'image' && msg.image) {
-        // Payment screenshots arrive as image attachments.
-        const downloaded = await downloadWhatsAppMedia(msg.image.id);
-        if (!downloaded.ok || !downloaded.buffer) {
-          outcome = {
-            replyText: `The attachment could not be retrieved: ${downloaded.error}`,
-            agentType: 'ROUTER',
-            intent: 'MEDIA_DOWNLOAD_FAILED',
-            tokensUsed: 0,
-            modelUsed: 'media',
-          };
-        } else {
-          repo.addMessage(conversation.id, {
-            waMessageId: msg.id,
-            role: 'USER',
-            type: 'IMAGE',
-            content: `image (${downloaded.mimeType})`,
-            mediaUrl: `whatsapp-media:${msg.image.id}`,
-          });
-          outcome = await handleIncomingImage(
-            user,
-            conversation,
-            downloaded.buffer,
-            `${msg.id}.jpg`,
-            downloaded.mimeType,
-            msg.image.caption
-          );
-        }
-      } else {
-        // Extract message text. A list/button reply carries the row id, which is
-        // the reliable way to map a service selection back to the catalog.
-        let userText = '';
-        if (msg.type === 'text' && msg.text) {
-          userText = msg.text.body;
-        } else if (msg.interactive) {
-          if (msg.interactive.button_reply) {
-            userText = msg.interactive.button_reply.id || msg.interactive.button_reply.title;
-          } else if (msg.interactive.list_reply) {
-            userText = msg.interactive.list_reply.id || msg.interactive.list_reply.title;
-          }
-        }
-
-        if (!userText.trim()) continue;
-
-        // Add user message to conversation history
-        repo.addMessage(conversation.id, {
-          waMessageId: msg.id,
-          role: 'USER',
-          type: msg.interactive ? 'INTERACTIVE_REPLY' : 'TEXT',
-          content: userText,
-        });
-
-        // 5. Process through the shared inbound pipeline (service selection →
-        //    entitlement gate → agent). The record is closed once the inline run
-        //    finishes, so the queue view never shows work still pending.
-        const traceJob = repo.enqueueJob('PROCESS_WHATSAPP_MESSAGE', {
-          userId: user.id,
-          conversationId: conversation.id,
-          userText,
-        });
-
-        outcome = await handleIncomingText(user, conversation, userText);
-        repo.updateJobStatus(traceJob.id, 'COMPLETED');
-      }
-
-      // Save assistant response to conversation history
-      repo.addMessage(conversation.id, {
-        role: 'ASSISTANT',
-        type: outcome.image ? 'IMAGE' : 'TEXT',
-        content: outcome.replyText,
-        tokensUsed: outcome.tokensUsed,
-        ...(outcome.image ? { mediaUrl: `stored:${outcome.image.storageKey}` } : {}),
-      });
-
-      // 6. Dispatch reply to user via WhatsApp Gateway. A studio result is a file,
-      //    so it is uploaded to Meta's media endpoint first and sent as an image
-      //    with the explanation as its caption. If the upload fails, the words
-      //    still go out and say the attachment did not — never a silent drop.
-      if (outcome.image) {
-        const pixels = durableStore.readBinary(outcome.image.storageKey);
-        const uploaded = pixels
-          ? await uploadWhatsAppMedia(pixels, outcome.image.mimeType)
-          : { ok: false, mediaId: '', error: 'the stored photo could not be read back' };
-        if (uploaded.ok) {
-          await sendWhatsAppMessage(buildImageMessage(msg.from, uploaded.mediaId, outcome.replyText));
-        } else {
-          logger.error('IMAGE_DELIVERY_FAILED', new Error(uploaded.error ?? 'unknown media upload failure'), {
-            metadata: { storageKey: outcome.image.storageKey, userId: user.id },
-          });
-          await sendWhatsAppMessage(
-            buildTextMessage(
-              msg.from,
-              `${outcome.replyText}\n(The file could not be attached: ${uploaded.error})`
-            )
-          );
-        }
-      } else {
-        const payload = outcome.listMenu
-          ? buildListMessage(msg.from, outcome.listMenu.interactive)
-          : outcome.buttons && outcome.buttons.length > 0
-            ? buildButtonMessage(msg.from, outcome.replyText, outcome.buttons)
-            : buildTextMessage(msg.from, outcome.replyText);
-
-        await sendWhatsAppMessage(payload);
-      }
     }
 
     // Always acknowledge quickly to Meta with 200 OK
@@ -202,5 +86,149 @@ export async function POST(request: NextRequest) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     console.error('Error in WhatsApp webhook POST:', errorMsg);
     return NextResponse.json({ error: errorMsg }, { status: 500 });
+  }
+}
+
+/**
+ * One inbound message, from the read receipt to the delivered reply. It lives
+ * outside the POST body so the "typing…" heartbeat is stopped on every path,
+ * including a media download or a provider call that throws.
+ */
+async function processInboundMessage(msg: WhatsAppIncomingMessage): Promise<void> {
+  // The receipt goes out before the slow work starts: the person sees the
+  // message tick over and the indicator while the agent is still thinking. A
+  // Meta failure here is logged for the operator and never enters the reply.
+  const presence = beginWhatsAppTyping(msg.id);
+  void presence.ready.then((result) => {
+    if (!result.ok && result.mode === 'LIVE_META_API') {
+      logger.warn('WHATSAPP_PRESENCE_FAILED', 'Meta did not accept the read receipt or typing indicator', {
+        metadata: { messageId: msg.id, error: result.error },
+      });
+    }
+  });
+
+  try {
+    // Record event log
+    repo.recordWebhookEvent({
+      eventId: msg.id,
+      senderWaId: msg.from,
+      eventType: `messages.${msg.type}`,
+      isProcessed: true,
+      payloadSummary: msg.text?.body || `Interactive or ${msg.type} message`,
+    });
+
+    // 4. Resolve or create user & conversation
+    const user = repo.getOrCreateUserByPhone(`+${msg.from}`);
+    const conversation = repo.getOrCreateConversation(user.id);
+
+    let outcome: InboundOutcome;
+
+    if (msg.type === 'image' && msg.image) {
+      // Payment screenshots arrive as image attachments.
+      const downloaded = await downloadWhatsAppMedia(msg.image.id);
+      if (!downloaded.ok || !downloaded.buffer) {
+        outcome = {
+          replyText: `The attachment could not be retrieved: ${downloaded.error}`,
+          agentType: 'ROUTER',
+          intent: 'MEDIA_DOWNLOAD_FAILED',
+          tokensUsed: 0,
+          modelUsed: 'media',
+        };
+      } else {
+        repo.addMessage(conversation.id, {
+          waMessageId: msg.id,
+          role: 'USER',
+          type: 'IMAGE',
+          content: `image (${downloaded.mimeType})`,
+          mediaUrl: `whatsapp-media:${msg.image.id}`,
+        });
+        outcome = await handleIncomingImage(
+          user,
+          conversation,
+          downloaded.buffer,
+          `${msg.id}.jpg`,
+          downloaded.mimeType,
+          msg.image.caption
+        );
+      }
+    } else {
+      // Extract message text. A list/button reply carries the row id, which is
+      // the reliable way to map a service selection back to the catalog.
+      let userText = '';
+      if (msg.type === 'text' && msg.text) {
+        userText = msg.text.body;
+      } else if (msg.interactive) {
+        if (msg.interactive.button_reply) {
+          userText = msg.interactive.button_reply.id || msg.interactive.button_reply.title;
+        } else if (msg.interactive.list_reply) {
+          userText = msg.interactive.list_reply.id || msg.interactive.list_reply.title;
+        }
+      }
+
+      if (!userText.trim()) return;
+
+      // Add user message to conversation history
+      repo.addMessage(conversation.id, {
+        waMessageId: msg.id,
+        role: 'USER',
+        type: msg.interactive ? 'INTERACTIVE_REPLY' : 'TEXT',
+        content: userText,
+      });
+
+      // 5. Process through the shared inbound pipeline (service selection →
+      //    entitlement gate → agent). The record is closed once the inline run
+      //    finishes, so the queue view never shows work still pending.
+      const traceJob = repo.enqueueJob('PROCESS_WHATSAPP_MESSAGE', {
+        userId: user.id,
+        conversationId: conversation.id,
+        userText,
+      });
+
+      outcome = await handleIncomingText(user, conversation, userText);
+      repo.updateJobStatus(traceJob.id, 'COMPLETED');
+    }
+
+    // Save assistant response to conversation history
+    repo.addMessage(conversation.id, {
+      role: 'ASSISTANT',
+      type: outcome.image ? 'IMAGE' : 'TEXT',
+      content: outcome.replyText,
+      tokensUsed: outcome.tokensUsed,
+      ...(outcome.image ? { mediaUrl: `stored:${outcome.image.storageKey}` } : {}),
+    });
+
+    // 6. Dispatch reply to user via WhatsApp Gateway. A studio result is a file,
+    //    so it is uploaded to Meta's media endpoint first and sent as an image
+    //    with the explanation as its caption. If the upload fails, the words
+    //    still go out and say the attachment did not — never a silent drop.
+    if (outcome.image) {
+      const pixels = durableStore.readBinary(outcome.image.storageKey);
+      const uploaded = pixels
+        ? await uploadWhatsAppMedia(pixels, outcome.image.mimeType)
+        : { ok: false, mediaId: '', error: 'the stored photo could not be read back' };
+      if (uploaded.ok) {
+        await sendWhatsAppMessage(buildImageMessage(msg.from, uploaded.mediaId, outcome.replyText));
+      } else {
+        logger.error('IMAGE_DELIVERY_FAILED', new Error(uploaded.error ?? 'unknown media upload failure'), {
+          metadata: { storageKey: outcome.image.storageKey, userId: user.id },
+        });
+        await sendWhatsAppMessage(
+          buildTextMessage(
+            msg.from,
+            `${outcome.replyText}\n(The file could not be attached: ${uploaded.error})`
+          )
+        );
+      }
+    } else {
+      const payload = outcome.listMenu
+        ? buildListMessage(msg.from, outcome.listMenu.interactive)
+        : outcome.buttons && outcome.buttons.length > 0
+          ? buildButtonMessage(msg.from, outcome.replyText, outcome.buttons)
+          : buildTextMessage(msg.from, outcome.replyText);
+
+      await sendWhatsAppMessage(payload);
+    }
+  } finally {
+    presence.stop();
   }
 }

@@ -27,6 +27,15 @@ interface ReadinessPayload {
       rescueConfigured: boolean;
       attemptsPerProvider: number;
       budgetMs: number;
+      // Which of the reasoning layers this server can actually perform. Optional
+      // because an older /api/ready response must still render, not crash the screen.
+      reasoning?: {
+        webSearchConfigured: boolean;
+        webSearchProvider: 'gemini' | 'openai' | null;
+        memoryExtraction: boolean;
+        categoryRouting: boolean;
+        repeatRewrite: boolean;
+      };
     };
     whatsappWebhook: { status: string; mode: string; verified: boolean };
     imageStudio: {
@@ -81,6 +90,9 @@ interface ReadinessPayload {
 const ENV_LABELS: Array<{ name: string; note: string }> = [
   { name: 'GEMINI_API_KEY', note: 'Primary text provider — answers almost every agent reply' },
   { name: 'OPENAI_TEXT_MODEL', note: 'Rescue text model when Gemini is rate-limited or down (defaults to gpt-4o)' },
+  { name: 'AI_WEB_SEARCH', note: 'Allow a turn to be grounded in a live Google Search (on unless set to false/off) — billed per search by the provider' },
+  { name: 'OPENAI_SEARCH_MODEL', note: 'OpenAI model that may browse, e.g. a search-capable gpt-4o variant. Without it only Gemini answers searched turns' },
+  { name: 'AI_MEMORY_EXTRACT', note: 'Remember durable facts about each person from an answered turn (on unless set to false/off)' },
   { name: 'OPENAI_API_KEY', note: 'Adds the OpenAI text rescue, reads text out of MoMo receipt screenshots (vision OCR) and renders studio photos' },
   { name: 'OPENAI_IMAGE_MODEL', note: 'Optional studio model when using OpenAI (defaults to gpt-image-1)' },
   { name: 'GEMINI_IMAGE_MODEL', note: 'Optional studio model when only a Google key is set (defaults to gemini-2.5-flash-image)' },
@@ -401,6 +413,65 @@ export function SettingsScreen() {
             }`}
           >
             {readiness?.checks.aiProvider.rescueConfigured ? 'Rescue armed' : 'No rescue provider'}
+          </span>
+        </div>
+      </div>
+
+      {/* Reasoning layers on top of the chain */}
+      <div className="p-5 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-2">
+        <h2 className="text-sm font-bold text-white">Research, Routing &amp; Memory</h2>
+        <p className="text-xs text-zinc-400 leading-relaxed">
+          A turn is looked up live only when the server decides it must: the person asked for a
+          search, the answer changes over time, or Aguka genuinely holds nothing on the subject.
+          Road-safety rules are{' '}
+          <span className="text-zinc-200">never</span> answered from a web page — only from the
+          verified registry. Web results are charged per search by the provider, so they can be
+          switched off without losing ordinary replies.
+        </p>
+        <div className="flex flex-wrap gap-2 text-[10px] font-mono">
+          <span
+            className={`px-2 py-1 rounded border font-semibold ${
+              readiness?.checks.aiProvider.reasoning?.webSearchConfigured
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {readiness?.checks.aiProvider.reasoning?.webSearchConfigured
+              ? `Google Search via ${readiness.checks.aiProvider.reasoning.webSearchProvider}`
+              : 'Web search unavailable'}
+          </span>
+          <span
+            className={`px-2 py-1 rounded border font-semibold ${
+              readiness?.checks.aiProvider.reasoning?.memoryExtraction
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {readiness?.checks.aiProvider.reasoning?.memoryExtraction
+              ? 'Remembers each person'
+              : 'Memory extraction off'}
+          </span>
+          <span
+            className={`px-2 py-1 rounded border font-semibold ${
+              readiness?.checks.aiProvider.reasoning?.categoryRouting
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {readiness?.checks.aiProvider.reasoning?.categoryRouting
+              ? 'Model classifies unclear categories'
+              : 'Keyword routing only'}
+          </span>
+          <span
+            className={`px-2 py-1 rounded border font-semibold ${
+              readiness?.checks.aiProvider.reasoning?.repeatRewrite
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+            }`}
+          >
+            {readiness?.checks.aiProvider.reasoning?.repeatRewrite
+              ? 'Repeats are rewritten'
+              : 'No repeat check'}
           </span>
         </div>
       </div>

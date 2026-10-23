@@ -1,5 +1,28 @@
-import { verifyWebhookChallenge, verifyMetaSignature, buildImageMessage, uploadWhatsAppMedia } from '@/lib/whatsapp/gateway';
-import { detectLanguage, classifyIntent, requestsImageProduction } from '@/lib/ai/bilingual-router';
+import {
+  verifyWebhookChallenge,
+  verifyMetaSignature,
+  buildImageMessage,
+  uploadWhatsAppMedia,
+  buildPresencePayload,
+  markWhatsAppMessageRead,
+  beginWhatsAppTyping,
+  whatsappGraphVersion,
+  WHATSAPP_TYPING_REFRESH_MS,
+} from '@/lib/whatsapp/gateway';
+import { buildPlatformContext, PLATFORM_DATA_RULES } from '@/lib/ai/platform-context';
+import { detectLanguage, classifyIntent, requestsImageProduction, executeAgent } from '@/lib/ai/bilingual-router';
+import { needsWebSearch, formatSources, SEARCH_UNAVAILABLE } from '@/lib/ai/research';
+import { needsAgentClassification, parseAgentChoice } from '@/lib/ai/intent';
+import {
+  SAMPLING_BY_AGENT,
+  REPEAT_THRESHOLD,
+  REWRITE_INSTRUCTION,
+  similarity,
+  isRepeatOf,
+  recentAssistantReplies,
+  pickWindow,
+} from '@/lib/ai/variety';
+import { parseFacts, mergeMemories, shouldExtractMemories, memoryExtractionEnabled, MEMORY_LIMITS } from '@/lib/ai/memory';
 import { sanitizeUserInput, redactSecrets } from '@/lib/ai/prompt-security';
 import { repo } from '@/lib/db/repository';
 import { parseAndValidateConfig } from '@/lib/config';
@@ -17,6 +40,7 @@ import {
   ProviderAttemptError,
   type IAIProvider,
   type AIProviderResponse,
+  type GenerateOptions,
 } from '@/lib/ai/provider-adapter';
 import { GEMINI_MODEL } from '@/lib/gemini';
 import { queueService } from '@/lib/queue/redis-queue';
@@ -2243,6 +2267,822 @@ Published on 12-10-2026 | Deadline 30-11-2026
         .map(([name]) => name)
         .join(',') || 'none'}`,
     durationMs: Date.now() - t45Start,
+  });
+
+  // Test 46: The person sees their message land. Every inbound wamid is marked
+  // read, the "typing…" indicator rides the same Cloud API call and stays inside
+  // Meta's 25-second window, and a missing credential or a Meta rejection is
+  // reported to the caller instead of pretending the receipt was delivered.
+  const t46Start = Date.now();
+  const realPresenceFetch = globalThis.fetch;
+  let presenceCalls = 0;
+  interface PresenceRequestBody {
+    messaging_product?: string;
+    status?: string;
+    message_id?: string;
+    typing_indicator?: { type?: string };
+  }
+  type PresenceOutcome = { ok: boolean; mode: string; error?: string };
+  // Captured through an object because control-flow analysis cannot see that the
+  // stubbed transport fills these in before the assertions run.
+  const captured = { url: '', body: null as PresenceRequestBody | null };
+
+  const stubPresenceTransport = (respond: () => Response) => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      presenceCalls += 1;
+      captured.url = String(input);
+      captured.body = JSON.parse(String(init?.body ?? '{}')) as PresenceRequestBody;
+      return respond();
+    }) as typeof fetch;
+  };
+
+  const typingPayload = buildPresencePayload('wamid.SUITE.TYPING', true);
+  const readOnlyPayload = buildPresencePayload('wamid.SUITE.READ', false);
+  const versionNumber = (value: string): number => {
+    const match = /^v(\d+)\.(\d+)$/.exec(value);
+    return match ? Number(match[1]) * 100 + Number(match[2]) : 0;
+  };
+  const versionOk =
+    versionNumber(whatsappGraphVersion()) >= 2200 &&
+    whatsappGraphVersion({ ...process.env, WHATSAPP_GRAPH_VERSION: 'v24.0' }) === 'v24.0' &&
+    whatsappGraphVersion({ ...process.env, WHATSAPP_GRAPH_VERSION: 'nonsense' }) === whatsappGraphVersion();
+
+  let unconfiguredRead: PresenceOutcome | null = null;
+  let unconfiguredTyping: PresenceOutcome | null = null;
+  let liveRead: PresenceOutcome | null = null;
+  let failedRead: PresenceOutcome | null = null;
+  let liveTypingOk = false;
+  let offlineCalls = -1;
+  let presenceOk = false;
+  let liveSnapshotUrl = '';
+  let liveSnapshotBody: PresenceRequestBody | null = null;
+
+  try {
+    stubPresenceTransport(() => new Response('{}', { status: 200 }));
+    const offline = await withEnv(
+      { WHATSAPP_PHONE_NUMBER_ID: null, WHATSAPP_ACCESS_TOKEN: null },
+      async () => {
+        const read = await markWhatsAppMessageRead('wamid.SUITE.OFF', { typing: true });
+        const presence = beginWhatsAppTyping('wamid.SUITE.OFF');
+        const ready = await presence.ready;
+        presence.stop();
+        return { read, ready };
+      }
+    );
+    unconfiguredRead = offline.read;
+    unconfiguredTyping = offline.ready;
+    offlineCalls = presenceCalls;
+
+    stubPresenceTransport(() => new Response(JSON.stringify({ success: true }), { status: 200 }));
+    const liveCreds = { WHATSAPP_PHONE_NUMBER_ID: '1234567890', WHATSAPP_ACCESS_TOKEN: 'suite-presence-token' };
+    liveRead = await withEnv(liveCreds, () => markWhatsAppMessageRead('wamid.SUITE.LIVE', { typing: true }));
+    liveSnapshotUrl = captured.url;
+    liveSnapshotBody = captured.body;
+
+    const beat = await withEnv(liveCreds, async () => {
+      const presence = beginWhatsAppTyping('wamid.SUITE.BEAT');
+      const ready = await presence.ready;
+      presence.stop();
+      return ready;
+    });
+    liveTypingOk = beat.ok;
+
+    stubPresenceTransport(
+      () => new Response(JSON.stringify({ error: { message: '(#131000) Something went wrong' } }), { status: 400 })
+    );
+    failedRead = await withEnv(liveCreds, () => markWhatsAppMessageRead('wamid.SUITE.LIVE', { typing: false }));
+
+    presenceOk =
+      typingPayload.messaging_product === 'whatsapp' &&
+      typingPayload.status === 'read' &&
+      typingPayload.message_id === 'wamid.SUITE.TYPING' &&
+      typingPayload.typing_indicator?.type === 'text' &&
+      readOnlyPayload.status === 'read' &&
+      readOnlyPayload.typing_indicator === undefined &&
+      versionOk &&
+      unconfiguredRead?.ok === false &&
+      unconfiguredRead.mode === 'NOT_CONFIGURED' &&
+      unconfiguredTyping?.ok === false &&
+      unconfiguredTyping.mode === 'NOT_CONFIGURED' &&
+      offlineCalls === 0 &&
+      liveRead?.ok === true &&
+      liveRead.mode === 'LIVE_META_API' &&
+      liveTypingOk &&
+      liveSnapshotUrl.includes('graph.facebook.com') &&
+      liveSnapshotUrl.includes('1234567890/messages') &&
+      liveSnapshotBody?.status === 'read' &&
+      liveSnapshotBody?.message_id === 'wamid.SUITE.LIVE' &&
+      liveSnapshotBody?.typing_indicator?.type === 'text' &&
+      failedRead?.ok === false &&
+      failedRead.mode === 'LIVE_META_API' &&
+      /131000/.test(failedRead.error || '') &&
+      WHATSAPP_TYPING_REFRESH_MS < 25_000;
+  } finally {
+    globalThis.fetch = realPresenceFetch;
+  }
+
+  results.push({
+    id: 'test-whatsapp-read-receipt-and-typing',
+    category: 'WhatsApp Gateway',
+    name: 'A Message Is Marked Read And Typing Shown, Without A Request When Unconfigured',
+    passed: presenceOk,
+    expected:
+      'the presence payload is status=read for the inbound wamid with typing_indicator type=text; the Graph version supports typing indicators (v22.0+), honours WHATSAPP_GRAPH_VERSION and falls back on a malformed value; without credentials no HTTP request is made and the result says NOT_CONFIGURED; a live call posts to the phone number id with the receipt; a Meta rejection is returned as a failure with its reason and never thrown; the refresh stays inside the 25-second window',
+    actual: `payload=${typingPayload.status}/${typingPayload.typing_indicator?.type ?? 'none'} readOnlyTyping=${
+      readOnlyPayload.typing_indicator ? 'present' : 'absent'
+    }, version=${whatsappGraphVersion()} ok=${versionOk}, offline=${unconfiguredRead?.mode ?? 'n/a'}/${
+      unconfiguredTyping?.mode ?? 'n/a'
+    } calls=${offlineCalls}, live=${liveRead?.ok ?? 'n/a'}/${liveRead?.mode ?? 'n/a'} typing=${liveTypingOk} url=${
+      liveSnapshotUrl.split('/').slice(3, 5).join('/') || 'none'
+    } body=${liveSnapshotBody?.status ?? 'n/a'}/${liveSnapshotBody?.typing_indicator?.type ?? 'none'}, rejected=${
+      failedRead?.ok ?? 'n/a'
+    }/${failedRead?.error ? 'reasoned' : 'silent'}, refresh=${WHATSAPP_TYPING_REFRESH_MS}ms`,
+    durationMs: Date.now() - t46Start,
+  });
+
+  // Test 47: The agent is grounded in the whole backend, not a keyword-sized
+  // slice of it. A tutor turn must see the live catalogue, board health and this
+  // person's own rows — and must never see another person's records.
+  const t47Start = Date.now();
+  ensureCatalogSeeded();
+  const groundUser = repo.getOrCreateUserByPhone(
+    `+2507${String(suiteStamp + 80).slice(-8)}`,
+    'Suite Grounded User'
+  );
+  const unrelatedUser = repo.getOrCreateUserByPhone(
+    `+2507${String(suiteStamp + 81).slice(-8)}`,
+    'Suite Unrelated User'
+  );
+  const groundConversation = repo.getOrCreateConversation(groundUser.id);
+  repo.createCodingTask({
+    userId: groundUser.id,
+    title: 'SUITE_Grounded_Express_API',
+    taskType: 'SCAFFOLD',
+    language: 'typescript',
+    code: 'export {};',
+    inputPrompt: 'scaffold an Express API',
+    status: 'COMPLETED',
+  });
+  repo.createCodingTask({
+    userId: unrelatedUser.id,
+    title: 'SUITE_Other_Person_Private_Project',
+    taskType: 'DEBUG',
+    language: 'python',
+    code: 'pass',
+    inputPrompt: 'not this person',
+    status: 'COMPLETED',
+  });
+  repo.createStudySession({
+    userId: groundUser.id,
+    subject: 'SUITE_Mathematics',
+    topic: 'Fractions',
+    language: 'ENGLISH',
+    notes: 'own notes',
+    quizzes: [],
+  });
+  repo.addMessage(groundConversation.id, {
+    role: 'USER',
+    type: 'TEXT',
+    content: 'earlier question about my photo',
+  });
+
+  const platformSnapshot = buildPlatformContext({
+    user: repo.getUserById(groundUser.id)!,
+    conversation: repo.getConversationById(groundConversation.id)!,
+    agentType: 'STUDY_TUTOR',
+    replyLang: 'ENGLISH',
+    currentText: 'what can you help me with?',
+  });
+  const groundedText = platformSnapshot.parts.join('\n');
+  const groundedTools = platformSnapshot.tools.map((tool) => tool.name);
+  const menuServiceNames = listMenuServices().map((service) => service.nameEn);
+  const groundedOk =
+    platformSnapshot.parts.length === 7 &&
+    menuServiceNames.length > 0 &&
+    menuServiceNames.every((name) => groundedText.includes(name)) &&
+    groundedText.includes('SUITE_Grounded_Express_API') &&
+    !groundedText.includes('SUITE_Other_Person_Private_Project') &&
+    groundedText.includes('SUITE_Mathematics') &&
+    groundedText.includes('earlier question about my photo') &&
+    /Verified listings/.test(groundedText) &&
+    /Board status/.test(groundedText) &&
+    /Published modules/.test(groundedText) &&
+    /Latest payment order/.test(groundedText) &&
+    /AI text providers:/.test(groundedText) &&
+    groundedTools.includes('read_service_catalog') &&
+    groundedTools.includes('search_verified_jobs') &&
+    groundedTools.includes('read_learner_records') &&
+    groundedTools.includes('read_conversation_history') &&
+    PLATFORM_DATA_RULES.includes('never tell the person you have nothing');
+
+  results.push({
+    id: 'test-agent-grounded-in-whole-backend',
+    category: 'AI Orchestrator',
+    name: 'Every Agent Turn Sees The Live Catalogue And Only This Person\'s Records',
+    passed: groundedOk,
+    expected:
+      'a tutoring turn is grounded in the live service catalogue, runtime capability, board health, verified listings, road-safety totals, the person\'s own tutoring/coding/photo rows and the recent conversation, while another person\'s coding project never appears and the shared rules forbid claiming the platform has nothing when data exists',
+    actual: `blocks=${platformSnapshot.parts.length}, tools=${groundedTools.join(',')}, services=${menuServiceNames.length}, ownCoding=${groundedText.includes(
+      'SUITE_Grounded_Express_API'
+    )}, leakedOther=${groundedText.includes('SUITE_Other_Person_Private_Project')}, ownStudy=${groundedText.includes(
+      'SUITE_Mathematics'
+    )}, history=${groundedText.includes('earlier question about my photo')}, boards=${
+      /Board status/.test(groundedText) ? 'yes' : 'no'
+    }, academy=${/Published modules/.test(groundedText) ? 'yes' : 'no'}, account=${
+      /Latest payment order/.test(groundedText) ? 'yes' : 'no'
+    }`,
+    durationMs: Date.now() - t47Start,
+  });
+
+  // ---------------------------------------------------------------------------
+  // Tests 48-51: the reasoning layers — a live lookup when the platform has no
+  // answer, a category decided by the model when the words do not decide one, a
+  // memory of each person that survives the conversation, and an answer that does
+  // not repeat itself. Every provider call here is a stubbed HTTP response: no
+  // search is billed and no key in the operator's shell is used.
+  // ---------------------------------------------------------------------------
+
+  interface StubCall {
+    model: string;
+    system: string;
+    prompt: string;
+    json: boolean;
+    temperature: number | null;
+  }
+
+  /** Drive one or more agent turns through the OpenAI transport with no network. */
+  const runWithStubbedOpenAi = async <T>(opts: {
+    extras?: Record<string, string | null>;
+    respond: (call: StubCall, index: number) => { content: string; citations?: Array<{ url: string; title: string }> };
+    then: (calls: StubCall[]) => Promise<T>;
+  }): Promise<T> => {
+    const realFetch = globalThis.fetch;
+    const calls: StubCall[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!url.includes('api.openai.com')) return realFetch(input as never, init as never);
+      const body = JSON.parse(String(init?.body ?? '{}')) as {
+        model?: string;
+        temperature?: number;
+        response_format?: { type?: string };
+        messages?: Array<{ role: string; content: string }>;
+      };
+      const call: StubCall = {
+        model: String(body.model ?? ''),
+        system: String(body.messages?.find((m) => m.role === 'system')?.content ?? ''),
+        prompt: String(body.messages?.find((m) => m.role === 'user')?.content ?? ''),
+        json: body.response_format?.type === 'json_object',
+        temperature: typeof body.temperature === 'number' ? body.temperature : null,
+      };
+      const index = calls.length;
+      calls.push(call);
+      const reply = opts.respond(call, index);
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: reply.content,
+                ...(reply.citations?.length
+                  ? {
+                      annotations: reply.citations.map((c) => ({
+                        type: 'url_citation',
+                        url_citation: { url: c.url, title: c.title },
+                      })),
+                    }
+                  : {}),
+              },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 100, completion_tokens: 40, total_tokens: 140 },
+        }),
+        { status: 200 }
+      );
+    }) as typeof fetch;
+    try {
+      return await withEnv(
+        {
+          GEMINI_API_KEY: '',
+          OPENAI_API_KEY: 'sk-suite-turn-key',
+          OPENAI_TEXT_MODEL: 'gpt-4o',
+          OPENAI_SEARCH_MODEL: null,
+          AI_WEB_SEARCH: null,
+          AI_MEMORY_EXTRACT: null,
+          ...(opts.extras ?? {}),
+        },
+        () => opts.then(calls)
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  };
+
+  class SuiteTextProvider implements IAIProvider {
+    calls = 0;
+    constructor(
+      readonly name: string,
+      readonly providerName: 'gemini' | 'openai',
+      readonly model: string,
+      readonly supportsSearch: boolean
+    ) {}
+    async generateResponse(prompt: string, _sys?: string, options?: GenerateOptions): Promise<AIProviderResponse> {
+      this.calls++;
+      return {
+        text: `${this.providerName} answered ${prompt.slice(0, 12)}`,
+        tokensInput: 4,
+        tokensOutput: 6,
+        tokensUsed: 10,
+        latencyMs: 1,
+        model: this.model,
+        provider: this.providerName,
+        ...(options?.search
+          ? {
+              sources: [{ url: 'https://example.org/petrol-rw', title: 'Rwanda fuel prices' }],
+              searchQueries: ['petrol price kigali'],
+            }
+          : {}),
+      };
+    }
+    async healthCheck() {
+      return { ok: true, provider: this.name, model: this.model, latencyMs: 0 };
+    }
+  }
+
+  // Test 48: the research gate.
+  const t48Start = Date.now();
+  const emptyBoard = ['Job discovery\nVerified listings: NONE stored.\nBoard status:\n- none'];
+
+  const gate = await withEnv(
+    { GEMINI_API_KEY: 'suite-real-key', OPENAI_API_KEY: null, AI_WEB_SEARCH: null, OPENAI_SEARCH_MODEL: null },
+    () =>
+      Promise.resolve({
+        asked: needsWebSearch('Please search google for the price of petrol in Kigali', 'JOB_FINDER', emptyBoard),
+        rw: needsWebSearch('Shakisha kuri interineti igiciro cya lisansi', 'JOB_FINDER', emptyBoard),
+        fact: needsWebSearch('What is the exchange rate of the dollar today?', 'JOB_FINDER', emptyBoard),
+        own: needsWebSearch('search google and tell me how my cv looks', 'CAREER_ASSISTANT', emptyBoard),
+        academy: needsWebSearch('Look up online what the speed limit is here', 'ROAD_SAFETY_ACADEMY', emptyBoard),
+        held: needsWebSearch('Sobanurira imibare y amasomo y ishuri', 'STUDY_TUTOR', ['Verified listings: 3 stored']),
+        gap: needsWebSearch('Ndashaka akazi ko muri banki', 'JOB_FINDER', emptyBoard),
+      })
+  );
+  const gateNoProvider = await withEnv(
+    { GEMINI_API_KEY: '', OPENAI_API_KEY: '', AI_WEB_SEARCH: null },
+    () => Promise.resolve(needsWebSearch('search google for fuel prices', 'JOB_FINDER', emptyBoard))
+  );
+  const gateSearchOff = await withEnv(
+    { GEMINI_API_KEY: 'suite-real-key', OPENAI_API_KEY: '', AI_WEB_SEARCH: 'off' },
+    () => Promise.resolve(needsWebSearch('search google for fuel prices', 'JOB_FINDER', emptyBoard))
+  );
+  const gateNoSearchModel = await withEnv(
+    { GEMINI_API_KEY: '', OPENAI_API_KEY: 'sk-suite-key', OPENAI_SEARCH_MODEL: '', AI_WEB_SEARCH: null },
+    () => Promise.resolve(needsWebSearch('search google for fuel prices', 'JOB_FINDER', emptyBoard))
+  );
+  const gateOpenAiSearchModel = await withEnv(
+    { GEMINI_API_KEY: '', OPENAI_API_KEY: 'sk-suite-key', OPENAI_SEARCH_MODEL: 'gpt-4o-search-preview', AI_WEB_SEARCH: null },
+    () => Promise.resolve(needsWebSearch('search google for fuel prices', 'JOB_FINDER', emptyBoard))
+  );
+
+  const chainBlind = new SuiteTextProvider('Suite Blind', 'gemini', 'suite-blind-model', false);
+  const chainSearcher = new SuiteTextProvider('Suite Searcher', 'openai', 'suite-search-model', true);
+  const searchedAcrossChain = await runTextChain([chainBlind, chainSearcher], 'price of petrol', 'sys', {
+    search: true,
+  });
+  let blindOnlyRefused = false;
+  let blindOnlyAttempts: string[] = [];
+  try {
+    await runTextChain([new SuiteTextProvider('Suite Blind 2', 'gemini', 'suite-blind-model', false)], 'p', 's', {
+      search: true,
+    });
+  } catch (err) {
+    blindOnlyRefused = err instanceof AllTextProvidersFailed;
+    blindOnlyAttempts = err instanceof AllTextProvidersFailed ? err.attempts : [];
+  }
+
+  const citedEn = formatSources([{ url: 'https://example.org/a', title: 'Rwanda Energy' }], 'ENGLISH');
+  const citedRw = formatSources(
+    [
+      { url: 'https://example.org/a', title: 'A' },
+      { url: 'https://example.org/b', title: 'B' },
+      { url: 'https://example.org/c', title: 'C' },
+      { url: 'https://example.org/d', title: 'D' },
+    ],
+    'KINYARWANDA'
+  );
+
+  const researchUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 82).slice(-8)}`, 'Suite Research User');
+  const researchConv = repo.getOrCreateConversation(researchUser.id);
+  const searchedTurn = await runWithStubbedOpenAi({
+    extras: { OPENAI_SEARCH_MODEL: 'gpt-4o-search-preview' },
+    respond: (call) =>
+      call.json
+        ? { content: '{"facts":{}}' }
+        : {
+            content: 'Petrol in Kigali is quoted at the pump this week, according to the page that was read.',
+            citations: [{ url: 'https://example.org/petrol-rw', title: 'Rwanda fuel prices' }],
+          },
+    then: async (calls) => {
+      const result = await executeAgent(
+        repo.getUserById(researchUser.id)!,
+        repo.getConversationById(researchConv.id)!,
+        'Explain how a combustion engine works, then search google for the price of petrol in Kigali',
+        { replyLang: 'ENGLISH' }
+      );
+      return { result, calls };
+    },
+  });
+  const capabilitySaysSearch = await withEnv(
+    { GEMINI_API_KEY: 'suite-real-key', OPENAI_API_KEY: null, AI_WEB_SEARCH: null, OPENAI_SEARCH_MODEL: null },
+    () =>
+      Promise.resolve(
+        buildPlatformContext({
+          user: repo.getUserById(researchUser.id)!,
+          conversation: repo.getConversationById(researchConv.id)!,
+          agentType: 'JOB_FINDER',
+          replyLang: 'ENGLISH',
+          currentText: 'what can you do for me',
+        }).parts[0]
+      )
+  );
+
+  const researchTrace = searchedTurn.result.toolCalls.find((t) => t.name === 'web_research');
+  const researchOk =
+    gate.asked.research &&
+    gate.rw.research &&
+    gate.fact.research &&
+    gate.gap.research &&
+    !gate.own.research &&
+    /own records/i.test(gate.own.reason) &&
+    !gate.academy.research &&
+    /registry/i.test(gate.academy.reason) &&
+    !gate.held.research &&
+    !gateNoProvider.research &&
+    !gateSearchOff.research &&
+    !gateNoSearchModel.research &&
+    /search-capable/i.test(gateNoSearchModel.reason) &&
+    gateOpenAiSearchModel.research &&
+    searchedAcrossChain.searched &&
+    searchedAcrossChain.provider === 'openai' &&
+    chainBlind.calls === 0 &&
+    /skipped/.test(searchedAcrossChain.attempts[0]) &&
+    (searchedAcrossChain.sources?.length ?? 0) === 1 &&
+    blindOnlyRefused &&
+    /skipped/.test(blindOnlyAttempts[0] ?? '') &&
+    citedEn.includes('Sources:') &&
+    citedEn.includes('https://example.org/a') &&
+    citedRw.includes('Inkomoko') &&
+    (citedRw.match(/https/g) || []).length === 3 &&
+    formatSources([], 'ENGLISH') === '' &&
+    SEARCH_UNAVAILABLE.ENGLISH.includes('did not run') &&
+    searchedTurn.result.agentType === 'STUDY_TUTOR' &&
+    searchedTurn.result.modelUsed.includes('(searched)') &&
+    searchedTurn.result.replyText.includes('https://example.org/petrol-rw') &&
+    searchedTurn.result.replyText.includes('Sources:') &&
+    researchTrace?.name === 'web_research' &&
+    JSON.stringify(researchTrace?.result).includes('https://example.org/petrol-rw') &&
+    searchedTurn.calls.some((c) => c.model === 'gpt-4o-search-preview') &&
+    capabilitySaysSearch.includes('Live web research: available through gemini');
+
+  results.push({
+    id: 'test-agent-researches-when-it-has-no-answer',
+    category: 'AI Orchestrator',
+    name: 'A Question The Platform Cannot Answer Is Looked Up Live And Cited',
+    passed: researchOk,
+    expected:
+      'the server decides from the message and the stored snapshot whether a turn needs Google Search — an explicit lookup, a fact that changes, or a subject with nothing stored says yes, the person\'s own records and road safety say no — a provider that cannot browse is skipped for a searched turn instead of answering from memory, the pages actually read are printed as sources in the reply language, and the capability block tells the model whether search exists at all',
+    actual: `asked=${gate.asked.research}/${gate.rw.research}/${gate.fact.research}/${
+      gate.gap.research
+    }, own=${gate.own.research}, academy=${gate.academy.research}, held=${gate.held.research}, noProvider=${
+      gateNoProvider.research
+    }, off=${gateSearchOff.research}, blindChain=${
+      chainBlind.calls
+    }, refused=${blindOnlyRefused}, cited=${(searchedAcrossChain.sources?.length ?? 0)}/${
+      (citedRw.match(/https/g) || []).length
+    }, turn=${searchedTurn.result.modelUsed}, calls=${searchedTurn.calls.length}, trace=${
+      researchTrace ? 'recorded' : 'missing'
+    }`,
+    durationMs: Date.now() - t48Start,
+  });
+
+  // Test 49: the category the person asked in is decided, not only matched.
+  const t49Start = Date.now();
+  const routingOkUnit =
+    parseAgentChoice('STUDY_TUTOR') === 'STUDY_TUTOR' &&
+    parseAgentChoice(' study tutor ') === 'STUDY_TUTOR' &&
+    parseAgentChoice({ agent: 'CAREER_ASSISTANT' }) === 'CAREER_ASSISTANT' &&
+    parseAgentChoice({ agentType: 'image studio' }) === 'IMAGE_STUDIO' &&
+    parseAgentChoice({ agent: 'MOTIVATIONAL_SPEAKER' }) === null &&
+    parseAgentChoice('') === null &&
+    !needsAgentClassification({
+      currentText: 'Muraho',
+      serviceAgentType: null,
+      keywordMatches: 0,
+      currentAgentType: 'JOB_FINDER',
+      replyLang: 'KINYARWANDA',
+    }) &&
+    !needsAgentClassification({
+      currentText: 'Sobanurira ikizamini cyanjye',
+      serviceAgentType: null,
+      keywordMatches: 1,
+      currentAgentType: 'STUDY_TUTOR',
+      replyLang: 'ENGLISH',
+    }) &&
+    !needsAgentClassification({
+      currentText: 'Ndashaka akazi ko kure',
+      serviceAgentType: 'JOB_FINDER',
+      keywordMatches: 0,
+      currentAgentType: 'JOB_FINDER',
+      replyLang: 'KINYARWANDA',
+    }) &&
+    !needsAgentClassification({
+      currentText: 'Nshaka gusubira mu kizamini cyanjye',
+      serviceAgentType: null,
+      keywordMatches: 0,
+      currentAgentType: 'ROAD_SAFETY_ACADEMY',
+      replyLang: 'KINYARWANDA',
+    }) &&
+    needsAgentClassification({
+      currentText: 'Ndashaka akazi ko gukora code',
+      serviceAgentType: null,
+      keywordMatches: 2,
+      currentAgentType: 'CODING_AGENT',
+      replyLang: 'KINYARWANDA',
+    }) &&
+    needsAgentClassification({
+      currentText: 'What should I do to get ready this weekend?',
+      serviceAgentType: null,
+      keywordMatches: 0,
+      currentAgentType: 'JOB_FINDER',
+      replyLang: 'ENGLISH',
+    });
+
+  const routeUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 83).slice(-8)}`, 'Suite Routed User');
+  const routeConv = repo.getOrCreateConversation(routeUser.id);
+  const modelRouted = await runWithStubbedOpenAi({
+    respond: (call) =>
+      call.json
+        ? { content: call.system.includes('classify one WhatsApp message') ? '{"agent":"CAREER_ASSISTANT"}' : '{"facts":{}}' }
+        : { content: 'Here is how to prepare: bring your CV, rehearse three stories, ask about the team.' },
+    then: async (calls) => {
+      const result = await executeAgent(
+        repo.getUserById(routeUser.id)!,
+        repo.getConversationById(routeConv.id)!,
+        'What should I do to get ready this weekend?',
+        { replyLang: 'ENGLISH' }
+      );
+      return { result, calls };
+    },
+  });
+  const routeTrace = modelRouted.result.toolCalls.find((t) => t.name === 'classify_category');
+  const classifyCall = modelRouted.calls.find((c) => c.system.includes('classify one WhatsApp message'));
+
+  const nonsenseUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 84).slice(-8)}`, 'Suite Kept User');
+  const nonsenseConv = repo.getOrCreateConversation(nonsenseUser.id);
+  const nonsenseRouted = await runWithStubbedOpenAi({
+    respond: (call) =>
+      call.json
+        ? {
+            content: call.system.includes('classify one WhatsApp message')
+              ? '{"agent":"MOTIVATIONAL_SPEAKER"}'
+              : '{"facts":{}}',
+          }
+        : { content: 'A kept answer from the keyword agent that already had this turn.' },
+    then: () =>
+      executeAgent(
+        repo.getUserById(nonsenseUser.id)!,
+        repo.getConversationById(nonsenseConv.id)!,
+        'What should I do to get ready this weekend?',
+        { replyLang: 'ENGLISH' }
+      ),
+  });
+
+  const routingOk =
+    routingOkUnit &&
+    classifyIntent('What should I do to get ready this weekend?').matches === 0 &&
+    classifyIntent('Ndashaka akazi ko gukora code').matches === 2 &&
+    modelRouted.result.agentType === 'CAREER_ASSISTANT' &&
+    modelRouted.result.intent === 'MODEL_ROUTED:CAREER_ASSISTANT' &&
+    repo.getConversationById(routeConv.id)?.lastAgent === 'CAREER_ASSISTANT' &&
+    routeTrace?.name === 'classify_category' &&
+    JSON.stringify(routeTrace?.result).includes('CAREER_ASSISTANT') &&
+    classifyCall?.json === true &&
+    classifyCall?.temperature === 0 &&
+    nonsenseRouted.agentType === 'JOB_FINDER' &&
+    nonsenseRouted.intent === 'GENERAL_ASSISTANCE' &&
+    JSON.stringify(nonsenseRouted.toolCalls.find((t) => t.name === 'classify_category')?.result).includes('none');
+
+  results.push({
+    id: 'test-agent-category-decided-not-only-matched',
+    category: 'AI Orchestrator',
+    name: 'An Unclear Message Is Classified Into A Real Category, A Fake One Is Refused',
+    passed: routingOk,
+    expected:
+      'a free-text message whose words match nothing or match two ways gets one model call that must name one of the eight agents this build has; a menu pick, a short reply, a confident keyword and the academy are never re-routed; a category that does not exist keeps the deterministic routing and is recorded',
+    actual: `unit=${routingOkUnit}, matched=${classifyIntent('What should I do to get ready this weekend?').matches}/${
+      classifyIntent('Ndashaka akazi ko gukora code').matches
+    }, routed=${modelRouted.result.agentType}/${
+      modelRouted.result.intent
+    }, json=${classifyCall?.json}/${classifyCall?.temperature}, nonsenseKept=${nonsenseRouted.agentType}`,
+    durationMs: Date.now() - t49Start,
+  });
+
+  // Test 50: each person is remembered, and remembered apart from everyone else.
+  const t50Start = Date.now();
+  const factShape = parseFacts(
+    {
+      district: 'Huye',
+      password: 'supersecretpassword',
+      phone: '0788123456',
+      api_key: 'sk-abcdefghijkl1234',
+      'My Trade': '  plumbing   and  tiles ',
+      longvalue: 'y'.repeat(300),
+      tiny: 'a',
+      extra: 'should be cut by the per-turn cap',
+    },
+    {}
+  );
+  const existingFifteen = Object.fromEntries(Array.from({ length: 15 }, (_, i) => [`key${i}`, `value${i}`]));
+  const merged = mergeMemories(existingFifteen, { key14: 'replaced', newest: 'Huye' });
+  const memoryUnitOk =
+    factShape.district === 'Huye' &&
+    factShape.my_trade === 'plumbing and tiles' &&
+    !('password' in factShape) &&
+    !('phone' in factShape) &&
+    !('api_key' in factShape) &&
+    !('tiny' in factShape) &&
+    Object.keys(factShape).length <= MEMORY_LIMITS.MAX_FACTS_PER_TURN &&
+    (factShape.longvalue?.length ?? 0) <= MEMORY_LIMITS.MAX_VALUE_CHARS &&
+    Object.keys(merged).length === MEMORY_LIMITS.MAX_FACTS_TOTAL &&
+    merged.key14 === 'replaced' &&
+    merged.newest === 'Huye' &&
+    parseFacts('not json at all', {}).district === undefined &&
+    parseFacts([{ district: 'Kigali' }], {}).district === undefined &&
+    shouldExtractMemories('4') === false &&
+    shouldExtractMemories('Ndashaka akazi') === false &&
+    shouldExtractMemories('Nitwa Eric, ndi i Huye kandi nkora ububaji') === true &&
+    shouldExtractMemories('Nitwa Eric, ndi i Huye kandi nkora ububaji', {
+      AI_MEMORY_EXTRACT: 'off',
+    } as unknown as NodeJS.ProcessEnv) === false &&
+    memoryExtractionEnabled({} as NodeJS.ProcessEnv) === true &&
+    memoryExtractionEnabled({ AI_MEMORY_EXTRACT: 'false' } as unknown as NodeJS.ProcessEnv) === false;
+
+  const memoryUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 85).slice(-8)}`, 'Suite Remembered User');
+  const memoryConv = repo.getOrCreateConversation(memoryUser.id);
+  const otherUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 86).slice(-8)}`, 'Suite Stranger User');
+  const otherConv = repo.getOrCreateConversation(otherUser.id);
+  const memoryTurn = await runWithStubbedOpenAi({
+    respond: (call) =>
+      call.json
+        ? {
+            content: call.system.includes('durable facts')
+              ? '{"facts":{"district":"Huye","trade":"plumbing","phone_number":"0788123456"}}'
+              : '{"facts":{}}',
+          }
+        : { content: 'Reka tubanze turebe amategeko y\'imibare, hanyuma dukore umwitozo muto.' },
+    then: () =>
+      executeAgent(
+        repo.getUserById(memoryUser.id)!,
+        repo.getConversationById(memoryConv.id)!,
+        'Nkwifuza uvuze ku isomo: nitwa Eric, ndi i Huye, umwuga wanjye ni ububaji',
+        { replyLang: 'KINYARWANDA' }
+      ),
+  });
+  const remembered = repo.getConversationById(memoryConv.id)?.memories ?? {};
+  const ownSnapshot = buildPlatformContext({
+    user: repo.getUserById(memoryUser.id)!,
+    conversation: repo.getConversationById(memoryConv.id)!,
+    agentType: 'STUDY_TUTOR',
+    replyLang: 'KINYARWANDA',
+    currentText: 'wakomeza',
+  }).parts.join('\n');
+  const strangerSnapshot = buildPlatformContext({
+    user: repo.getUserById(otherUser.id)!,
+    conversation: repo.getConversationById(otherConv.id)!,
+    agentType: 'STUDY_TUTOR',
+    replyLang: 'KINYARWANDA',
+    currentText: 'wakomeza',
+  }).parts.join('\n');
+  const memoryTrace = memoryTurn.toolCalls.find((t) => t.name === 'remember_person_facts');
+
+  const memoryOk =
+    memoryUnitOk &&
+    remembered.district === 'Huye' &&
+    remembered.trade === 'plumbing' &&
+    !('phone_number' in remembered) &&
+    memoryTrace?.name === 'remember_person_facts' &&
+    JSON.stringify(memoryTrace?.result).includes('district') &&
+    ownSnapshot.includes('Remembered notes about this person') &&
+    ownSnapshot.includes('district=Huye') &&
+    !strangerSnapshot.includes('district=Huye') &&
+    !strangerSnapshot.includes('plumbing');
+
+  results.push({
+    id: 'test-agent-remembers-each-person-apart',
+    category: 'AI Orchestrator',
+    name: 'Durable Facts About A Person Are Kept And Never Shared',
+    passed: memoryOk,
+    expected:
+      'a substantive answered turn writes validated facts into that conversation\'s own memory — secret-looking keys, long digit strings and over-long values are refused, four per turn and sixteen per person — and the next turn reads them back for this person only, while another person\'s snapshot never contains them',
+    actual: `unit=${memoryUnitOk}, stored=${Object.keys(remembered).join(',')||'none'}, refused=${
+      'phone_number' in remembered ? 'leaked' : 'no secret'
+    }, trace=${memoryTrace ? 'recorded' : 'missing'}, own=${ownSnapshot.includes(
+      'district=Huye'
+    )}, strangerLeak=${strangerSnapshot.includes('district=Huye')}, cap=${Object.keys(merged).length}`,
+    durationMs: Date.now() - t50Start,
+  });
+
+  // Test 51: the same question must not earn the same answer twice.
+  const t51Start = Date.now();
+  const sameAnswer =
+    'Aguka AI can build your CV, prepare interview answers and search verified listings for you today.';
+  const differentAnswer =
+    'Dufite ibikorwa bitatu: gufasha guimpuzamagambo ya CV, kwitegura ikiganiro, no gushaka imirimo yemejwe.';
+  const varietyUnitOk =
+    similarity(sameAnswer, sameAnswer) === 1 &&
+    similarity(sameAnswer, differentAnswer) < REPEAT_THRESHOLD &&
+    isRepeatOf(sameAnswer, [differentAnswer, 'totally unrelated sentence about rainfall in Musanze']) === false &&
+    isRepeatOf(sameAnswer, [sameAnswer]) === true &&
+    recentAssistantReplies([
+      { role: 'USER', content: sameAnswer },
+      { role: 'ASSISTANT', content: 'short' },
+      { role: 'ASSISTANT', content: sameAnswer },
+      { role: 'ASSISTANT', content: differentAnswer },
+    ]).join('|') === `${sameAnswer}|${differentAnswer}` &&
+    pickWindow([1, 2, 3], 5, 0).join() === '1,2,3' &&
+    pickWindow<number>([], 5, 3).length === 0 &&
+    pickWindow([1, 2, 3, 4, 5, 6, 7], 5, 0).join() === '1,2,3,4,5' &&
+    pickWindow([1, 2, 3, 4, 5, 6, 7], 5, 2).join() === '3,4,5,6,7' &&
+    pickWindow([1, 2, 3, 4, 5, 6, 7], 5, 6).join() === '7,1,2,3,4' &&
+    Object.keys(SAMPLING_BY_AGENT).length === 8 &&
+    SAMPLING_BY_AGENT.ROAD_SAFETY_ACADEMY <= SAMPLING_BY_AGENT.STUDY_TUTOR &&
+    SAMPLING_BY_AGENT.CAREER_ASSISTANT >= 0.7 &&
+    REWRITE_INSTRUCTION.includes('must stay exactly as they were');
+
+  const repeatUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 87).slice(-8)}`, 'Suite Repeat User');
+  const repeatConv = repo.getOrCreateConversation(repeatUser.id);
+  repo.addMessage(repeatConv.id, { role: 'ASSISTANT', type: 'TEXT', content: sameAnswer });
+  const rewordedTurn = await runWithStubbedOpenAi({
+    respond: (call) =>
+      call.json
+        ? { content: '{"facts":{}}' }
+        : { content: call.prompt.includes('What you already answered') ? differentAnswer : sameAnswer },
+    then: async (calls) => {
+      const result = await executeAgent(
+        repo.getUserById(repeatUser.id)!,
+        repo.getConversationById(repeatConv.id)!,
+        'Sobanurira umunyeshuri ibijyanye n\'imibare yo mu ishuri',
+        { replyLang: 'ENGLISH' }
+      );
+      return { result, calls };
+    },
+  });
+  const rewriteTrace = rewordedTurn.result.toolCalls.find((t) => t.name === 'rewrite_repeat');
+
+  const stuckUser = repo.getOrCreateUserByPhone(`+2507${String(suiteStamp + 88).slice(-8)}`, 'Suite Stuck User');
+  const stuckConv = repo.getOrCreateConversation(stuckUser.id);
+  repo.addMessage(stuckConv.id, { role: 'ASSISTANT', type: 'TEXT', content: sameAnswer });
+  const stuckTurn = await runWithStubbedOpenAi({
+    respond: (call) => (call.json ? { content: '{"facts":{}}' } : { content: sameAnswer }),
+    then: async (calls) => {
+      const result = await executeAgent(
+        repo.getUserById(stuckUser.id)!,
+        repo.getConversationById(stuckConv.id)!,
+        'Sobanurira umunyeshuri ibijyanye n\'imibare yo mu ishuri',
+        { replyLang: 'ENGLISH' }
+      );
+      return { result, calls };
+    },
+  });
+
+  const varietyOk =
+    varietyUnitOk &&
+    rewordedTurn.result.replyText === differentAnswer &&
+    rewordedTurn.result.modelUsed.includes('(reworded)') &&
+    rewriteTrace?.name === 'rewrite_repeat' &&
+    JSON.stringify(rewriteTrace?.result).includes('"reworded":true') &&
+    rewordedTurn.calls.some((c) => c.prompt.includes('What you already answered') && c.prompt.includes(sameAnswer)) &&
+    rewordedTurn.calls.some((c) => c.temperature === SAMPLING_BY_AGENT.STUDY_TUTOR) &&
+    stuckTurn.result.replyText.startsWith(sameAnswer) &&
+    JSON.stringify(stuckTurn.result.toolCalls.find((t) => t.name === 'rewrite_repeat')?.result).includes('"reworded":false') &&
+    stuckTurn.calls.length === 3;
+
+  results.push({
+    id: 'test-agent-does-not-answer-the-same-twice',
+    category: 'AI Orchestrator',
+    name: 'A Reply That Repeats The Person\'s Own History Is Rewritten Once',
+    passed: varietyOk,
+    expected:
+      'each agent answers at its own sampling temperature, the stored listings shown rotate as the conversation goes on instead of repeating five rows forever, and a reply whose wording matches what this person already saw is re-asked exactly once with the facts held still — if it still repeats, the first answer is kept rather than an error',
+    actual: `threshold=${REPEAT_THRESHOLD}, windows=${pickWindow(
+      [1, 2, 3, 4, 5, 6, 7],
+      5,
+      6
+    ).join()}|${pickWindow([1, 2, 3, 4, 5, 6, 7], 5, 2).join()}, unit=${varietyUnitOk}, rewrite=${
+      rewordedTurn.result.modelUsed
+    }, calls=${rewordedTurn.calls.length}/${stuckTurn.calls.length}, stuck=${
+      stuckTurn.result.replyText === sameAnswer ? 'kept' : 'changed'
+    }`,
+    durationMs: Date.now() - t51Start,
   });
 
   const passedCount = results.filter((r) => r.passed).length;

@@ -45,6 +45,7 @@ import { getQueueRuntimeSnapshot } from '@/lib/queue/status';
 import { resolveImageCapability } from '@/lib/images/provider';
 import { imageRetentionDays, passportHeightPx, passportWidthPx } from '@/lib/images/spec';
 import { chainSummary } from '@/lib/ai/provider-adapter';
+import { memoryExtractionEnabled } from '@/lib/ai/memory';
 import { questionFingerprint } from '@/lib/road-safety/text-analysis';
 import {
   DEFAULT_ROAD_SAFETY_SETTINGS,
@@ -476,6 +477,19 @@ class AppRepository implements Persistable {
       conv.lastAgent = agent;
       conv.updatedAt = new Date().toISOString();
     }
+  }
+
+  /**
+   * Durable notes about this person, kept on their own conversation and read back
+   * into every later prompt. Merged through the caller's cap so one long-running
+   * account cannot grow the map without bound.
+   */
+  rememberInConversation(conversationId: string, facts: Record<string, string>): Conversation | undefined {
+    const conv = this.getConversationById(conversationId);
+    if (!conv) return undefined;
+    conv.memories = { ...(conv.memories || {}), ...facts };
+    conv.updatedAt = new Date().toISOString();
+    return conv;
   }
 
   updateConversation(
@@ -1146,6 +1160,7 @@ class AppRepository implements Persistable {
     const persistence = durableStore.status;
     const prisma = detectPrismaReadiness();
     const queue = getQueueRuntimeSnapshot();
+    const chain = chainSummary();
 
     return {
       status: isWaConfigured && isGeminiConfigured && isSignatureEnforced ? 'OPTIMAL' : 'DEGRADED',
@@ -1178,17 +1193,24 @@ class AppRepository implements Persistable {
         model: GEMINI_MODEL,
         bilingualKinyarwandaSupport: true,
       },
-      textChain: (() => {
-        const chain = chainSummary();
-        return {
-          configured: chain.configured,
-          order: chain.order,
-          /** False means one provider outage ends the reply — the rescue key is not set. */
-          rescueConfigured: chain.rescueConfigured,
-          attemptsPerProvider: chain.attemptsPerProvider,
-          budgetMs: chain.budgetMs,
-        };
-      })(),
+      textChain: {
+        configured: chain.configured,
+        order: chain.order,
+        /** False means one provider outage ends the reply — the rescue key is not set. */
+        rescueConfigured: chain.rescueConfigured,
+        attemptsPerProvider: chain.attemptsPerProvider,
+        budgetMs: chain.budgetMs,
+      },
+      reasoning: {
+        webSearchConfigured: chain.webSearchConfigured,
+        webSearchProvider: chain.webSearchProvider,
+        // The flag alone would claim memory on a server with no model to write it with.
+        memoryExtraction: memoryExtractionEnabled() && chain.configured,
+        // Both of these ask the model something, so without a provider they are
+        // reported as off rather than as a capability the server does not have.
+        categoryRouting: chain.configured,
+        repeatRewrite: chain.configured,
+      },
       imageStudio: (() => {
         const capability = resolveImageCapability();
         return {

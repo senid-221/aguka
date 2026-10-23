@@ -8,7 +8,7 @@
 - **Ingress**: WhatsApp Mobile User ➔ Meta Cloud API Webhook ➔ Next.js Gateway
 - **Reliability & Queue**: BullMQ on Redis whenever `REDIS_URL` resolves to a real endpoint; the same
   job handlers run in this process when it does not, and `/api/health` reports which engine is live
-- **AI Orchestrator**: Bilingual Router with Kinyarwanda & English detection, Gemini model selection (`GEMINI_MODEL`, default `gemini-2.5-flash`), prompt-injection shielding, secret redaction, and two real tool calls (`search_verified_jobs`, `query_talent_marketplace`)
+- **AI Orchestrator**: Bilingual Router with Kinyarwanda & English detection, Gemini model selection (`GEMINI_MODEL`, default `gemini-2.5-flash`), prompt-injection shielding, secret redaction, and a whole-backend data snapshot (`lib/ai/platform-context.ts`) read from the store on every turn — see 2.1
 - **Core Modules**:
   1. **Job Finder**: Job in Rwanda cards and We Work Remotely category feeds are crawled for real; MIFOTRA publishes no readable feed, so the crawl reports that reason instead of inventing listings (see 5.3). The pool starts empty until a crawl runs.
   2. **Career Assistant**: bilingual CV, cover letter and interview-prep text from the model; explicit application consent required
@@ -44,6 +44,38 @@ after payment. `isFree` or `chargeEnabled = false` means the service is never bl
 **Enable charging.** Services & Pricing screen, or `PATCH /api/admin/services` with
 `{ "code": "ROAD_SAFETY", "chargeEnabled": true, "price": 5000, "currency": "RWF", "billingPeriod": "MONTHLY", "trialHours": 24 }`.
 Pricing is validated server-side (`validatePricing`) and every change is written to the audit trail.
+
+**Receipts and "typing…".** `beginWhatsAppTyping()` in `lib/whatsapp/gateway.ts` is the first thing the
+webhook does with an inbound message, before the catalogue, entitlement or model work: it sends
+`status: read` for that `wamid` together with a `typing_indicator` of type `text`, then repeats the
+indicator every 20 seconds because Meta dismisses it after roughly 25. `stop()` clears the heartbeat as
+soon as the reply goes out or the turn throws. Typing indicators need Graph v22.0 or newer, so
+`whatsappGraphVersion()` defaults to `v23.0`, honours `WHATSAPP_GRAPH_VERSION`, and falls back to the
+default if you set a malformed value rather than building a broken URL. With no credentials configured,
+no HTTP request is made at all and the result reads `NOT_CONFIGURED`; if Meta rejects the call, the
+reason is logged as `WHATSAPP_PRESENCE_FAILED` and never thrown — a broken token costs the ticks, not
+the answer. **Not yet proven from this repository:** the payload is asserted against a stubbed
+transport, never a live number, so confirm both effects on your own test number before relying on them.
+
+### 2.1 Grounding: what the model is allowed to know
+
+An agent turn is grounded in `buildPlatformContext()`, which reads seven blocks straight from the store
+and records each as a tool call: the live service catalogue plus this deployment's runtime facts
+(provider chain order, whether WhatsApp and the studio are configured, the manual-payment rule), the
+person's own account, entitlement and latest payment order, verified listings with board health, the
+talent marketplace (titles and districts only — never another person's name or phone), this person's own
+study, coding and photo rows, road-safety published-content totals with this learner's own progress and
+open paper, and the last six messages of this conversation plus its stored memories.
+
+Before this, `executeAgent` assembled platform data for only three of the eight agent types, so a
+tutoring, coding or career turn reached the model with an empty data block and no conversation history —
+which is exactly why it could say "I don't have that" about a service, a listing or a photo that was
+really on the board. `PLATFORM_DATA_RULES` is appended to the system prompt with it: the snapshot is the
+only source of facts, a section that says NONE or NOT CONFIGURED must be reported plainly with the
+nearest thing that does exist offered instead, and nothing — service, employer, salary, price, lesson or
+record — may be invented. Per-user isolation is enforced in code by filtering on `userId`, because
+`getStudySessions()`, `getCodingTasks()` and `getMediaTasks()` return every user's
+rows. Test `test-agent-grounded-in-whole-backend` asserts a second person's project never appears.
 
 ---
 
@@ -193,7 +225,17 @@ unlocks only on an identified confirmation of a receipt.
      - **Verify Token**: any random string you choose, set identically as `WHATSAPP_VERIFY_TOKEN`.
        The code ships no default, so the handshake is rejected until you set it.
    - Subscribe to the **`messages`** webhook field.
-5. **Interactive Testing Without Credentials**:
+5. **Read Receipts and the Typing Indicator**: the gateway answers every inbound `wamid` with
+   `status: read` plus a `typing_indicator` before it starts the slow work, refreshed every 20 seconds
+   while the agent reads the store and generates. Meta requires Graph **v22.0 or newer** for the
+   indicator, which is why `whatsappGraphVersion()` defaults to `v23.0`; override it with
+   `WHATSAPP_GRAPH_VERSION` if your app pins another version, and note that a malformed value silently
+   falls back to the default instead of building a broken URL. Failure is never fatal: with no
+   credentials the call is skipped and reported `NOT_CONFIGURED`, and a Meta rejection logs
+   `WHATSAPP_PRESENCE_FAILED` with the provider's own reason while the person still receives the
+   answer. Send a message to your test number and confirm both effects visually — this repository has
+   only ever asserted the payload against a stubbed transport, never a live number.
+6. **Interactive Testing Without Credentials**:
    - The **WhatsApp Simulator** screen runs a message through the real router, security checks and AI
      call path locally and shows the payload it *would* send. It never dispatches to Meta or to a
      phone number, and the delivery result is labelled `dispatched: false`.
@@ -274,6 +316,79 @@ the keys that are actually set, so fixing the environment takes effect without a
   the `.env.example` placeholder, which is rejected on purpose.
 - **Cost.** Gemini carries the traffic; OpenAI is only billed for the replies Gemini could
   not give, which is also the record of how often the primary is failing.
+
+---
+
+### 5.2b Research, categories, memory and variety
+
+Four layers sit between the router and the chain. Each is a server-side gate, not a line in a
+system prompt: a model that is merely *asked* to look something up, to vary its wording or to
+remember a person either does not, or claims it did.
+
+**`lib/ai/research.ts` — when a turn is searched.** `needsWebSearch()` reads the message and the
+live snapshot and returns a decision with a stated reason, recorded on the agent run as the
+`web_research` tool trace:
+
+| Message | Decision | Why |
+| --- | --- | --- |
+| "search google for the price of petrol", "shakisha kuri interineti…" | search | the person asked for a live lookup |
+| "what is the exchange rate today", "igiciro cya…", "angana iki" | search | the answer changes, so a stored one goes stale |
+| "ndashaka akazi" while the snapshot says `Verified listings: NONE` | search | the platform genuinely has nothing to offer |
+| "how does **my cv** look", "ikizamini **cyanjye**" | store | it is this person's own record, which the store holds |
+| any Road Safety Academy turn | store | a traffic rule may only come from the verified registry — a page stating a wrong limit is worse than no answer |
+| anything else | store | the platform data already answers it |
+
+A searched turn is handed only to a provider that can browse: Gemini with `google_search`
+grounding, or OpenAI when `OPENAI_SEARCH_MODEL` names a search-capable model. The other is
+skipped with `skipped — no web search capability` in the attempt log rather than answering from
+memory and calling it research. The pages the provider actually read are printed after the answer
+as `Sources:` / `Inkomoko:` (three at most, URLs exactly as returned). If the lookup was asked for
+and failed, the reply carries `SEARCH_UNAVAILABLE` — the store-only answer is labelled, never
+presented as researched. `AI_WEB_SEARCH=false` switches lookups off; Google bills per search, so
+this is the cost control, and ordinary replies are unaffected.
+
+**`lib/ai/intent.ts` — which agent answers.** `classifyIntent()` matches words, and words lie:
+"API" appears in a CV question, and a person who picked Find Jobs can still ask about fractions.
+When the words match nothing or match two categories at once, one model call names the category —
+accepted only if it is one of the eight agents this build has. A menu pick (the person already
+named their category, and was charged for it), a reply shorter than eight characters, a confident
+single keyword match and the academy (an open exam paper is stateful) are never re-routed. Any
+failure — a bad JSON body, a timeout, a category that does not exist — keeps the keyword routing
+and is recorded in the `classify_category` trace.
+
+**`lib/ai/memory.ts` — what is remembered.** After an answered turn, one small JSON call writes
+durable facts into that conversation's own memory map, which `platform-context.ts` reads back into
+every later prompt. Keys are normalised to `snake_case`; secret-looking keys, values containing
+7+ consecutive digits (phone, ID, card), values over 120 characters, and anything the person has
+already told are refused. Four facts per turn, sixteen per person, oldest dropped first. It lives
+per conversation, so one learner's notes cannot appear in another's prompt. Nothing is remembered
+from a failed turn, and `AI_MEMORY_EXTRACT=false` stops the call.
+
+**`lib/ai/variety.ts` — why the same question gets a different answer.** Each agent answers at its
+own sampling temperature (0.3 for the academy, where facts must not improvise, up to 0.85 for
+career coaching). The verified listings put in front of the model rotate with the conversation
+instead of showing the same five rows while forty more sit in the store — the offset is the count
+of stored assistant replies, so it needs no extra state and survives a restart. Finally the reply
+is compared with the last two answers this person saw: at 0.72 word overlap or more the turn is
+re-asked once with the earlier answer shown and the facts pinned. If the second attempt still
+matches, or fails, the first answer is kept — the same good reply beats an error message.
+
+- **Latency.** A single message can now make up to four model calls (classify, answer, rewrite,
+  remember). They are sequential and each is inside the chain's own budget, and the typing
+  indicator is refreshed every 20 seconds while they run. In practice the extra calls are rare:
+  a menu pick skips classification, a searched turn is only searched when the gate says so, and
+  the rewrite fires only on a genuine near-duplicate. If replies start feeling slow, set
+  `AI_MEMORY_EXTRACT=false` first — it is the only one that runs on every substantive turn.
+- **Where to look.** `/api/health` and `/api/ready` report `reasoning`
+  (`webSearchConfigured`, `webSearchProvider`, `memoryExtraction`, `categoryRouting`,
+  `repeatRewrite`), the Settings screen shows them as the *Research, Routing & Memory* panel, and
+  every layer leaves a named tool trace on the agent run in the Agents screen. The capability
+  snapshot also tells the model whether search exists on this server, so it cannot promise a
+  lookup it cannot perform.
+- **Not proven from this machine.** The tests drive all four layers through a stubbed transport.
+  No Google search, memory write or rewrite has ever been billed here, because no provider key is
+  set. Before relying on them, send one question that needs a lookup, one that states a fact about
+  yourself, and the same request twice in a row, and check the three traces on the Agents screen.
 
 ---
 
@@ -463,6 +578,16 @@ Tests verified:
   with the expired posting marked `EXPIRED` and excluded from the active count; a board with no public feed
   reporting its reason, storing nothing and flipping to a real crawl once `JOB_FEED_URL_<CODE>` is set; a
   board answering 500 storing nothing; and a row with no `sourceUrl` refused by the zero-hallucination gate
+- Read receipt and typing indicator against a stubbed transport (no request leaves the machine): the
+  payload carries `status: read` for the inbound `wamid` with a `typing_indicator` of type `text`; the
+  Graph version is at least v22.0, honours `WHATSAPP_GRAPH_VERSION` and falls back on a malformed value;
+  with no credentials both calls answer `NOT_CONFIGURED` and make zero HTTP requests; a live call posts
+  to the phone number ID; a Meta rejection returns a failure with its reason and never throws; the
+  heartbeat interval stays inside Meta's ~25-second dismissal window
+- Whole-backend grounding: an ordinary tutoring turn sees the live catalogue, runtime capability facts,
+  board health, verified listings, road-safety totals, this person's own study and coding rows and the
+  recent conversation — while a second person's coding project never appears in the same snapshot, and
+  the shared rules forbid claiming the platform has nothing when the snapshot lists something
 
 ---
 
@@ -501,12 +626,12 @@ place.
 
 ### Going live checklist
 1. Admin login works (`ADMIN_JWT_SECRET` + credentials) and every `/api/admin/*` route rejects a request with no token. So does each console data route — `/api/users`, `/api/conversations`, `/api/media`, `/api/marketplace`, `/api/jobs`, `/api/agents`, `/api/coding`, `/api/study`, `/api/tests`, `/api/whatsapp/simulate` — on every verb; check one with `curl` before you trust the dashboard.
-2. `WHATSAPP_APP_SECRET` set, so unsigned webhooks are rejected; Meta handshake verified with your own `WHATSAPP_VERIFY_TOKEN`.
+2. `WHATSAPP_APP_SECRET` set, so unsigned webhooks are rejected; Meta handshake verified with your own `WHATSAPP_VERIFY_TOKEN`. Send a test message and confirm the two blue ticks and the "typing…" indicator actually appear on the phone — the suite only proves the payload shape, never Meta's rendering of it, and the indicator needs `WHATSAPP_GRAPH_VERSION` at v22.0 or newer.
 3. Services & Pricing reviewed: `chargeEnabled`, price, currency, billing period, trial hours and usage caps per service; nothing bills a person until you switch it on.
 4. Menu order and visibility confirmed by sending a first message to the number.
 5. `MOMO_PAYEE_CODE` receives money; `PAYMENT_WEBHOOK_SECRET` shared with the provider; review queue exercised end to end (order → proof → verify → access → expiry → payment → re-access).
 6. Road safety citations re-checked against the current gazette and `REVIEW_DATE` updated.
-7. `/api/ready` and `/api/health` green, `npm test` at 35/35, and `AGUKA_DATA_DIR` on a backed-up volume.
+7. `/api/ready` and `/api/health` green, `npm test` at 51/51, and `AGUKA_DATA_DIR` on a backed-up volume.
 8. If scheduled jobs matter to you: `REDIS_URL` resolves (the health endpoint names the engine), the
    worker runs somewhere always-on, and `QUEUE_INLINE_WORKER=false` on serverless so a frozen function
    cannot hold a half-finished job.
