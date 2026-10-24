@@ -66,7 +66,14 @@ export async function GET() {
         retentionDays: systemHealth.imageStudio.retentionDays,
       },
       jobDiscovery: {
-        status: configResult.config.jobs.crawlIntervalMinutes > 0 ? 'SCHEDULED' : 'MANUAL_ONLY',
+        // With no worker process on a serverless host, ON_DEMAND says the pool is still
+        // filled by the turn that needs it rather than left empty until an admin clicks.
+        status:
+          configResult.config.jobs.crawlIntervalMinutes > 0
+            ? 'SCHEDULED'
+            : configResult.config.jobs.onDemandCrawl
+              ? 'ON_DEMAND'
+              : 'MANUAL_ONLY',
         ...configResult.config.jobs,
         // What each board last actually returned: the interval is a setting, this is the proof.
         boards: repo.getSources().map((source) => ({

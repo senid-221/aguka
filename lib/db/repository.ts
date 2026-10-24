@@ -46,6 +46,7 @@ import { resolveImageCapability } from '@/lib/images/provider';
 import { imageRetentionDays, passportHeightPx, passportWidthPx } from '@/lib/images/spec';
 import { chainSummary } from '@/lib/ai/provider-adapter';
 import { memoryExtractionEnabled } from '@/lib/ai/memory';
+import { scoreListing, splitSearchTerms } from '@/lib/jobs/query';
 import { questionFingerprint } from '@/lib/road-safety/text-analysis';
 import {
   DEFAULT_ROAD_SAFETY_SETTINGS,
@@ -87,6 +88,12 @@ const KNOWN_JOB_SOURCES: JobSource[] = [
     activeListingsCount: 0,
   },
 ];
+
+function isListingActive(job: JobListing, now: number): boolean {
+  if (job.isExpired || job.verificationStatus === 'EXPIRED') return false;
+  const deadline = Date.parse(job.deadline || '');
+  return Number.isNaN(deadline) || deadline >= now;
+}
 
 /**
  * A question row may be written by the content pack, the admin editor or the generator.
@@ -155,7 +162,8 @@ function withExamDefaults(row: ExamTemplate): ExamTemplate {
 }
 
 // Singleton in-memory state store that persists across server requests
-class AppRepository implements Persistable {
+/** Exported for the suite: a check can build listings and query them without writing a single row into the live store. */
+export class AppRepository implements Persistable {
   private users: User[] = [];
   private jobSources: JobSource[] = [...KNOWN_JOB_SOURCES];
   private jobListings: JobListing[] = [];
@@ -261,30 +269,47 @@ class AppRepository implements Persistable {
     sourceCode?: string;
     isRemote?: boolean;
     verificationStatus?: string;
+    /**
+     * A closed vacancy is not a choice. Off by default because the admin screen
+     * has to keep seeing expired rows to clean them up.
+     */
+    activeOnly?: boolean;
   }): JobListing[] {
-    return this.jobListings.filter((job) => {
-      if (filter?.sourceCode && filter.sourceCode !== 'ALL') {
-        const source = this.jobSources.find((s) => s.code === filter.sourceCode);
-        if (source && job.sourceId !== source.id) return false;
-      }
+    const now = Date.now();
+    const terms = splitSearchTerms(filter?.keyword);
+    const source =
+      filter?.sourceCode && filter.sourceCode !== 'ALL'
+        ? this.jobSources.find((s) => s.code === filter.sourceCode)
+        : undefined;
+    // A board filter naming a code that does not exist used to be ignored, which
+    // showed every board's listings under one board's name.
+    if (filter?.sourceCode && filter.sourceCode !== 'ALL' && !source) return [];
+
+    const scored: Array<{ job: JobListing; score: number }> = [];
+    for (const job of this.jobListings) {
+      if (source && job.sourceId !== source.id) continue;
       if (filter?.isRemote !== undefined) {
         const isJobRemote = job.jobType === 'REMOTE' || job.location.toLowerCase().includes('remote');
-        if (filter.isRemote && !isJobRemote) return false;
+        if (filter.isRemote && !isJobRemote) continue;
       }
       if (filter?.verificationStatus && filter.verificationStatus !== 'ALL') {
-        if (job.verificationStatus !== filter.verificationStatus) return false;
+        if (job.verificationStatus !== filter.verificationStatus) continue;
       }
-      if (filter?.keyword) {
-        const q = filter.keyword.toLowerCase();
-        const matches =
-          job.title.toLowerCase().includes(q) ||
-          job.employer.toLowerCase().includes(q) ||
-          job.location.toLowerCase().includes(q) ||
-          job.tags.some((t) => t.toLowerCase().includes(q));
-        if (!matches) return false;
-      }
-      return true;
+      if (filter?.activeOnly && !isListingActive(job, now)) continue;
+
+      const score = terms.length > 0 ? scoreListing(job, terms) : 0;
+      if (score === null) continue;
+      scored.push({ job, score });
+    }
+
+    scored.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      const aDeadline = Date.parse(a.job.deadline || '') || Number.MAX_SAFE_INTEGER;
+      const bDeadline = Date.parse(b.job.deadline || '') || Number.MAX_SAFE_INTEGER;
+      if (aDeadline !== bDeadline) return aDeadline - bDeadline;
+      return Date.parse(b.job.discoveredAt || '') - Date.parse(a.job.discoveredAt || '');
     });
+    return scored.map((entry) => entry.job);
   }
 
   getJobById(id: string): JobListing | undefined {

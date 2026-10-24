@@ -558,3 +558,70 @@ because a model that is only *asked* to research, vary or remember either does n
   rewritten answer on a deployed server, and read the three traces on the Agents screen, before
   repeating this as working behaviour. A turn can also now make up to four sequential model calls, so
   latency on a slow provider is worth watching on a real number.
+
+## A job question that found nothing: words that match, and boards read when asked
+
+Reported from the deployed server: no verified listing appeared, and the search was not answering the
+words people typed. Two separate defects, one of them infrastructure.
+
+- Infrastructure: the store is a per-process memory pool backed by a JSON snapshot, and a serverless host
+  has neither a writable disk nor a worker process, so **every cold instance started with zero listings**.
+  The boards were readable; nobody had read them in that instance.
+- `lib/jobs/lazy-crawl.ts` (new) — `ensureJobListings()` runs the crawl inside the turn that needs the
+  pool, once per process: skipped when a crawl this fresh already left active verified listings, skipped
+  again until `JOB_ON_DEMAND_COOLDOWN_MS` (default 300000) has passed since an attempt, joined when an
+  attempt is already in flight, and waited on only until `JOB_ON_DEMAND_BUDGET_MS` (default 12000) so a
+  slow board cannot hold a reply hostage — boards that finished are stored and the rest keep reading. A
+  board's failure never reaches the person: the promise is caught, the outcome is `{ ran, reason, gained,
+  boardsRead, budgetHit }`, logged as `JOB_ON_DEMAND_CRAWL`, recorded on the agent run and returned to the
+  Jobs screen as `boardRead`. `JOB_ON_DEMAND_CRAWL=false` switches it off, and `/api/ready` reports
+  `ON_DEMAND` when the schedule is off but this is on.
+- `lib/ai/bilingual-router.ts` — step 5a, before the platform snapshot is built, so rows read this second
+  are in the answer this second. Triggered by `agentType === JOB_FINDER` or `wantsWork()` on the message,
+  and emits a `refresh_job_boards` tool trace with the plain-words reason.
+- `app/api/jobs/route.ts` — `GET` calls the same guard, which is why the dashboard stops showing an empty
+  table on a cold instance, and `POST { action: "CRAWL_ALL" }` adds the **Read All Boards** button beside
+  the per-board ones in `components/screens/jobs-screen.tsx`.
+- `lib/jobs/query.ts` (new) — the words of the message decide the answer. `splitSearchTerms()` cuts the
+  message into words, `INTENT_WORDS` drops the asking itself in both languages (`akazi`, `ndashaka`, `gukora`,
+  `muri`, `job`, `vacancy`), `termGroups()` attaches the English wordings a Kinyarwanda word is answered by
+  (`mudasobwa` → IT, software, developer, programmer) to **that word only**, so one question never demands all
+  five at once, `PLACE_WORDS` keeps Rwandan districts as places, `containsTerm()` requires a two- or
+  three-letter word to be the whole word (`it` must not answer "administration"), `scoreListing()` requires
+  **every** word to be answered somewhere and weights title 6, employer 4, tags 3, location/requirements 2,
+  description 1, and `selectListingsForQuery()` reports `no-words` / `every-word` / `one-word` /
+  `nothing-matched` so an unrelated pool is described as *the nearest open ones, not a match* instead of being
+  presented as answers.
+- `lib/db/repository.ts` — `getJobs()` uses it: an unknown `sourceCode` returns nothing instead of every
+  board, `activeOnly: true` hides what the board marked `EXPIRED`, what `isExpired` and what is past its
+  stated deadline, and the survivors are ranked by score, then soonest deadline, then newest. `AppRepository`
+  is exported so a check can query a private store without touching the live one.
+- `lib/ai/platform-context.ts` — `jobsBlock()` now narrows the pool with the message plus the remembered
+  facts about that person, asks only for active verified listings, and prints the matched/mismatched note
+  above instead of a silent list.
+- Tests: the suite is at 54. `test-jobs-search-answers-every-word`,
+  `test-jobs-search-excludes-closed-and-unknown-board` (a throwaway `new AppRepository()`, so no row is
+  written to the live store) and `test-jobs-boards-read-on-demand` (cold, cooldown, already-fresh,
+  switched-off and budget-exceeded paths). A job question can now make the process read the public boards,
+  so `runPlatformTestSuiteAsync()` pins `JOB_ON_DEMAND_CRAWL=false` for the whole run and resets the
+  process guards around it; a tripwire that replaced `globalThis.fetch` with a throwing stub counted
+  **zero** network attempts across all 54 checks. One bug the suite itself found: the budget timer was
+  `unref()`'d, so a crawl holding no socket let the process exit silently with the reply still waiting —
+  it is a ref'd timer cleared on settlement now, and `npm test` finished in 1.3s instead of never.
+- Proven here, against the real boards, in a throwaway data directory and a real browser: one cold process
+  read Job in Rwanda and We Work Remotely in 7.0s and stored **113 verified listings** (59 + 54, MIFOTRA
+  refused with its usual reason); opening the Jobs screen on a server with an empty store filled the table
+  with those 113 without anyone pressing a button; `Read All Boards` re-read both feeds and reported
+  `0 new and 113 already-known`, listing MIFOTRA as unreadable rather than as a healthy empty board; the
+  console box `developer kigali` returned the one Kigali developer posting, `mudasobwa` returned 26 IT and
+  software postings and `hydrography` returned the honest no-match row. Through the simulator's real inbound
+  pipeline, `Ndashaka akazi ka developer muri Kigali` routed to `JOB_FINDER` and recorded
+  `refresh_job_boards → 113 already stored from a crawl this fresh (4ms)` plus
+  `search_verified_jobs(words:["developer","kigali"], storedVerified:113, matched:1, mode:"every-word")`.
+- Still not proven, and not claimed: it has not run on the **deployed host**, and no model-written job reply
+  was produced here because this machine has no provider key — the turn ends at `not-configured` after the
+  tools have run. After deploying, ask one WhatsApp message for work, read `refresh_job_boards` and
+  `search_verified_jobs` on the Agents run, `JOB_ON_DEMAND_CRAWL` in the server log, and confirm the reply
+  itself quotes listings with working links before saying job search works in production. On a host with
+  `npm run worker` the on-demand path should never fire; if it does, the schedule is off or the store is not
+  durable.

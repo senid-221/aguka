@@ -35,6 +35,7 @@ interface JobsPayload {
   jobs: JobListing[];
   sources: JobSource[];
   crawl?: { crawlIntervalMinutes: number; maxListingsPerSource: number; feedOverrides: Record<string, string> };
+  boardRead?: { ran: boolean; reason: string; listings: number };
 }
 
 const STATUS_STYLE: Record<CrawlResult['status'], { chip: string; label: string }> = {
@@ -54,6 +55,8 @@ export function JobsScreen() {
   const [isRemoteOnly, setIsRemoteOnly] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [crawlingSource, setCrawlingSource] = useState<string | null>(null);
+  const [readingAll, setReadingAll] = useState(false);
+  const [boardRead, setBoardRead] = useState<JobsPayload['boardRead'] | null>(null);
   const [sourceNotice, setSourceNotice] = useState<{ kind: 'ok' | 'warn' | 'error'; text: string } | null>(null);
 
   // Starts and ends inside the promise callbacks: the effect below calls this on
@@ -70,6 +73,7 @@ export function JobsScreen() {
         setJobs(res.data.jobs || []);
         setSources(res.data.sources || []);
         setCrawlConfig(res.data.crawl || null);
+        setBoardRead(res.data.boardRead || null);
       })
       .catch((err) => console.error('Error fetching jobs:', err))
       .finally(() => setIsLoading(false));
@@ -118,6 +122,35 @@ export function JobsScreen() {
     loadJobs();
   };
 
+  const handleCrawlAll = async () => {
+    setReadingAll(true);
+    setSourceNotice(null);
+    const res = await adminFetch<{ result?: { stored: number; refreshed: number; unreadable: string[] } }>('/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'CRAWL_ALL' }),
+    });
+    setReadingAll(false);
+
+    if (res.unauthorized) {
+      setSourceNotice({ kind: 'error', text: 'Sign in as an administrator to read the boards.' });
+      return;
+    }
+    if (!res.data?.result) {
+      setSourceNotice({ kind: 'error', text: res.error || 'The board reading request returned no result.' });
+      loadJobs();
+      return;
+    }
+
+    const run = res.data.result;
+    setSourceNotice({
+      kind: run.stored + run.refreshed > 0 ? 'ok' : 'warn',
+      text: `${run.stored} new and ${run.refreshed} already-known listing(s) read from the boards${
+        run.unreadable.length ? `; unreadable: ${run.unreadable.join(', ')}` : ''
+      }.`,
+    });
+    loadJobs();
+  };
+
   return (
     <div className="p-4 sm:p-6 space-y-6">
       {/* Top Header */}
@@ -138,13 +171,24 @@ export function JobsScreen() {
           </p>
         </div>
 
-        <button
-          onClick={refreshListings}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 border border-zinc-700 transition-colors w-max"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
-          <span>Refresh Listings</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleCrawlAll}
+            disabled={readingAll || !session.authed}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 text-xs font-semibold border border-emerald-500/20 transition-colors disabled:opacity-50"
+          >
+            <Search className="w-3.5 h-3.5" />
+            <span>{readingAll ? 'Reading boards…' : 'Read All Boards'}</span>
+          </button>
+
+          <button
+            onClick={refreshListings}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 border border-zinc-700 transition-colors"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+            <span>Refresh Listings</span>
+          </button>
+        </div>
       </div>
 
       <AdminGate session={session} scope="Running a crawl and verifying listings is administrator-only." />
@@ -277,9 +321,18 @@ export function JobsScreen() {
               {jobs.length === 0 && (
                 <tr>
                   <td colSpan={6} className="py-12 text-center text-xs text-zinc-500">
-                    No listings stored yet. Use <span className="text-zinc-300">Crawl now</span> on a board above, or
-                    wait for the worker schedule. A board that cannot be read says why instead of filling the pool with
-                    invented vacancies.
+                    {!keyword && selectedSource === 'ALL' && !isRemoteOnly && boardRead?.reason ? (
+                      <span className="block max-w-2xl mx-auto leading-relaxed">
+                        Nothing is stored: {boardRead.reason}
+                      </span>
+                    ) : (
+                      <span className="block max-w-2xl mx-auto leading-relaxed">
+                        No listings match what is asked of this table. Use{" "}
+                        <span className="text-zinc-300">Read All Boards</span> to re-read every board at once, or{" "}
+                        <span className="text-zinc-300">Crawl now</span> on one of them. A board that cannot be read says
+                        why instead of filling the pool with invented vacancies.
+                      </span>
+                    )}
                   </td>
                 </tr>
               )}

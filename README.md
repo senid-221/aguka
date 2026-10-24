@@ -129,6 +129,18 @@ WhatsApp user → Meta Cloud API webhook → Next.js route handler
   source: normalise → refuse anything with no link back → collapse duplicate postings → upsert by the
   board's own posting id → record the board's health, timing, active count and the board's own words for
   a failure. Expired postings are stored as `EXPIRED` and excluded from the active count.
+- **Searching the pool** — `lib/jobs/query.ts` decides what a question is really asking. Every word of it
+  must be answered somewhere in a listing (a title hit outweighs a description one), one Kinyarwanda word is
+  answered by any of the English wordings the boards publish (`mudasobwa` → IT, software, developer — not all
+  of them at once), Rwandan district names are kept as places, a two-letter word must be the whole word rather
+  than a fragment of another, and a closed vacancy or an unregistered board is never returned as work. When
+  nothing answers the question, the reply says so instead of showing unrelated postings.
+- **Cold servers** — `lib/jobs/lazy-crawl.ts` reads the boards inside the turn that needs them. A serverless
+  host cannot run `npm run worker`, so every new instance started with an empty pool and told the first job
+  seeker of the day that nothing was stored. One attempt per process per cooldown, a wall-clock budget so a
+  slow board cannot hold the reply hostage, and the reason for whatever came back is recorded on the agent
+  run, reported by `/api/ready` and shown on the Jobs screen. `JOB_ON_DEMAND_CRAWL=false` leaves the pool to
+  the worker and the buttons.
 - **Data** — `lib/db/repository.ts` starts empty: no users, conversations, jobs, profiles, orders or
   exam attempts exist until real traffic or an explicit API call creates them. `lib/db/store.ts`
   writes the operational records to an atomic, versioned JSON snapshot under `AGUKA_DATA_DIR` (default
@@ -200,6 +212,9 @@ All variables are documented in [`.env.example`](.env.example) and validated at 
 | `JOB_CRAWL_INTERVAL_MINUTES` | How often the worker re-reads every board. Default 60; `0` switches the schedule off and leaves only the Jobs screen button. |
 | `JOB_CRAWL_MAX_LISTINGS` | Ceiling on rows taken from one board per crawl. Default 60. |
 | `JOB_CRAWL_TIMEOUT_MS` | How long one board may take to answer before the crawl records a failure and moves on. Default 15000. |
+| `JOB_ON_DEMAND_CRAWL` | Whether a job question that finds the pool empty reads the boards itself before the answer is written. Default on. |
+| `JOB_ON_DEMAND_BUDGET_MS` | How long that answer waits for the boards; boards that finish are already stored and the rest keep reading. Default 12000. |
+| `JOB_ON_DEMAND_COOLDOWN_MS` | How long one process waits before attempting the boards again after an attempt. Default 300000. |
 | `MAX_MESSAGES_PER_MINUTE_PER_USER`, `MAX_DAILY_AI_TOKENS_PER_USER` | Rate and budget limits read by `UsageLimiter`; enforcement still needs wiring. |
 
 Prices, trial length, usage caps and which services appear in the WhatsApp menu are not environment

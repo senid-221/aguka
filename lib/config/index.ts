@@ -12,9 +12,18 @@ export interface JobDiscoveryConfig {
   crawlIntervalMinutes: number;
   crawlTimeoutMs: number;
   maxListingsPerSource: number;
+  /** A turn that finds the pool empty reads the boards itself; this is its ceiling. */
+  onDemandCrawl: boolean;
+  onDemandBudgetMs: number;
+  onDemandCooldownMs: number;
   /** Boards an operator repointed with JOB_FEED_URL_<CODE>; URL, never a secret. */
   feedOverrides: Record<string, string>;
 }
+
+const positiveInt = (raw: string | undefined, fallback: number): number => {
+  const parsed = Number.parseInt(String(raw ?? '').trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
 
 export function jobDiscoveryConfig(env: NodeJS.ProcessEnv = process.env): JobDiscoveryConfig {
   const rawInterval = parseInt(env.JOB_CRAWL_INTERVAL_MINUTES || '60', 10);
@@ -29,6 +38,9 @@ export function jobDiscoveryConfig(env: NodeJS.ProcessEnv = process.env): JobDis
     crawlIntervalMinutes: Number.isFinite(rawInterval) ? Math.max(0, rawInterval) : 60,
     crawlTimeoutMs: crawlTimeoutMs(env),
     maxListingsPerSource: maxListingsPerSource(env),
+    onDemandCrawl: !['false', '0', 'off', 'no'].includes((env.JOB_ON_DEMAND_CRAWL || 'true').trim().toLowerCase()),
+    onDemandBudgetMs: positiveInt(env.JOB_ON_DEMAND_BUDGET_MS, 12_000),
+    onDemandCooldownMs: positiveInt(env.JOB_ON_DEMAND_COOLDOWN_MS, 300_000),
     feedOverrides: overrides,
   };
 }
@@ -288,5 +300,8 @@ export function getEnvPresence(env: NodeJS.ProcessEnv = process.env): Record<str
     JOB_CRAWL_INTERVAL_MINUTES: present('JOB_CRAWL_INTERVAL_MINUTES'),
     JOB_CRAWL_MAX_LISTINGS: present('JOB_CRAWL_MAX_LISTINGS'),
     JOB_CRAWL_TIMEOUT_MS: present('JOB_CRAWL_TIMEOUT_MS'),
+    JOB_ON_DEMAND_CRAWL: present('JOB_ON_DEMAND_CRAWL'),
+    JOB_ON_DEMAND_BUDGET_MS: present('JOB_ON_DEMAND_BUDGET_MS'),
+    JOB_ON_DEMAND_COOLDOWN_MS: present('JOB_ON_DEMAND_COOLDOWN_MS'),
   };
 }

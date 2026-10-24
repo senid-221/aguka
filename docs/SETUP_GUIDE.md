@@ -420,8 +420,30 @@ needs an administrator bearer token because it makes outbound calls and writes t
   leaves the console button. `JOB_CRAWL_TIMEOUT_MS` (default 15000) bounds one board, and
   `JOB_CRAWL_MAX_LISTINGS` (default 60) bounds how many rows are taken from it.
 - **Where to look.** The **Jobs Discovery** screen lists each board with its last outcome, the board's own
-  note and a *Crawl now* button; **System Settings** shows the schedule, caps and per-board state; and
-  `/api/ready` returns the same as `checks.jobDiscovery`, including `SCHEDULED` or `MANUAL_ONLY`.
+  note, a **Read All Boards** button and a *Crawl now* button per board; **System Settings** shows the
+  schedule, caps and per-board state; and `/api/ready` returns the same as `checks.jobDiscovery`, reporting
+  `SCHEDULED`, `ON_DEMAND` or `MANUAL_ONLY`.
+- **On-demand reading (`lib/jobs/lazy-crawl.ts`).** A serverless host runs no worker, so a cold instance
+  starts with an empty pool and the first job seeker of the day was told nothing was stored. Now a turn that
+  asks for work — and the Jobs screen itself — reads the boards before answering: at most one attempt per
+  process per `JOB_ON_DEMAND_COOLDOWN_MS` (default 300000), skipped when a crawl this fresh already left
+  active verified listings stored, and waited on only up to `JOB_ON_DEMAND_BUDGET_MS` (default 12000) so a
+  slow board cannot hold a WhatsApp reply hostage; the boards that finished are already stored and the rest
+  keep reading. `JOB_ON_DEMAND_CRAWL=false` switches it off, and the reason for whatever came back is
+  recorded on the agent run as `refresh_job_boards`, written to the log as `JOB_ON_DEMAND_CRAWL` and shown
+  in the empty table. This is a repair for a host with no worker, not a substitute for the schedule: with
+  `npm run worker` on an always-on host the pool is already full and this never fires.
+- **Searching what is stored (`lib/jobs/query.ts`).** A question is split into words, the ask-words in either
+  language (`akazi`, `imirimo`, `ndashaka`, `gukora`, `muri`, `job`, `vacancy`) are dropped, and a listing is
+  returned only when every remaining word is answered somewhere in it — a title hit counts six times, a
+  description hit once. Each word keeps its own set of wordings: `mudasobwa` is answered by *any* of IT,
+  software, developer or programmer, not by all of them at once, because the boards post in English while the
+  question arrives in Kinyarwanda. A word of two or three letters must be the whole word, so `it` never
+  matches "administration" or "site". District names are kept as places, `activeOnly` hides what the board
+  marked expired and what is past its stated deadline, and an unregistered `sourceCode` returns nothing
+  instead of every
+  board. When no listing answers the words, the agent is told so plainly and says *these are the nearest open
+  ones, not a match* rather than presenting unrelated vacancies as answers.
 - **Etiquette.** Requests carry an identifying `User-Agent` (`AgukaAIJobDiscovery/1.0`), go only to pages
   the board publishes for readers, and stay inside the interval and cap above. Check a board's terms
   before lowering `JOB_CRAWL_INTERVAL_MINUTES`.

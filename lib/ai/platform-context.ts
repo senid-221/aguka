@@ -6,6 +6,7 @@ import { isWhatsAppLiveConfigured } from '@/lib/whatsapp/gateway';
 import { findPendingAttempt, progressFor } from '@/lib/road-safety/academy';
 import { chainSummary } from './provider-adapter';
 import { pickWindow } from './variety';
+import { jobQueryTerms, selectListingsForQuery } from '@/lib/jobs/query';
 
 /**
  * Everything the conversational agent is allowed to say about the platform,
@@ -157,12 +158,20 @@ function accountBlock(user: User): Block {
   };
 }
 
-function jobsBlock(currentText: string, offset: number): Block {
+function jobsBlock(currentText: string, offset: number, remembered: string[]): Block {
   const wantsRemote = /remote/i.test(currentText);
-  const listings = repo.getJobs({
-    ...(wantsRemote ? { isRemote: true } : {}),
+  const stored = repo.getJobs({
     verificationStatus: 'VERIFIED',
+    activeOnly: true,
+    ...(wantsRemote ? { isRemote: true } : {}),
   });
+
+  // The person's own words, plus what this conversation already established about
+  // them — a district remembered two turns ago still narrows the next search.
+  const terms = jobQueryTerms(`${currentText} ${remembered.join(' ')}`);
+  const { matched, mode } = selectListingsForQuery(stored, terms);
+  const pool = matched.length > 0 ? matched : stored;
+
   const sources = repo.getSources();
 
   const boardLines =
@@ -180,9 +189,9 @@ function jobsBlock(currentText: string, offset: number): Block {
   // The same five rows printed at every request is what makes a person conclude the
   // platform knows five jobs. The slice advances with the conversation, so a fourth
   // "shaka akazi" shows the next ones instead of the first ones again.
-  const shown = pickWindow(listings, MAX_LISTINGS, offset);
+  const shown = pickWindow(pool, MAX_LISTINGS, offset);
   const listingLines =
-    listings.length === 0
+    stored.length === 0
       ? 'Verified listings: NONE stored. Do not invent one; say no verified listing has been stored yet and offer CV or job-alert help.'
       : `Verified listings${wantsRemote ? ' (remote only)' : ''} — these are the only jobs you may present:\n${shown
           .map(
@@ -190,14 +199,28 @@ function jobsBlock(currentText: string, offset: number): Block {
               `- ${j.title} | ${j.employer} | ${j.location} | ${j.salaryRange || 'salary not stated'} | ${j.jobType} | ${j.sourceName} | ${j.sourceUrl}`
           )
           .join('\n')}${
-          listings.length > shown.length
-            ? `\n(${listings.length} verified listing(s) are stored in total; ${shown.length} are shown here and another slice comes up as this conversation continues, so never say these are the only ones.)`
+          pool.length > shown.length
+            ? `\n(${pool.length} listing(s) of ${stored.length} stored match; ${shown.length} are shown here and another slice comes up as this conversation continues, so never say these are the only ones.)`
             : ''
+        }${
+          mode === 'nothing-matched'
+            ? `\n(None of the ${stored.length} stored listing(s) mentions ${terms.slice(0, 6).join(', ')}. These ${shown.length} are the nearest open ones, NOT a match — say so plainly and offer to keep looking.)`
+            : mode === 'one-word'
+              ? `\n(Matched on part of what was asked (${terms.join(', ')}); say which part matched if the person seems unsatisfied.)`
+              : ''
         }`;
 
   return {
     text: `Job discovery (read from stored crawls, never guessed):\n${listingLines}\nBoard status:\n${boardLines}`,
-    result: { verifiedListings: listings.length, shown: shown.length, boards: sources.length, remoteOnly: wantsRemote },
+    result: {
+      storedVerified: stored.length,
+      matched: matched.length,
+      matchMode: mode,
+      terms,
+      shown: shown.length,
+      boards: sources.length,
+      remoteOnly: wantsRemote,
+    },
   };
 }
 
@@ -330,8 +353,14 @@ export function buildPlatformContext(input: PlatformContextInput): PlatformConte
   add('read_person_account', { userId: input.user.id }, () => accountBlock(input.user));
   add(
     'search_verified_jobs',
-    { remoteOnly: /remote/i.test(input.currentText), verifiedOnly: true, slice: replyOffset },
-    () => jobsBlock(input.currentText, replyOffset)
+    {
+      remoteOnly: /remote/i.test(input.currentText),
+      verifiedOnly: true,
+      activeOnly: true,
+      words: jobQueryTerms(`${input.currentText} ${Object.values(input.conversation.memories || {}).join(' ')}`),
+      slice: replyOffset,
+    },
+    () => jobsBlock(input.currentText, replyOffset, Object.values(input.conversation.memories || {}))
   );
   add('query_talent_marketplace', {}, () => marketplaceBlock());
   add('read_learner_records', { userId: input.user.id }, () => personalRecordsBlock(input.user.id));

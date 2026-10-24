@@ -13,6 +13,8 @@ import { getService } from '@/lib/services/catalog';
 import { handleRoadSafetyMessage } from '@/lib/road-safety/whatsapp-flow';
 import { buildRoadSafetyTutorContext } from '@/lib/road-safety/tutor-context';
 import { buildPlatformContext, PLATFORM_DATA_RULES } from './platform-context';
+import { ensureJobListings } from '@/lib/jobs/lazy-crawl';
+import { wantsWork } from '@/lib/jobs/query';
 import {
   needsWebSearch,
   searchAndAnswer,
@@ -678,6 +680,30 @@ export async function executeAgent(
   //    whole platform snapshot, not only the slice its keywords pointed at: a
   //    tutor asked "what else does Aguka do?" must see the real catalogue, and a
   //    job question must see board health. All of it is read from the live store.
+  //
+  // 5a. A host that cannot keep a worker running starts every cold instance with an
+  //     empty job pool, so the turn that needs listings reads the boards itself
+  //     instead of apologising about them. This happens before the snapshot below,
+  //     otherwise the fresh rows would arrive one reply too late.
+  const crawlTraces: AgentExecutionResult['toolCalls'] = [];
+  if (agentType === 'JOB_FINDER' || wantsWork(sanitization.cleanText)) {
+    const crawlStart = Date.now();
+    const crawl = await ensureJobListings();
+    crawlTraces.push({
+      name: 'refresh_job_boards',
+      args: { why: 'a job question arrived with no listing fresh in this process' },
+      result: {
+        read: crawl.ran,
+        listings: crawl.activeVerified,
+        gained: crawl.gained,
+        boardsRead: crawl.boardsRead,
+        stoppedAtBudget: crawl.budgetHit,
+        note: crawl.reason,
+      },
+      latencyMs: Date.now() - crawlStart,
+    });
+  }
+
   const platform = buildPlatformContext({
     user,
     conversation,
@@ -685,7 +711,7 @@ export async function executeAgent(
     replyLang,
     currentText: sanitization.cleanText,
   });
-  const toolCalls: AgentExecutionResult['toolCalls'] = [...routingTraces, ...platform.tools];
+  const toolCalls: AgentExecutionResult['toolCalls'] = [...routingTraces, ...crawlTraces, ...platform.tools];
   const contextParts: string[] = [...platform.parts];
 
   // The academy turn also gets the detailed learner record (their paper, the

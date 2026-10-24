@@ -24,7 +24,7 @@ import {
 } from '@/lib/ai/variety';
 import { parseFacts, mergeMemories, shouldExtractMemories, memoryExtractionEnabled, MEMORY_LIMITS } from '@/lib/ai/memory';
 import { sanitizeUserInput, redactSecrets } from '@/lib/ai/prompt-security';
-import { repo } from '@/lib/db/repository';
+import { repo, AppRepository } from '@/lib/db/repository';
 import { parseAndValidateConfig } from '@/lib/config';
 import { logger } from '@/lib/logging/logger';
 import {
@@ -107,6 +107,8 @@ import { GET as rsAdminRouteGET, POST as rsAdminRoutePOST } from '@/app/api/admi
 import { issueAdminToken } from '@/lib/security/admin-auth';
 import { crawlSource, type CrawlRunResult, type JobCrawlStore, type SourceCrawlResult } from '@/lib/jobs/crawler';
 import { startJobSourceSchedule } from '@/lib/jobs/schedule';
+import { ensureJobListings, resetLazyCrawlState } from '@/lib/jobs/lazy-crawl';
+import { jobQueryTerms, selectListingsForQuery, termGroups, wantsWork } from '@/lib/jobs/query';
 import { normalizeJobListing } from '@/lib/jobs/normalizer';
 import type { JobListing, JobSource, RoadSafetyQuestion } from '@/lib/types';
 import type { RawJobItem } from '@/lib/jobs/types';
@@ -144,13 +146,34 @@ async function withEnv<T>(changes: Record<string, string | null>, fn: () => Prom
   }
 }
 
-export async function runPlatformTestSuiteAsync(): Promise<{
+/**
+ * The suite is offline by construction. One guard here rather than in every check:
+ * a job question makes an agent turn read the public boards, and turns arrive through
+ * the webhook route as well as directly, so the switch is set for the whole run and
+ * restored afterwards — an in-dashboard suite run must not leave the host disabled.
+ */
+export async function runPlatformTestSuiteAsync(): Promise<SuiteReport> {
+  const previous = process.env.JOB_ON_DEMAND_CRAWL;
+  process.env.JOB_ON_DEMAND_CRAWL = 'false';
+  resetLazyCrawlState();
+  try {
+    return await runSuiteChecks();
+  } finally {
+    if (previous === undefined) delete process.env.JOB_ON_DEMAND_CRAWL;
+    else process.env.JOB_ON_DEMAND_CRAWL = previous;
+    resetLazyCrawlState();
+  }
+}
+
+type SuiteReport = {
   allPassed: boolean;
   total: number;
   passedCount: number;
   failedCount: number;
   results: TestResultItem[];
-}> {
+};
+
+async function runSuiteChecks(): Promise<SuiteReport> {
   const results: TestResultItem[] = [];
 
   // Test 1: Webhook Subscription Challenge (GET)
@@ -2569,6 +2592,8 @@ Published on 12-10-2026 | Deadline 30-11-2026
           OPENAI_SEARCH_MODEL: null,
           AI_WEB_SEARCH: null,
           AI_MEMORY_EXTRACT: null,
+          // A job question makes this turn read the public boards; the suite stays offline.
+          JOB_ON_DEMAND_CRAWL: 'false',
           ...(opts.extras ?? {}),
         },
         () => opts.then(calls)
@@ -3083,6 +3108,204 @@ Published on 12-10-2026 | Deadline 30-11-2026
       stuckTurn.result.replyText === sameAnswer ? 'kept' : 'changed'
     }`,
     durationMs: Date.now() - t51Start,
+  });
+
+  // Tests 52-54: the job search as a person actually experiences it — their own
+  // words, only open vacancies, and a store that fills itself on a host with no
+  // worker to fill it.
+  const DAY = 86_400_000;
+  const makeListing = (overrides: Partial<JobListing>): JobListing => ({
+    id: 'job-x',
+    sourceId: 'src-jobinrwanda',
+    sourceName: 'Job in Rwanda',
+    externalId: 'x',
+    title: 'Untitled',
+    employer: 'An Employer',
+    location: 'Kigali City',
+    jobType: 'FULL_TIME',
+    description: 'No description.',
+    sourceUrl: 'https://www.jobinrwanda.com/jobs/x',
+    deadline: new Date(Date.now() + 30 * DAY).toISOString(),
+    discoveredAt: new Date(Date.now() - DAY).toISOString(),
+    lastVerifiedAt: new Date().toISOString(),
+    verificationStatus: 'VERIFIED',
+    isExpired: false,
+    tags: [],
+    ...overrides,
+  });
+
+  const t52Start = Date.now();
+  const searchPool = [
+    makeListing({ id: 'job-dev-kigali', title: 'Senior Backend Developer', employer: 'Bank of Kigali' }),
+    makeListing({ id: 'job-dev-remote', title: 'Java Developer', location: 'Remote' }),
+    makeListing({ id: 'job-admin-mention', title: 'Office Administrator', description: 'Supports the developer team in Kigali.' }),
+    makeListing({ id: 'job-teacher', title: 'Secondary School Teacher', description: 'Teaches mathematics.' }),
+  ];
+  const askedTerms = jobQueryTerms('Ndashaka akazi ka developer muri Kigali');
+  const everyWord = selectListingsForQuery(searchPool, askedTerms);
+  const computerWords = jobQueryTerms('Ndashaka akazi ko gukora mudasobwa');
+  const computerGroups = termGroups(computerWords);
+  const translated = selectListingsForQuery(searchPool, computerWords);
+  const district = selectListingsForQuery(
+    searchPool,
+    jobQueryTerms('Ndashaka akazi ka mudasobwa muri Kigali')
+  );
+  const unmatched = selectListingsForQuery(searchPool, ['hydrography']);
+  // A two-letter word must be the whole word: a listing about "administration" and
+  // "site visits" does not answer a person looking for IT.
+  const itProbe = selectListingsForQuery(
+    [
+      makeListing({ id: 'job-it-officer', title: 'IT Officer', employer: 'ABAHIZI SACCO Ngoma' }),
+      makeListing({
+        id: 'job-admin-fragments',
+        title: 'Office Administrator',
+        description: 'Handles administration and site visits.',
+      }),
+    ],
+    ['it']
+  );
+  const searchOk =
+    askedTerms.includes('developer') &&
+    askedTerms.includes('kigali') &&
+    !askedTerms.includes('akazi') &&
+    !askedTerms.includes('muri') &&
+    everyWord.mode === 'every-word' &&
+    everyWord.matched.map((j) => j.id).join(',') === 'job-dev-kigali,job-admin-mention' &&
+    computerWords.join(',') === 'mudasobwa' &&
+    computerGroups.length === 1 &&
+    computerGroups[0].words.includes('developer') &&
+    translated.mode === 'every-word' &&
+    translated.matched.map((j) => j.id).join(',').startsWith('job-dev-kigali') &&
+    district.mode === 'every-word' &&
+    district.matched.map((j) => j.id).join(',') === 'job-dev-kigali,job-admin-mention' &&
+    unmatched.mode === 'nothing-matched' &&
+    itProbe.mode === 'every-word' &&
+    itProbe.matched.map((j) => j.id).join(',') === 'job-it-officer' &&
+    wantsWork('Ndashaka akazi') &&
+    !wantsWork('Muraho, amakuru?');
+
+  results.push({
+    id: 'test-jobs-search-answers-every-word',
+    category: 'Job Discovery',
+    name: 'A Job Search Answers Every Word Asked Or Says It Matched None',
+    passed: searchOk,
+    expected:
+      'the words of the message decide the answer — every word must be answered somewhere in a listing, a title match outranks a description match, one Kinyarwanda word is answered by any of the English wordings the boards publish rather than by all of them at once, a short word must be the whole word, and a query nothing answers reports no match instead of showing unrelated vacancies',
+    actual: `terms=${askedTerms.join()}|mode=${everyWord.mode},order=${everyWord.matched
+      .map((j) => j.id)
+      .join(',')},kinyarwanda=${translated.mode}:${translated.matched
+      .map((j) => j.id)
+      .join(',')}`,
+    durationMs: Date.now() - t52Start,
+  });
+
+  const t53Start = Date.now();
+  const store = new AppRepository();
+  const listingSeed = {
+    sourceId: 'src-jobinrwanda',
+    sourceName: 'Job in Rwanda',
+    title: 'Developer',
+    employer: 'Andela',
+    location: 'Kigali City',
+    jobType: 'FULL_TIME' as const,
+    description: 'Builds things.',
+    sourceUrl: 'https://www.jobinrwanda.com/jobs/1',
+    verificationStatus: 'VERIFIED' as const,
+    isExpired: false,
+    tags: ['developer'],
+  };
+  store.addJobListing({ ...listingSeed, externalId: 'open', deadline: new Date(Date.now() + 30 * DAY).toISOString() });
+  store.addJobListing({
+    ...listingSeed,
+    externalId: 'closed',
+    verificationStatus: 'EXPIRED' as const,
+    isExpired: true,
+    deadline: new Date(Date.now() - DAY).toISOString(),
+  });
+  store.addJobListing({ ...listingSeed, externalId: 'past-deadline', deadline: new Date(Date.now() - DAY).toISOString() });
+  const openOnly = store.getJobs({ keyword: 'developer', activeOnly: true });
+  const anyState = store.getJobs({ keyword: 'developer' });
+  const multiWord = store.getJobs({ keyword: 'developer kigali' });
+  const unknownBoard = store.getJobs({ sourceCode: 'NO_SUCH_BOARD' });
+  const knownBoard = store.getJobs({ sourceCode: 'JOB_IN_RWANDA' });
+  const storeOk =
+    openOnly.length === 1 &&
+    openOnly[0].externalId === 'open' &&
+    anyState.length === 3 &&
+    multiWord.length === 3 &&
+    store.getJobs({ keyword: 'developer huye' }).length === 0 &&
+    unknownBoard.length === 0 &&
+    knownBoard.length === 3;
+
+  results.push({
+    id: 'test-jobs-search-excludes-closed-and-unknown-board',
+    category: 'Job Discovery',
+    name: 'A Closed Vacancy And An Unregistered Board Are Not Returned As Work',
+    passed: storeOk,
+    expected:
+      'activeOnly drops what the board itself marked expired and what is past its stated deadline, two words must both be satisfied rather than either, and a source code that is not registered returns nothing instead of every board',
+    actual: `open=${openOnly.length}/${anyState.length},multiWord=${multiWord.length},wrongDistrict=${store
+      .getJobs({ keyword: 'developer huye' }).length},unknownBoard=${unknownBoard.length},knownBoard=${knownBoard.length}`,
+    durationMs: Date.now() - t53Start,
+  });
+
+  const t54Start = Date.now();
+  resetLazyCrawlState();
+  let boardRuns = 0;
+  let clock = 1_700_000_000_000;
+  let state: { activeVerified: number; lastCrawledAt: number | null } = { activeVerified: 0, lastCrawledAt: null };
+  const lazyEnv = { JOB_ON_DEMAND_CRAWL: 'true', JOB_CRAWL_INTERVAL_MINUTES: '60' } as unknown as NodeJS.ProcessEnv;
+  const lazyCall = (crawl?: () => Promise<unknown>, budgetMs = 500, env = lazyEnv) =>
+    ensureJobListings({
+      env,
+      now: () => clock,
+      read: () => state,
+      budgetMs,
+      cooldownMs: 60_000,
+      crawl: crawl ?? (async () => { boardRuns++; }),
+    });
+
+  const cold = await lazyCall();
+  const coldRuns = boardRuns;
+  const again = await lazyCall();
+  clock += 61_000;
+  const afterCooldown = await lazyCall();
+  const cooldownRuns = boardRuns;
+  state = { activeVerified: 12, lastCrawledAt: clock };
+  const whileFresh = await lazyCall();
+  const switchedOff = await lazyCall(undefined, 500, {
+    JOB_ON_DEMAND_CRAWL: 'false',
+  } as unknown as NodeJS.ProcessEnv);
+  state = { activeVerified: 0, lastCrawledAt: null };
+  clock += 600_000;
+  resetLazyCrawlState();
+  const slowBoard = await lazyCall(() => new Promise<never>(() => {}), 20);
+  resetLazyCrawlState();
+
+  const lazyOk =
+    cold.ran &&
+    coldRuns === 1 &&
+    !again.ran &&
+    /already attempted/.test(again.reason) &&
+    afterCooldown.ran &&
+    cooldownRuns === 2 &&
+    !whileFresh.ran &&
+    /already stored/.test(whileFresh.reason) &&
+    !switchedOff.ran &&
+    /switched off/.test(switchedOff.reason) &&
+    slowBoard.ran &&
+    slowBoard.budgetHit &&
+    slowBoard.latencyMs < 2_000;
+
+  results.push({
+    id: 'test-jobs-boards-read-on-demand',
+    category: 'Job Discovery',
+    name: 'A Cold Server Reads The Boards Itself Before Answering A Job Question',
+    passed: lazyOk,
+    expected:
+      'an empty or stale store makes the turn read the boards once, a second question in the same window does not repeat it, a store that is already fresh is left alone, the switch off is honoured, and a board that answers slowly cannot hold the reply past its budget',
+    actual: `cold=${cold.ran}:${coldRuns},repeat=${again.ran}:${again.reason.slice(0, 28)},afterCooldown=${afterCooldown.ran}:${cooldownRuns},fresh=${whileFresh.ran},off=${switchedOff.ran},slowBudget=${slowBoard.budgetHit}@${slowBoard.latencyMs}ms`,
+    durationMs: Date.now() - t54Start,
   });
 
   const passedCount = results.filter((r) => r.passed).length;
